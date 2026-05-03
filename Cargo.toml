@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/crypto",
+    "core/vault",
+    "core/storage",
+    "core/common",
+    "core/sync",
+    "core/app",
+    "core/ffi",
+    "core/fuse",
+    "core/webdav",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Christian Pojoni <christian@axiom-vault.com>"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Crypto
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+rand = "0.10.1"
+zeroize = { version = "1.7", features = ["derive"] }
+subtle = "2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0.17"
+anyhow = "1.0"
+
+# Async
+tokio = { version = "1.52", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+
+# Testing
+proptest = "1.0"
+tempfile = "3.8"
+
+# Utils
+base64 = "0.22.1"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client and OAuth2
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query"] }
+oauth2 = "5.0"
+url = "2.5"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1.5"
+
+# Database
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# Desktop
+fuser = "0.17"
+
+# Browser opening
+open = "5.3"
+
+# Recovery key word encoding
+bip39 = "2.1"
+
+# Erasure coding
+reed-solomon-erasure = "6.0"
+crc32fast = "1.4"
+
+# Filesystem paths
+dirs = "6.0"
+percent-encoding = "2.3"

@@ -1,0 +1,195 @@
+name: Release Stable
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # stable tags only (no -beta suffix)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to release (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-stable
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate semver and Cargo.toml match
+        id: check
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            input_version="${REF_NAME#v}"
+          else
+            input_version="$INPUT_VERSION"
+            # Manual releases must run from the default branch
+            if [[ "$REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+              echo "::error::Manual releases must run from ${DEFAULT_BRANCH}. Got: ${REF_NAME}"
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
+            exit 1
+          fi
+
+          if [[ "$cargo_version" != "$input_version" ]]; then
+            echo "::error::Cargo.toml version (${cargo_version}) does not match input (${input_version}). Bump Cargo.toml first."
+            exit 1
+          fi
+
+          tag="v${input_version}"
+
+          # Only check tag existence for manual dispatch (tag push means it already exists)
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::Tag ${tag} already exists."
+              exit 1
+            fi
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.body }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build release notes
+        id: notes
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            INPUT_VERSION="${REF_NAME#v}"
+          fi
+
+          # Find the previous stable tag (exclude beta tags)
+          PREV_TAG=$(git tag --sort=-creatordate | grep -vE '\-beta\.' | grep -v "^v${INPUT_VERSION}$" | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Extract features only — skip bug fixes for clean release notes
+          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^feat(\(|:)' \
+            | sed 's/^feat(\([^)]*\)): /\1: /' \
+            | sed 's/^feat: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
+            | while IFS= read -r line; do echo "- ${line}"; done || true)
+
+          if [ -z "$FEATURES" ]; then
+            FEATURES="- Incremental improvements and polish"
+          fi
+
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
+            | sed 's/Co-Authored-By: *//i' \
+            | sed 's/ *$//' \
+            | sort -uf || true)
+
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^Claude' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
+
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG_LINE="*Full changelog: ${PREV_TAG}...v${INPUT_VERSION}*"
+          else
+            CHANGELOG_LINE="*Initial release*"
+          fi
+
+          BODY=$(cat <<NOTES_EOF
+          ## What's New
+
+          ${FEATURES}
+
+          ## Contributors
+
+          ${ALL_CONTRIBUTORS}
+
+          ---
+          ${CHANGELOG_LINE}
+          NOTES_EOF
+          )
+
+          {
+            echo "body<<BODY_EOF"
+            echo "$BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish Stable Release
+    needs: [validate, release-notes]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tag if manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "axiom-core $TAG"
+          git push origin "$TAG"
+
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --latest

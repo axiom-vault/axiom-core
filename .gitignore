@@ -1,0 +1,30 @@
+# Build artifacts
+/target/
+/target.root-owned/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock — excluded (library crate; see https://doc.rust-lang.org/cargo/faq.html)
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test vaults (don't commit test data)
+/test_vaults/
+*.vault/
+
+# Claude Code
+.claude/worktrees/
+.claude/settings.local.json
+
+# Git worktrees
+.worktrees/

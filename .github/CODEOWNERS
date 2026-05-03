@@ -1,0 +1,22 @@
+# CODEOWNERS for axiom-core
+# These owners will be the default owners for everything in the repo.
+
+# Global owners
+* @5queezer
+
+# Core Rust modules
+/core/crypto/ @5queezer
+/core/vault/ @5queezer
+/core/storage/ @5queezer
+/core/sync/ @5queezer
+/core/ffi/ @5queezer
+/core/common/ @5queezer
+/core/app/ @5queezer
+/core/fuse/ @5queezer
+/core/webdav/ @5queezer
+
+# CI/CD configuration
+/.github/ @5queezer
+
+# Documentation
+*.md @5queezer
