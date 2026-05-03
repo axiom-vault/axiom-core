@@ -28,7 +28,7 @@ jobs:
     outputs:
       tag: ${{ steps.check.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Validate semver and Cargo.toml match
         id: check
         shell: bash
@@ -81,7 +81,7 @@ jobs:
     outputs:
       notes: ${{ steps.notes.outputs.body }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Build release notes
@@ -161,89 +161,12 @@ jobs:
             echo "BODY_EOF"
           } >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build ${{ matrix.target }}
-    needs: [validate]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
-            cross_compiler: gcc-aarch64-linux-gnu
-            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
-            linker: aarch64-linux-gnu-gcc
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
-
-      - name: Install cross compiler
-        if: matrix.cross_compiler
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ${{ matrix.cross_compiler }}
-
-      - name: Build release
-        shell: bash
-        run: |
-          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
-            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
-          fi
-          cargo build --release --locked --target ${{ matrix.target }} -p axiomvault-cli
-
-      - name: Package binary
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../axiomvault-${{ matrix.target }}.tar.gz axiomvault
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: axiomvault-${{ matrix.target }}
-          path: axiomvault-${{ matrix.target }}.tar.gz
-          retention-days: 14
-
   publish:
     name: Publish Stable Release
-    needs: [validate, release-notes, build]
+    needs: [validate, release-notes]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: axiomvault-*
-          path: artifacts
-
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          find . -type f -name '*.tar.gz' -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Collect release assets
-        run: |
-          mkdir -p release-assets
-          find artifacts -type f \( -name '*.tar.gz' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
-          echo "--- Assets ---"
-          ls -lh release-assets/
-
-      - name: Write release notes
-        env:
-          NOTES: ${{ needs.release-notes.outputs.notes }}
-        run: printf '%s\n' "$NOTES" > release-notes.md
+      - uses: actions/checkout@v4
 
       - name: Create tag if manual dispatch
         if: github.event_name == 'workflow_dispatch'
@@ -252,15 +175,20 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "axiomvault $TAG"
+          git tag -a "$TAG" -m "axiom-core $TAG"
           git push origin "$TAG"
+
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          gh release create "$TAG" release-assets/* \
+          gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --notes-file release-notes.md \

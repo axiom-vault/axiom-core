@@ -4,7 +4,8 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo.lock — checked in (binary project)
+# Cargo.lock — excluded (library crate; see https://doc.rust-lang.org/cargo/faq.html)
+Cargo.lock
 
 # IDE
 .idea/
@@ -24,12 +25,6 @@ Thumbs.db
 # Claude Code
 .claude/worktrees/
 .claude/settings.local.json
-
-# Apple build artifacts
-clients/apple/Frameworks/
-clients/apple/build/
-clients/apple/**/*.xcuserstate
-clients/apple/AxiomVault.xcodeproj/project.pbxproj
 
 # Git worktrees
 .worktrees/

@@ -1,4 +1,4 @@
-# CODEOWNERS for AxiomVault
+# CODEOWNERS for axiom-core
 # These owners will be the default owners for everything in the repo.
 
 # Global owners
@@ -11,16 +11,12 @@
 /core/sync/ @5queezer
 /core/ffi/ @5queezer
 /core/common/ @5queezer
-
-# iOS client
-/clients/ios/ @5queezer
-
-# CLI tool
-/tools/cli/ @5queezer
+/core/app/ @5queezer
+/core/fuse/ @5queezer
+/core/webdav/ @5queezer
 
 # CI/CD configuration
 /.github/ @5queezer
 
 # Documentation
 *.md @5queezer
-/docs/ @5queezer
