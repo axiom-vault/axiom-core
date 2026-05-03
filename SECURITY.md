@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in AxiomVault, please report it responsibly.
 
-**Email:** [security@axiomvault.dev](mailto:security@axiomvault.dev)
+**Email:** [security@axiom-vault.com](mailto:security@axiom-vault.com)
 
 If possible, encrypt your report using our PGP key (available on request). Include:
 
