@@ -14,6 +14,66 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use axiomvault_common::Result;
 
+/// PKCE verifier for OAuth authorization-code flows.
+///
+/// The verifier is generated alongside an authorization URL and must be
+/// supplied when exchanging the resulting authorization code for tokens.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct CloudPkceVerifier(String);
+
+impl CloudPkceVerifier {
+    /// Reconstruct a verifier from its raw secret value.
+    ///
+    /// Use this when an application needs to persist the verifier secret
+    /// returned by [`CloudAuthorization::pkce_verifier`] across the browser
+    /// authorization callback. Do not hand-roll verifier values; freshly
+    /// generated authorization requests should use the verifier returned by
+    /// the provider auth manager.
+    pub fn new(verifier: String) -> Self {
+        Self(verifier)
+    }
+
+    /// Get the verifier secret.
+    ///
+    /// This is primarily useful for clients that need to persist the verifier
+    /// between opening the browser and receiving the OAuth callback.
+    pub fn secret(&self) -> &str {
+        &self.0
+    }
+
+    /// Convert into the oauth2 crate's PKCE verifier type.
+    pub(crate) fn into_oauth2(mut self) -> oauth2::PkceCodeVerifier {
+        oauth2::PkceCodeVerifier::new(std::mem::take(&mut self.0))
+    }
+}
+
+impl From<oauth2::PkceCodeVerifier> for CloudPkceVerifier {
+    fn from(verifier: oauth2::PkceCodeVerifier) -> Self {
+        Self(verifier.into_secret())
+    }
+}
+
+impl std::fmt::Debug for CloudPkceVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloudPkceVerifier([REDACTED])")
+    }
+}
+
+/// OAuth authorization request data for OAuth 2.1-aligned PKCE flows.
+#[derive(Debug)]
+pub struct CloudAuthorization {
+    /// URL the user should open to authorize the application.
+    pub url: String,
+    /// CSRF token that must match the callback state parameter.
+    pub csrf_token: String,
+    /// PKCE verifier to supply when exchanging the authorization code.
+    ///
+    /// Browser-based flows may store `pkce_verifier.secret()` temporarily while
+    /// waiting for the OAuth callback, then reconstruct it with
+    /// [`CloudPkceVerifier::new`] before calling `exchange_code`.
+    pub pkce_verifier: CloudPkceVerifier,
+}
+
 /// OAuth2 tokens with expiration tracking.
 ///
 /// Common across all cloud providers. Contains the access token for API

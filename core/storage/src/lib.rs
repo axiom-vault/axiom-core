@@ -25,7 +25,9 @@ pub mod rebuild;
 pub mod registry;
 pub mod shard_map;
 
-pub use cloud_auth::{CloudTokenManager, CloudTokens, TokenRefresher};
+pub use cloud_auth::{
+    CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
+};
 pub use composite::{CompositeConfig, CompositeStorageProvider, RaidMode};
 pub use dropbox::{DropboxConfig, DropboxProvider};
 pub use gdrive::{GDriveConfig, GDriveProvider};

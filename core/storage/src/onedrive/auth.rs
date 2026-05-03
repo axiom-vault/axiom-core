@@ -11,7 +11,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use axiomvault_common::{Error, Result};
 
-use crate::cloud_auth::{CloudTokenManager, CloudTokens, TokenRefresher};
+use crate::cloud_auth::{
+    CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
+};
 
 /// Re-export `CloudTokens` as `OneDriveTokens` for backward compatibility.
 pub type OneDriveTokens = CloudTokens;
@@ -42,8 +44,10 @@ const ONEDRIVE_SCOPES: &[&str] = &["Files.ReadWrite", "offline_access"];
 pub struct OneDriveAuthConfig {
     /// Azure AD application (client) ID.
     pub client_id: String,
-    /// Client secret.
-    pub client_secret: String,
+    /// Optional client secret for confidential clients.
+    ///
+    /// Native/public clients should use PKCE without a client secret.
+    pub client_secret: Option<String>,
     /// Redirect URL for OAuth2 callback.
     #[zeroize(skip)]
     pub redirect_url: String,
@@ -52,7 +56,9 @@ pub struct OneDriveAuthConfig {
 impl Default for OneDriveAuthConfig {
     fn default() -> Self {
         let client_id = std::env::var("AXIOMVAULT_ONEDRIVE_CLIENT_ID").unwrap_or_default();
-        let client_secret = std::env::var("AXIOMVAULT_ONEDRIVE_CLIENT_SECRET").unwrap_or_default();
+        let client_secret = std::env::var("AXIOMVAULT_ONEDRIVE_CLIENT_SECRET")
+            .ok()
+            .filter(|secret| !secret.is_empty());
         Self {
             client_id,
             client_secret,
@@ -71,13 +77,6 @@ impl OneDriveAuthConfig {
                     .to_string(),
             ));
         }
-        if self.client_secret.is_empty() {
-            return Err(Error::InvalidInput(
-                "OneDrive client secret not configured. \
-                 Set the AXIOMVAULT_ONEDRIVE_CLIENT_SECRET environment variable."
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }
@@ -92,8 +91,7 @@ pub struct OneDriveAuthManager {
 impl OneDriveAuthManager {
     /// Create a new authentication manager.
     pub fn new(config: OneDriveAuthConfig) -> Result<Self> {
-        let client = BasicClient::new(ClientId::new(config.client_id.clone()))
-            .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        let mut client = BasicClient::new(ClientId::new(config.client_id.clone()))
             .set_auth_uri(
                 AuthUrl::new(MS_AUTH_URL.to_string())
                     .map_err(|e| Error::InvalidInput(format!("Invalid auth URL: {}", e)))?,
@@ -107,23 +105,39 @@ impl OneDriveAuthManager {
                     .map_err(|e| Error::InvalidInput(format!("Invalid redirect URL: {}", e)))?,
             );
 
+        if let Some(client_secret) = &config.client_secret {
+            client = client.set_client_secret(ClientSecret::new(client_secret.clone()));
+        }
+
         Ok(Self { client, config })
     }
 
     /// Generate the authorization URL for the user to visit.
-    pub fn authorization_url(&self) -> (String, String) {
-        let mut auth_request = self.client.authorize_url(oauth2::CsrfToken::new_random);
+    pub fn authorization_url(&self) -> CloudAuthorization {
+        let (pkce_challenge, pkce_verifier) = oauth2::PkceCodeChallenge::new_random_sha256();
+        let mut auth_request = self
+            .client
+            .authorize_url(oauth2::CsrfToken::new_random)
+            .set_pkce_challenge(pkce_challenge);
 
         for scope in ONEDRIVE_SCOPES {
             auth_request = auth_request.add_scope(Scope::new(scope.to_string()));
         }
 
         let (auth_url, csrf_token) = auth_request.url();
-        (auth_url.to_string(), csrf_token.secret().clone())
+        CloudAuthorization {
+            url: auth_url.to_string(),
+            csrf_token: csrf_token.secret().clone(),
+            pkce_verifier: pkce_verifier.into(),
+        }
     }
 
     /// Exchange an authorization code for tokens.
-    pub async fn exchange_code(&self, code: &str) -> Result<OneDriveTokens> {
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        pkce_verifier: CloudPkceVerifier,
+    ) -> Result<OneDriveTokens> {
         use oauth2::AuthorizationCode;
 
         let http_client = oauth2::reqwest::ClientBuilder::new()
@@ -134,6 +148,7 @@ impl OneDriveAuthManager {
         let token_result = self
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()))
+            .set_pkce_verifier(pkce_verifier.into_oauth2())
             .request_async(&http_client)
             .await
             .map_err(|e| Error::Authentication(format!("Token exchange failed: {}", e)))?;
@@ -248,7 +263,7 @@ mod tests {
     fn test_auth_config_serialization() {
         let config = OneDriveAuthConfig {
             client_id: "id".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: None,
             redirect_url: REDIRECT_URL.to_string(),
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -260,25 +275,50 @@ mod tests {
     fn test_auth_manager_creation() {
         let config = OneDriveAuthConfig {
             client_id: "test_id".to_string(),
-            client_secret: "test_secret".to_string(),
+            client_secret: None,
             redirect_url: "http://localhost:8080/callback".to_string(),
         };
         let manager = OneDriveAuthManager::new(config).unwrap();
         assert_eq!(manager.config().client_id, "test_id");
+        assert!(manager.config().client_secret.is_none());
+    }
+
+    #[test]
+    fn test_config_validation_allows_empty_client_secret() {
+        let config = OneDriveAuthConfig {
+            client_id: "test_id".to_string(),
+            client_secret: None,
+            redirect_url: "http://localhost:8080/callback".to_string(),
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_authorization_url() {
         let config = OneDriveAuthConfig {
             client_id: "test_id".to_string(),
-            client_secret: "test_secret".to_string(),
+            client_secret: None,
             redirect_url: "http://localhost:8080/callback".to_string(),
         };
         let manager = OneDriveAuthManager::new(config).unwrap();
-        let (url, csrf) = manager.authorization_url();
-        assert!(url.contains("login.microsoftonline.com"));
-        assert!(url.contains("client_id=test_id"));
-        assert!(url.contains("Files.ReadWrite"));
-        assert!(!csrf.is_empty());
+        let authorization = manager.authorization_url();
+        assert!(authorization.url.contains("login.microsoftonline.com"));
+        assert!(authorization.url.contains("client_id=test_id"));
+        assert!(authorization.url.contains("Files.ReadWrite"));
+        assert!(authorization.url.contains("code_challenge="));
+        assert!(authorization.url.contains("code_challenge_method=S256"));
+        assert!(!authorization.csrf_token.is_empty());
+        assert!(!authorization.pkce_verifier.secret().is_empty());
+
+        let parsed_url = url::Url::parse(&authorization.url).unwrap();
+        let code_challenge = parsed_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code_challenge").then(|| value.to_string()))
+            .unwrap();
+        let verifier =
+            oauth2::PkceCodeVerifier::new(authorization.pkce_verifier.secret().to_string());
+        let expected_challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+        assert_eq!(code_challenge, expected_challenge.as_str());
     }
 }
