@@ -1,0 +1,44 @@
+//! Storage provider abstraction for AxiomVault.
+//!
+//! This module provides a trait-based interface for different storage backends
+//! (Google Drive, local filesystem, iCloud, etc.) and a provider registry
+//! for dynamic provider resolution.
+//!
+//! # Design Principles
+//! - Provider isolation: No provider-specific logic in vault or crypto modules
+//! - Async operations: All I/O operations are async
+//! - Streaming support: Large files are handled via streams
+//! - Unified error semantics: Consistent error types across providers
+
+pub mod cloud_auth;
+pub mod composite;
+pub mod dropbox;
+pub mod gdrive;
+pub mod health;
+pub mod http_client;
+pub mod icloud;
+pub mod local;
+pub mod memory;
+pub mod onedrive;
+pub mod provider;
+pub mod rebuild;
+pub mod registry;
+pub mod shard_map;
+
+pub use cloud_auth::{CloudTokenManager, CloudTokens, TokenRefresher};
+pub use composite::{CompositeConfig, CompositeStorageProvider, RaidMode};
+pub use dropbox::{DropboxConfig, DropboxProvider};
+pub use gdrive::{GDriveConfig, GDriveProvider};
+// Re-export unified HealthStatus from common alongside storage-specific health types.
+pub use axiomvault_common::health::HealthStatus;
+pub use health::{HealthConfig, ProviderHealth};
+pub use icloud::{ICloudConfig, ICloudProvider};
+pub use local::LocalProvider;
+pub use memory::MemoryProvider;
+pub use onedrive::{OneDriveConfig, OneDriveProvider};
+pub use provider::{ConflictResolution, Metadata, StorageProvider};
+pub use rebuild::{
+    RaidRebuilder, RebuildCheckpoint, RebuildConfig, RebuildProgress, RebuildResult,
+};
+pub use registry::{create_default_registry, ProviderFactory, ProviderRegistry};
+pub use shard_map::{ChunkEntry, ErasureParams, ShardLocation, ShardMap};

@@ -1,0 +1,35 @@
+# Build artifacts
+/target/
+/target.root-owned/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock — checked in (binary project)
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test vaults (don't commit test data)
+/test_vaults/
+*.vault/
+
+# Claude Code
+.claude/worktrees/
+.claude/settings.local.json
+
+# Apple build artifacts
+clients/apple/Frameworks/
+clients/apple/build/
+clients/apple/**/*.xcuserstate
+clients/apple/AxiomVault.xcodeproj/project.pbxproj
+
+# Git worktrees
+.worktrees/

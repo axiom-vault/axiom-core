@@ -1,0 +1,792 @@
+//! Application facade — the single entry point for all vault operations.
+
+use std::sync::Arc;
+
+use tokio::sync::{RwLock, RwLockReadGuard};
+use tracing::info;
+use zeroize::Zeroizing;
+
+use axiomvault_common::{VaultId, VaultPath};
+use axiomvault_crypto::KdfParams;
+use axiomvault_vault::{VaultManager, VaultOperations, VaultSession};
+
+use crate::dto::*;
+use crate::error::{AppError, AppResult};
+use crate::events::{event_channel, AppEvent, EventReceiver, EventSender};
+use crate::local_index::{IndexEntry, LocalIndex};
+
+fn now_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Application service wrapping all vault subsystems.
+///
+/// Thread-safe (`Send + Sync`) and designed to be shared via `Arc`.
+/// All mutable state is behind interior locks.
+pub struct AppService {
+    manager: VaultManager,
+    session: RwLock<Option<ActiveVault>>,
+    event_tx: EventSender,
+}
+
+/// Internal state for an open vault.
+struct ActiveVault {
+    session: Arc<VaultSession>,
+    provider_type: String,
+    /// Optional local metadata cache, updated on file operations.
+    index: Option<LocalIndex>,
+}
+
+impl AppService {
+    /// Create a new application service.
+    pub fn new() -> Self {
+        let (event_tx, _) = event_channel(64);
+        Self {
+            manager: VaultManager::new(),
+            session: RwLock::new(None),
+            event_tx,
+        }
+    }
+
+    /// Subscribe to application events.
+    pub fn subscribe(&self) -> EventReceiver {
+        self.event_tx.subscribe()
+    }
+
+    /// Get a reference to the event sender (for bridging to FFI callbacks).
+    pub fn event_sender(&self) -> &EventSender {
+        &self.event_tx
+    }
+
+    fn emit(&self, event: AppEvent) {
+        // Ignore send errors — no receivers is fine.
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Access the underlying vault manager for operations that don't
+    /// require an active session (e.g. checking whether a vault exists
+    /// at a given location).
+    pub fn vault_manager(&self) -> &VaultManager {
+        &self.manager
+    }
+
+    /// Parse a vault path string, mapping errors to `AppError::InvalidInput`.
+    fn parse_path(path: &str) -> AppResult<VaultPath> {
+        VaultPath::parse(path).map_err(|e| AppError::InvalidInput(e.to_string()))
+    }
+
+    /// Acquire a read-lock on the session, failing with `NoOpenVault` if
+    /// no vault is open.
+    async fn active_vault(&self) -> AppResult<RwLockReadGuard<'_, Option<ActiveVault>>> {
+        let guard = self.session.read().await;
+        if guard.is_none() {
+            return Err(AppError::NoOpenVault);
+        }
+        Ok(guard)
+    }
+
+    /// Build a `VaultOperations` handle from a lock guard.
+    ///
+    /// Caller must have obtained the guard via `active_vault()`.
+    fn ops<'a>(active: &'a ActiveVault) -> AppResult<VaultOperations<'a>> {
+        VaultOperations::new(&active.session).map_err(AppError::from)
+    }
+
+    // -- Vault lifecycle --
+
+    /// Create a new vault.
+    pub async fn create_vault(&self, mut params: CreateVaultParams) -> AppResult<VaultCreatedDto> {
+        let vault_id =
+            VaultId::new(&params.vault_id).map_err(|e| AppError::InvalidInput(e.to_string()))?;
+
+        // Check if vault already exists.
+        let exists = self
+            .manager
+            .vault_exists(&params.provider_type, params.provider_config.clone())
+            .await
+            .map_err(AppError::from)?;
+
+        if exists {
+            return Err(AppError::VaultAlreadyExists(std::mem::take(
+                &mut params.vault_id,
+            )));
+        }
+
+        let provider_config = std::mem::take(&mut params.provider_config);
+        let creation = self
+            .manager
+            .create_vault(
+                vault_id,
+                params.password.as_bytes(),
+                &params.provider_type,
+                provider_config,
+                KdfParams::default(),
+            )
+            .await
+            .map_err(AppError::from)?;
+
+        let provider_type = std::mem::take(&mut params.provider_type);
+        let info = VaultInfoDto {
+            id: creation.session.vault_id().to_string(),
+            provider_type: provider_type.clone(),
+            is_unlocked: true,
+        };
+
+        // Move the mnemonic out of the manager response and into the DTO so the
+        // bytes are never copied into a non-zeroizing buffer.
+        let dto = VaultCreatedDto {
+            info: info.clone(),
+            recovery_words: creation.recovery_words,
+        };
+
+        *self.session.write().await = Some(ActiveVault {
+            session: Arc::new(creation.session),
+            provider_type,
+            index: None,
+        });
+
+        self.emit(AppEvent::VaultCreated(info));
+
+        info!(vault_id = %params.vault_id, "Vault created");
+        Ok(dto)
+    }
+
+    /// Open an existing vault.
+    pub async fn open_vault(&self, mut params: OpenVaultParams) -> AppResult<VaultInfoDto> {
+        let provider_config = std::mem::take(&mut params.provider_config);
+        let session = self
+            .manager
+            .open_vault(
+                &params.provider_type,
+                provider_config,
+                params.password.as_bytes(),
+            )
+            .await
+            .map_err(AppError::from)?;
+
+        let provider_type = std::mem::take(&mut params.provider_type);
+        let info = VaultInfoDto {
+            id: session.vault_id().to_string(),
+            provider_type: provider_type.clone(),
+            is_unlocked: true,
+        };
+
+        *self.session.write().await = Some(ActiveVault {
+            session: Arc::new(session),
+            provider_type,
+            index: None,
+        });
+
+        self.emit(AppEvent::VaultOpened(info.clone()));
+
+        info!(vault_id = %info.id, "Vault opened");
+        Ok(info)
+    }
+
+    /// Recover a vault using recovery words.
+    pub async fn recover_vault(&self, mut params: RecoverVaultParams) -> AppResult<VaultInfoDto> {
+        let provider_config = std::mem::take(&mut params.provider_config);
+        let session = self
+            .manager
+            .recover_vault(
+                &params.provider_type,
+                provider_config,
+                &params.recovery_words,
+                params.new_password.as_bytes(),
+            )
+            .await
+            .map_err(AppError::from)?;
+
+        let provider_type = std::mem::take(&mut params.provider_type);
+        let info = VaultInfoDto {
+            id: session.vault_id().to_string(),
+            provider_type: provider_type.clone(),
+            is_unlocked: true,
+        };
+
+        *self.session.write().await = Some(ActiveVault {
+            session: Arc::new(session),
+            provider_type,
+            index: None,
+        });
+
+        self.emit(AppEvent::VaultOpened(info.clone()));
+
+        info!(vault_id = %info.id, "Vault recovered");
+        Ok(info)
+    }
+
+    /// Lock the active vault (clears keys from memory, wipes index).
+    ///
+    /// Requires exclusive access to the session — FUSE must be unmounted first.
+    pub async fn lock_vault(&self) -> AppResult<()> {
+        let mut guard = self.session.write().await;
+        let active = guard.as_mut().ok_or(AppError::NoOpenVault)?;
+
+        // Wipe cached plaintext metadata before locking.
+        if let Some(ref index) = active.index {
+            if let Err(e) = index.wipe() {
+                tracing::warn!("Failed to wipe local index on lock: {}", e);
+            }
+        }
+
+        let session = Arc::get_mut(&mut active.session).ok_or_else(|| {
+            AppError::InvalidInput(
+                "Cannot lock vault while FUSE is mounted. Unmount first.".to_string(),
+            )
+        })?;
+        session.lock();
+        drop(guard);
+
+        self.emit(AppEvent::VaultLocked);
+        info!("Vault locked");
+        Ok(())
+    }
+
+    /// Close the active vault entirely.
+    pub async fn close_vault(&self) -> AppResult<()> {
+        let mut guard = self.session.write().await;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+
+        // Wipe cached plaintext metadata before closing.
+        if let Some(ref index) = active.index {
+            if let Err(e) = index.wipe() {
+                tracing::warn!("Failed to wipe local index on close: {}", e);
+            }
+        }
+
+        *guard = None;
+        drop(guard);
+
+        self.emit(AppEvent::VaultClosed);
+        info!("Vault closed");
+        Ok(())
+    }
+
+    /// Change the vault password.
+    ///
+    /// Both passwords are taken by value as [`Zeroizing<String>`] so they are
+    /// wiped from memory on return, regardless of success or failure. Requires
+    /// exclusive access to the session — FUSE must be unmounted first.
+    pub async fn change_password(
+        &self,
+        old_password: Zeroizing<String>,
+        new_password: Zeroizing<String>,
+    ) -> AppResult<()> {
+        let mut guard = self.session.write().await;
+        let active = guard.as_mut().ok_or(AppError::NoOpenVault)?;
+
+        let session = Arc::get_mut(&mut active.session).ok_or_else(|| {
+            AppError::InvalidInput(
+                "Cannot change password while FUSE is mounted. Unmount first.".to_string(),
+            )
+        })?;
+        session
+            .change_password(old_password.as_bytes(), new_password.as_bytes())
+            .map_err(AppError::from)?;
+
+        // Drop both passwords as soon as the underlying call returns. The
+        // `Zeroizing` wrapper wipes the heap allocation on drop.
+        drop(old_password);
+        drop(new_password);
+
+        // Persist the updated config.
+        self.manager
+            .save_config(&active.session)
+            .await
+            .map_err(AppError::from)?;
+
+        self.emit(AppEvent::PasswordChanged);
+        info!("Password changed");
+        Ok(())
+    }
+
+    /// Check if a vault is currently open.
+    pub async fn is_vault_open(&self) -> bool {
+        self.session.read().await.is_some()
+    }
+
+    /// Get info about the current vault.
+    pub async fn vault_info(&self) -> AppResult<VaultInfoDto> {
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        Ok(VaultInfoDto {
+            id: active.session.vault_id().to_string(),
+            provider_type: active.provider_type.clone(),
+            is_unlocked: active.session.is_active(),
+        })
+    }
+
+    /// Attach a local index to the active vault for metadata caching.
+    ///
+    /// Must be called after `create_vault` or `open_vault`. File operations
+    /// will automatically maintain the index when one is attached.
+    pub async fn set_local_index(&self, index: LocalIndex) -> AppResult<()> {
+        let mut guard = self.session.write().await;
+        let active = guard.as_mut().ok_or(AppError::NoOpenVault)?;
+        active.index = Some(index);
+        Ok(())
+    }
+
+    /// Get a shared reference to the vault session for FUSE mounting.
+    ///
+    /// The caller must drop the returned Arc before calling `lock_vault`,
+    /// `close_vault`, or `change_password` — those methods require exclusive
+    /// access and will fail if a FUSE mount still holds a reference.
+    pub async fn vault_session(&self) -> AppResult<Arc<VaultSession>> {
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        Ok(Arc::clone(&active.session))
+    }
+
+    // -- File operations --
+
+    /// Create a file in the vault.
+    pub async fn create_file(&self, path: &str, content: &[u8]) -> AppResult<()> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.create_file(&vault_path, content)
+            .await
+            .map_err(AppError::from)?;
+
+        if let Some(ref index) = active.index {
+            let _ = index.upsert_entry(&IndexEntry {
+                path: path.to_string(),
+                encrypted_name: String::new(),
+                is_directory: false,
+                size: Some(i64::try_from(content.len()).unwrap_or(i64::MAX)),
+                modified_at: now_timestamp(),
+                etag: None,
+            });
+        }
+
+        drop(guard);
+        self.emit(AppEvent::FileCreated {
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Read a file from the vault.
+    pub async fn read_file(&self, path: &str) -> AppResult<Vec<u8>> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.read_file(&vault_path).await.map_err(AppError::from)
+    }
+
+    /// Update a file in the vault.
+    pub async fn update_file(&self, path: &str, content: &[u8]) -> AppResult<()> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.update_file(&vault_path, content)
+            .await
+            .map_err(AppError::from)?;
+
+        if let Some(ref index) = active.index {
+            let _ = index.upsert_entry(&IndexEntry {
+                path: path.to_string(),
+                encrypted_name: String::new(),
+                is_directory: false,
+                size: Some(i64::try_from(content.len()).unwrap_or(i64::MAX)),
+                modified_at: now_timestamp(),
+                etag: None,
+            });
+        }
+
+        drop(guard);
+        self.emit(AppEvent::FileUpdated {
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Delete a file from the vault.
+    pub async fn delete_file(&self, path: &str) -> AppResult<()> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.delete_file(&vault_path).await.map_err(AppError::from)?;
+
+        if let Some(ref index) = active.index {
+            let _ = index.delete_entry(path);
+        }
+
+        drop(guard);
+        self.emit(AppEvent::FileDeleted {
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    // -- Directory operations --
+
+    /// Create a directory in the vault.
+    pub async fn create_directory(&self, path: &str) -> AppResult<()> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.create_directory(&vault_path)
+            .await
+            .map_err(AppError::from)?;
+
+        if let Some(ref index) = active.index {
+            let _ = index.upsert_entry(&IndexEntry {
+                path: path.to_string(),
+                encrypted_name: String::new(),
+                is_directory: true,
+                size: None,
+                modified_at: now_timestamp(),
+                etag: None,
+            });
+        }
+
+        drop(guard);
+        self.emit(AppEvent::DirectoryCreated {
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    /// List directory contents.
+    pub async fn list_directory(&self, path: &str) -> AppResult<Vec<DirectoryEntryDto>> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        let entries = ops
+            .list_directory(&vault_path)
+            .await
+            .map_err(AppError::from)?;
+
+        let dtos: Vec<DirectoryEntryDto> = entries
+            .into_iter()
+            .map(|(name, is_directory, size)| {
+                let entry_path = if path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", path.trim_end_matches('/'), name)
+                };
+                DirectoryEntryDto {
+                    name,
+                    path: entry_path,
+                    is_directory,
+                    size,
+                    modified_at: None,
+                }
+            })
+            .collect();
+
+        drop(guard);
+        self.emit(AppEvent::DirectoryListed {
+            path: path.to_string(),
+            entries: dtos.clone(),
+        });
+        Ok(dtos)
+    }
+
+    /// Delete an empty directory.
+    pub async fn delete_directory(&self, path: &str) -> AppResult<()> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.delete_directory(&vault_path)
+            .await
+            .map_err(AppError::from)?;
+
+        if let Some(ref index) = active.index {
+            let _ = index.delete_entry(path);
+        }
+
+        drop(guard);
+        self.emit(AppEvent::DirectoryDeleted {
+            path: path.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Check if a path exists in the vault.
+    pub async fn exists(&self, path: &str) -> AppResult<bool> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        Ok(ops.exists(&vault_path).await)
+    }
+
+    /// Get file or directory metadata.
+    pub async fn metadata(&self, path: &str) -> AppResult<FileMetadataDto> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        let (name, is_directory, size) = ops.metadata(&vault_path).await.map_err(AppError::from)?;
+
+        Ok(FileMetadataDto {
+            name,
+            path: path.to_string(),
+            is_directory,
+            size,
+        })
+    }
+
+    // -- File import/export --
+
+    /// Import a local file into the vault.
+    pub async fn import_file(&self, local_path: &str, vault_path: &str) -> AppResult<()> {
+        let content = tokio::fs::read(local_path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to read local file: {}", e)))?;
+
+        self.create_file(vault_path, &content).await
+    }
+
+    /// Export a vault file to the local filesystem.
+    pub async fn export_file(&self, vault_path: &str, local_path: &str) -> AppResult<()> {
+        let content = self.read_file(vault_path).await?;
+
+        tokio::fs::write(local_path, content)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to write local file: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Check if a vault exists at the given location.
+    ///
+    /// This is a convenience wrapper around
+    /// [`VaultManager::vault_exists`]. Callers that already have a
+    /// reference to the manager via [`vault_manager()`](Self::vault_manager)
+    /// may call it directly instead.
+    pub async fn vault_exists(
+        &self,
+        provider_type: &str,
+        provider_config: serde_json::Value,
+    ) -> AppResult<bool> {
+        self.manager
+            .vault_exists(provider_type, provider_config)
+            .await
+            .map_err(AppError::from)
+    }
+}
+
+impl Default for AppService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_and_open_vault() {
+        let service = AppService::new();
+        let mut rx = service.subscribe();
+
+        let result = service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("secure-password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.info.id, "test-vault");
+        assert!(result.info.is_unlocked);
+        assert_eq!(result.recovery_words.split_whitespace().count(), 24);
+
+        // Should have received a VaultCreated event.
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event, AppEvent::VaultCreated(_)));
+    }
+
+    #[tokio::test]
+    async fn test_file_operations() {
+        let service = AppService::new();
+
+        service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        // Create and read a file.
+        service
+            .create_file("/hello.txt", b"Hello, World!")
+            .await
+            .unwrap();
+
+        let content = service.read_file("/hello.txt").await.unwrap();
+        assert_eq!(content, b"Hello, World!");
+
+        // Update the file.
+        service
+            .update_file("/hello.txt", b"Updated content")
+            .await
+            .unwrap();
+
+        let content = service.read_file("/hello.txt").await.unwrap();
+        assert_eq!(content, b"Updated content");
+
+        // Delete the file.
+        service.delete_file("/hello.txt").await.unwrap();
+        assert!(!service.exists("/hello.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_directory_operations() {
+        let service = AppService::new();
+
+        service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        service.create_directory("/docs").await.unwrap();
+        service
+            .create_file("/docs/readme.txt", b"Read me")
+            .await
+            .unwrap();
+
+        let entries = service.list_directory("/docs").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "readme.txt");
+        assert!(!entries[0].is_directory);
+    }
+
+    #[tokio::test]
+    async fn test_lock_and_close() {
+        let service = AppService::new();
+
+        service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        assert!(service.is_vault_open().await);
+
+        service.lock_vault().await.unwrap();
+
+        let info = service.vault_info().await.unwrap();
+        assert!(!info.is_unlocked);
+
+        service.close_vault().await.unwrap();
+        assert!(!service.is_vault_open().await);
+    }
+
+    #[tokio::test]
+    async fn test_no_vault_errors() {
+        let service = AppService::new();
+
+        assert!(matches!(
+            service.vault_info().await,
+            Err(AppError::NoOpenVault)
+        ));
+        assert!(matches!(
+            service.read_file("/foo").await,
+            Err(AppError::NoOpenVault)
+        ));
+        assert!(matches!(
+            service.lock_vault().await,
+            Err(AppError::NoOpenVault)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_open_nonexistent_vault_returns_vault_not_found() {
+        let service = AppService::new();
+
+        let result = service
+            .open_vault(OpenVaultParams {
+                password: Zeroizing::new("password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(AppError::VaultNotFound(_))),
+            "expected VaultNotFound, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_serialization() {
+        let event = AppEvent::FileCreated {
+            path: "/test.txt".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AppEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, AppEvent::FileCreated { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_change_password() {
+        let service = AppService::new();
+
+        service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("old-password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        service
+            .change_password(
+                Zeroizing::new("old-password".to_string()),
+                Zeroizing::new("new-password".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Verify file operations still work after password change.
+        service
+            .create_file("/test.txt", b"test data")
+            .await
+            .unwrap();
+        let content = service.read_file("/test.txt").await.unwrap();
+        assert_eq!(content, b"test data");
+    }
+}
