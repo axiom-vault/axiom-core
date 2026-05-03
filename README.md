@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/axiom-vault/axiom-core/actions/workflows/rust.yml"><img src="https://github.com/axiom-vault/axiom-core/actions/workflows/rust.yml/badge.svg" alt="Rust CI"></a>
   <a href="https://github.com/axiom-vault/axiom-core/releases/latest"><img src="https://img.shields.io/github/v/release/axiom-vault/axiom-core?include_prereleases" alt="Latest Release"></a>
-  <a href="https://github.com/axiom-vault/axiom-core/blob/master/LICENSE"><img src="https://img.shields.io/github/license/axiom-vault/axiom-core" alt="License"></a>
+  <a href="https://github.com/axiom-vault/axiom-core/blob/main/LICENSE"><img src="https://img.shields.io/github/license/axiom-vault/axiom-core" alt="License"></a>
 </p>
 
 ---
