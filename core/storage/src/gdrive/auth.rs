@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use axiomvault_common::{Error, Result};
 
 use crate::cloud_auth::{
-    CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
+    deserialize_optional_secret, CloudAuthorization, CloudPkceVerifier, CloudTokenManager,
+    CloudTokens, TokenRefresher,
 };
 
 /// Re-export `CloudTokens` as `Tokens` for backward compatibility.
@@ -39,16 +40,30 @@ const REDIRECT_URL: &str = "http://localhost:8080/callback";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 
 /// Configuration for OAuth2 authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Client ID (can be overridden from default).
     pub client_id: String,
     /// Optional client secret for confidential clients.
     ///
     /// Native/public clients should use PKCE without a client secret.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
     pub client_secret: Option<String>,
     /// Redirect URL for OAuth2 callback.
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
 }
 
 impl Default for AuthConfig {
@@ -287,6 +302,32 @@ mod tests {
 
         assert_eq!(deserialized.client_id, config.client_id);
         assert_eq!(deserialized.redirect_url, config.redirect_url);
+    }
+
+    #[test]
+    fn test_auth_config_deserializes_empty_client_secret_as_none() {
+        let config: AuthConfig = serde_json::from_value(serde_json::json!({
+            "client_id": "test_id",
+            "client_secret": "",
+            "redirect_url": REDIRECT_URL,
+        }))
+        .unwrap();
+
+        assert!(config.client_secret.is_none());
+    }
+
+    #[test]
+    fn test_auth_config_debug_redacts_client_secret() {
+        let config = AuthConfig {
+            client_id: "test_id".to_string(),
+            client_secret: Some("super-secret".to_string()),
+            redirect_url: REDIRECT_URL.to_string(),
+        };
+
+        let debug = format!("{:?}", config);
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
     }
 
     #[test]

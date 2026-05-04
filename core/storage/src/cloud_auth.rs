@@ -9,10 +9,20 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use axiomvault_common::Result;
+
+/// Deserialize optional OAuth secrets, treating blank strings as absent.
+pub(crate) fn deserialize_optional_secret<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|secret| !secret.is_empty()))
+}
 
 /// PKCE verifier for OAuth authorization-code flows.
 ///
@@ -60,7 +70,6 @@ impl std::fmt::Debug for CloudPkceVerifier {
 }
 
 /// OAuth authorization request data for OAuth 2.1-aligned PKCE flows.
-#[derive(Debug)]
 pub struct CloudAuthorization {
     /// URL the user should open to authorize the application.
     pub url: String,
@@ -72,6 +81,16 @@ pub struct CloudAuthorization {
     /// waiting for the OAuth callback, then reconstruct it with
     /// [`CloudPkceVerifier::new`] before calling `exchange_code`.
     pub pkce_verifier: CloudPkceVerifier,
+}
+
+impl std::fmt::Debug for CloudAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudAuthorization")
+            .field("url", &"[REDACTED]")
+            .field("csrf_token", &"[REDACTED]")
+            .field("pkce_verifier", &self.pkce_verifier)
+            .finish()
+    }
 }
 
 /// OAuth2 tokens with expiration tracking.
@@ -219,6 +238,22 @@ mod tests {
         let deserialized: CloudTokens = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.access_token, tokens.access_token);
         assert_eq!(deserialized.refresh_token, tokens.refresh_token);
+    }
+
+    #[test]
+    fn test_cloud_authorization_debug_redacts_secrets() {
+        let authorization = CloudAuthorization {
+            url: "https://example.test/auth?state=csrf-secret&code_challenge=challenge".to_string(),
+            csrf_token: "csrf-secret".to_string(),
+            pkce_verifier: CloudPkceVerifier::new("pkce-secret".to_string()),
+        };
+
+        let debug = format!("{:?}", authorization);
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("csrf-secret"));
+        assert!(!debug.contains("pkce-secret"));
+        assert!(!debug.contains("https://example.test"));
     }
 
     /// Dummy refresher for testing the token manager.

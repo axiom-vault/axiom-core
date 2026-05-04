@@ -12,7 +12,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use axiomvault_common::{Error, Result};
 
 use crate::cloud_auth::{
-    CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
+    deserialize_optional_secret, CloudAuthorization, CloudPkceVerifier, CloudTokenManager,
+    CloudTokens, TokenRefresher,
 };
 
 /// Re-export `CloudTokens` as `OneDriveTokens` for backward compatibility.
@@ -40,17 +41,31 @@ const REDIRECT_URL: &str = "http://localhost:8080/callback";
 const ONEDRIVE_SCOPES: &[&str] = &["Files.ReadWrite", "offline_access"];
 
 /// Configuration for OneDrive OAuth2 authentication.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct OneDriveAuthConfig {
     /// Azure AD application (client) ID.
     pub client_id: String,
     /// Optional client secret for confidential clients.
     ///
     /// Native/public clients should use PKCE without a client secret.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
     pub client_secret: Option<String>,
     /// Redirect URL for OAuth2 callback.
     #[zeroize(skip)]
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for OneDriveAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneDriveAuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
 }
 
 impl Default for OneDriveAuthConfig {
@@ -269,6 +284,32 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: OneDriveAuthConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.client_id, config.client_id);
+    }
+
+    #[test]
+    fn test_auth_config_deserializes_empty_client_secret_as_none() {
+        let config: OneDriveAuthConfig = serde_json::from_value(serde_json::json!({
+            "client_id": "test_id",
+            "client_secret": "",
+            "redirect_url": REDIRECT_URL,
+        }))
+        .unwrap();
+
+        assert!(config.client_secret.is_none());
+    }
+
+    #[test]
+    fn test_auth_config_debug_redacts_client_secret() {
+        let config = OneDriveAuthConfig {
+            client_id: "test_id".to_string(),
+            client_secret: Some("super-secret".to_string()),
+            redirect_url: REDIRECT_URL.to_string(),
+        };
+
+        let debug = format!("{:?}", config);
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
     }
 
     #[test]

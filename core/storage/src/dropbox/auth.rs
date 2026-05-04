@@ -11,7 +11,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use axiomvault_common::{Error, Result};
 
 use crate::cloud_auth::{
-    CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
+    deserialize_optional_secret, CloudAuthorization, CloudPkceVerifier, CloudTokenManager,
+    CloudTokens, TokenRefresher,
 };
 
 /// Re-export `CloudTokens` as `DropboxTokens` for backward compatibility.
@@ -36,17 +37,31 @@ const DROPBOX_TOKEN_URL: &str = "https://api.dropboxapi.com/oauth2/token";
 const REDIRECT_URL: &str = "http://localhost:8080/callback";
 
 /// Configuration for Dropbox OAuth2 authentication.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct DropboxAuthConfig {
     /// Dropbox app key (client ID).
     pub app_key: String,
     /// Optional Dropbox app secret for confidential clients.
     ///
     /// Native/public clients should use PKCE without an app secret.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
     pub app_secret: Option<String>,
     /// Redirect URL for OAuth2 callback.
     #[zeroize(skip)]
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for DropboxAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DropboxAuthConfig")
+            .field("app_key", &self.app_key)
+            .field(
+                "app_secret",
+                &self.app_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
 }
 
 impl Default for DropboxAuthConfig {
@@ -262,6 +277,32 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: DropboxAuthConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.app_key, config.app_key);
+    }
+
+    #[test]
+    fn test_auth_config_deserializes_empty_app_secret_as_none() {
+        let config: DropboxAuthConfig = serde_json::from_value(serde_json::json!({
+            "app_key": "test_key",
+            "app_secret": "",
+            "redirect_url": REDIRECT_URL,
+        }))
+        .unwrap();
+
+        assert!(config.app_secret.is_none());
+    }
+
+    #[test]
+    fn test_auth_config_debug_redacts_app_secret() {
+        let config = DropboxAuthConfig {
+            app_key: "test_key".to_string(),
+            app_secret: Some("super-secret".to_string()),
+            redirect_url: REDIRECT_URL.to_string(),
+        };
+
+        let debug = format!("{:?}", config);
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
     }
 
     #[test]
