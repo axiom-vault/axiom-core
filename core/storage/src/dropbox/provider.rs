@@ -196,7 +196,7 @@ mod tests {
             },
             auth_config: Some(DropboxAuthConfig {
                 app_key: "test_key".to_string(),
-                app_secret: "test_secret".to_string(),
+                app_secret: Some("test_secret".to_string()),
                 redirect_url: "http://localhost:8080/callback".to_string(),
             }),
         }

@@ -419,7 +419,7 @@ mod tests {
             },
             auth_config: Some(AuthConfig {
                 client_id: "test_client".to_string(),
-                client_secret: "test_secret".to_string(),
+                client_secret: Some("test_secret".to_string()),
                 redirect_url: "http://localhost:8080/callback".to_string(),
             }),
         }

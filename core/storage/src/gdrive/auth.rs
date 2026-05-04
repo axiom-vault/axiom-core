@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use axiomvault_common::{Error, Result};
 
-use crate::cloud_auth::{CloudTokenManager, CloudTokens, TokenRefresher};
+use crate::cloud_auth::{
+    deserialize_optional_secret, CloudAuthorization, CloudPkceVerifier, CloudTokenManager,
+    CloudTokens, TokenRefresher,
+};
 
 /// Re-export `CloudTokens` as `Tokens` for backward compatibility.
 pub type Tokens = CloudTokens;
@@ -37,20 +40,38 @@ const REDIRECT_URL: &str = "http://localhost:8080/callback";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 
 /// Configuration for OAuth2 authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Client ID (can be overridden from default).
     pub client_id: String,
-    /// Client secret (can be overridden from default).
-    pub client_secret: String,
+    /// Optional client secret for confidential clients.
+    ///
+    /// Native/public clients should use PKCE without a client secret.
+    #[serde(default, deserialize_with = "deserialize_optional_secret")]
+    pub client_secret: Option<String>,
     /// Redirect URL for OAuth2 callback.
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         let client_id = std::env::var("AXIOMVAULT_GOOGLE_CLIENT_ID").unwrap_or_default();
-        let client_secret = std::env::var("AXIOMVAULT_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+        let client_secret = std::env::var("AXIOMVAULT_GOOGLE_CLIENT_SECRET")
+            .ok()
+            .filter(|secret| !secret.is_empty());
         Self {
             client_id,
             client_secret,
@@ -69,13 +90,6 @@ impl AuthConfig {
                     .to_string(),
             ));
         }
-        if self.client_secret.is_empty() {
-            return Err(axiomvault_common::Error::InvalidInput(
-                "Google OAuth2 client secret not configured. \
-                 Set the AXIOMVAULT_GOOGLE_CLIENT_SECRET environment variable."
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }
@@ -90,8 +104,7 @@ pub struct AuthManager {
 impl AuthManager {
     /// Create a new authentication manager.
     pub fn new(config: AuthConfig) -> Result<Self> {
-        let client = BasicClient::new(ClientId::new(config.client_id.clone()))
-            .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        let mut client = BasicClient::new(ClientId::new(config.client_id.clone()))
             .set_auth_uri(
                 AuthUrl::new(GOOGLE_AUTH_URL.to_string())
                     .map_err(|e| Error::InvalidInput(format!("Invalid auth URL: {}", e)))?,
@@ -105,13 +118,17 @@ impl AuthManager {
                     .map_err(|e| Error::InvalidInput(format!("Invalid redirect URL: {}", e)))?,
             );
 
+        if let Some(client_secret) = &config.client_secret {
+            client = client.set_client_secret(ClientSecret::new(client_secret.clone()));
+        }
+
         Ok(Self { client, config })
     }
 
     /// Create with default configuration (reads credentials from environment variables).
     ///
-    /// Requires `AXIOMVAULT_GOOGLE_CLIENT_ID` and `AXIOMVAULT_GOOGLE_CLIENT_SECRET`
-    /// to be set in the environment.
+    /// Requires `AXIOMVAULT_GOOGLE_CLIENT_ID` to be set in the environment.
+    /// `AXIOMVAULT_GOOGLE_CLIENT_SECRET` is optional for confidential clients.
     pub fn with_defaults() -> Result<Self> {
         let config = AuthConfig::default();
         config.validate()?;
@@ -120,17 +137,23 @@ impl AuthManager {
 
     /// Generate the authorization URL for the user to visit.
     ///
-    /// Returns the URL and a CSRF token that should be verified on callback.
-    pub fn authorization_url(&self) -> (String, String) {
+    /// Returns the URL, CSRF token, and PKCE verifier needed for token exchange.
+    pub fn authorization_url(&self) -> CloudAuthorization {
+        let (pkce_challenge, pkce_verifier) = oauth2::PkceCodeChallenge::new_random_sha256();
         let (auth_url, csrf_token) = self
             .client
             .authorize_url(oauth2::CsrfToken::new_random)
             .add_scope(Scope::new(DRIVE_SCOPE.to_string()))
             .add_extra_param("access_type", "offline")
             .add_extra_param("prompt", "consent")
+            .set_pkce_challenge(pkce_challenge)
             .url();
 
-        (auth_url.to_string(), csrf_token.secret().clone())
+        CloudAuthorization {
+            url: auth_url.to_string(),
+            csrf_token: csrf_token.secret().clone(),
+            pkce_verifier: pkce_verifier.into(),
+        }
     }
 
     /// Exchange an authorization code for tokens.
@@ -144,7 +167,11 @@ impl AuthManager {
     /// # Errors
     /// - Invalid authorization code
     /// - Network errors
-    pub async fn exchange_code(&self, code: &str) -> Result<Tokens> {
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        pkce_verifier: CloudPkceVerifier,
+    ) -> Result<Tokens> {
         use oauth2::AuthorizationCode;
 
         let http_client = oauth2::reqwest::ClientBuilder::new()
@@ -155,6 +182,7 @@ impl AuthManager {
         let token_result = self
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()))
+            .set_pkce_verifier(pkce_verifier.into_oauth2())
             .request_async(&http_client)
             .await
             .map_err(|e| Error::Authentication(format!("Token exchange failed: {}", e)))?;
@@ -277,6 +305,32 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_config_deserializes_empty_client_secret_as_none() {
+        let config: AuthConfig = serde_json::from_value(serde_json::json!({
+            "client_id": "test_id",
+            "client_secret": "",
+            "redirect_url": REDIRECT_URL,
+        }))
+        .unwrap();
+
+        assert!(config.client_secret.is_none());
+    }
+
+    #[test]
+    fn test_auth_config_debug_redacts_client_secret() {
+        let config = AuthConfig {
+            client_id: "test_id".to_string(),
+            client_secret: Some("super-secret".to_string()),
+            redirect_url: REDIRECT_URL.to_string(),
+        };
+
+        let debug = format!("{:?}", config);
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[test]
     fn test_tokens_serialization() {
         let tokens = Tokens {
             access_token: "access".to_string(),
@@ -295,29 +349,54 @@ mod tests {
     fn test_auth_manager_creation() {
         let config = AuthConfig {
             client_id: "test_id".to_string(),
-            client_secret: "test_secret".to_string(),
+            client_secret: None,
             redirect_url: "http://localhost:8080/callback".to_string(),
         };
 
         let manager = AuthManager::new(config.clone()).unwrap();
         assert_eq!(manager.config().client_id, "test_id");
+        assert!(manager.config().client_secret.is_none());
+    }
+
+    #[test]
+    fn test_config_validation_allows_empty_client_secret() {
+        let config = AuthConfig {
+            client_id: "test_id".to_string(),
+            client_secret: None,
+            redirect_url: "http://localhost:8080/callback".to_string(),
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_authorization_url_generation() {
         let config = AuthConfig {
             client_id: "test_id".to_string(),
-            client_secret: "test_secret".to_string(),
+            client_secret: None,
             redirect_url: "http://localhost:8080/callback".to_string(),
         };
 
         let manager = AuthManager::new(config).unwrap();
-        let (url, csrf_token) = manager.authorization_url();
+        let authorization = manager.authorization_url();
 
-        assert!(url.contains("accounts.google.com"));
-        assert!(url.contains("client_id=test_id"));
-        assert!(url.contains("scope="));
-        assert!(url.contains("access_type=offline"));
-        assert!(!csrf_token.is_empty());
+        assert!(authorization.url.contains("accounts.google.com"));
+        assert!(authorization.url.contains("client_id=test_id"));
+        assert!(authorization.url.contains("scope="));
+        assert!(authorization.url.contains("access_type=offline"));
+        assert!(authorization.url.contains("code_challenge="));
+        assert!(authorization.url.contains("code_challenge_method=S256"));
+        assert!(!authorization.csrf_token.is_empty());
+        assert!(!authorization.pkce_verifier.secret().is_empty());
+
+        let parsed_url = url::Url::parse(&authorization.url).unwrap();
+        let code_challenge = parsed_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code_challenge").then(|| value.to_string()))
+            .unwrap();
+        let verifier =
+            oauth2::PkceCodeVerifier::new(authorization.pkce_verifier.secret().to_string());
+        let expected_challenge = oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier);
+        assert_eq!(code_challenge, expected_challenge.as_str());
     }
 }
