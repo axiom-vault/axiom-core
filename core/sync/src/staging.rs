@@ -101,8 +101,8 @@ pub struct StagingArea {
 impl StagingArea {
     /// Create a new staging area.
     ///
-    /// On Unix the staging directory is chmod'd to `0o700` so other local
-    /// users cannot enumerate or read pending changes (audit M-5).
+    /// On Unix the staging directory is created with `0o700` atomically so
+    /// other local users cannot enumerate or read pending changes (audit M-5).
     ///
     /// If the on-disk registry exists but is corrupt (invalid JSON), the
     /// corrupt file is renamed to `staging_registry.json.corrupt-{ts}` so
@@ -114,17 +114,21 @@ impl StagingArea {
         let staging_dir = base_dir.join("staging");
         let registry_path = base_dir.join("staging_registry.json");
 
-        // Create staging directory.
-        fs::create_dir_all(&staging_dir).await.map_err(Error::Io)?;
-
-        // Tighten directory permissions on Unix (audit M-5).
+        // Create staging directory with restrictive mode atomically (audit M-5).
+        // Using DirBuilder with .mode() avoids the window where the dir is created
+        // with the default umask before set_permissions tightens it.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            fs::set_permissions(&staging_dir, perms)
-                .await
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&staging_dir)
                 .map_err(Error::Io)?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(&staging_dir).await.map_err(Error::Io)?;
         }
 
         // Load existing registry if present. Corrupt JSON is preserved on

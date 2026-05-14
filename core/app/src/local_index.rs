@@ -44,22 +44,36 @@ pub struct LocalIndex {
 impl LocalIndex {
     /// Create or open a local index database.
     ///
-    /// The database file is created with mode 0600 (owner read/write only)
+    /// The database file is pre-created with mode 0600 (owner read/write only)
     /// to prevent other users from reading cached vault metadata.
     pub fn open(db_path: impl AsRef<Path>) -> AppResult<Self> {
         let db_path = db_path.as_ref();
         let is_new = !db_path.exists() || db_path.to_str() == Some(":memory:");
-        let conn = Connection::open(db_path).map_err(sqlite_err)?;
 
+        // Pre-create the DB file with mode 0600 so SQLite opens an already-private
+        // file. Avoids the window where another local user could read cached
+        // vault metadata between SQLite's create and a later set_permissions call.
         #[cfg(unix)]
         if is_new && db_path.to_str() != Some(":memory:") {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(db_path)
             {
-                tracing::warn!("Failed to set restrictive permissions on index db: {}", e);
+                Ok(_) => {} // file now exists with 0600; SQLite will open it below
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // race: another process won
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to pre-create index db with restrictive perms: {}",
+                        e
+                    );
+                }
             }
         }
+
+        let conn = Connection::open(db_path).map_err(sqlite_err)?;
 
         conn.execute_batch(
             r#"
