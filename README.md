@@ -10,8 +10,6 @@
   <a href="https://github.com/axiom-vault/axiom-core/blob/main/LICENSE"><img src="https://img.shields.io/github/license/axiom-vault/axiom-core" alt="License"></a>
 </p>
 
----
-
 > [!WARNING]
 > This project is in **early development** and is **not production ready**. APIs may change, features may be incomplete. Do not use for storing sensitive data in production.
 
@@ -34,6 +32,7 @@
 | `core/fuse` | FUSE virtual filesystem |
 | `core/webdav` | WebDAV server |
 | `core/common` | Shared types and error handling |
+| `core/mcp` | MCP server over stdio |
 
 ## Features
 
@@ -66,8 +65,8 @@
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) stable toolchain
+- **Linux (for the FUSE crate):**
 
-**Linux (for the FUSE crate):**
 ```bash
 sudo apt-get install -y libfuse3-dev
 ```
@@ -95,18 +94,27 @@ cargo run -p axiomvault-mcp
 ### Lint
 
 ```bash
-cargo fmt --all                          # Format
-cargo clippy --workspace -- -D warnings  # Lint
+cargo fmt --all # Format
+cargo clippy --workspace -- -D warnings # Lint
+RUSTFLAGS='-D warnings' cargo check --workspace # Fast warning gate
 ```
+
+### Git Hooks
+
+```bash
+./scripts/install-hooks.sh
+```
+
+This installs the tracked pre-commit hook via `core.hooksPath=.githooks` so local commits run the fast workspace warning gate.
 
 ## Vault Format
 
-```
+```text
 vault-root/
-├── vault.config          # Encrypted metadata (salt, KDF params, version)
-├── d/                    # Encrypted file content
+├── vault.config # Encrypted metadata (salt, KDF params, version)
+├── d/ # Encrypted file content
 └── m/
-    └── tree.json         # Encrypted directory tree index
+   └── tree.json # Encrypted directory tree index
 ```
 
 ## Security Design

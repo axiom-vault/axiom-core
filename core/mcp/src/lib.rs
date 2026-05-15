@@ -29,8 +29,10 @@ const VAULT_TREE_URI: &str = "axiom://vault/tree";
 #[derive(Clone)]
 pub struct AxiomMcpServer {
     app: Arc<AppService>,
-    tool_router: ToolRouter<Self>,
-    prompt_router: PromptRouter<Self>,
+    #[expect(dead_code, reason = "stored router used by rmcp macro-generated handlers")]
+ tool_router: ToolRouter<Self>,
+    #[expect(dead_code, reason = "stored router used by rmcp macro-generated handlers")]
+ prompt_router: PromptRouter<Self>,
 }
 
 impl AxiomMcpServer {

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "pre-commit: cargo check workspace with warnings denied"
+RUSTFLAGS='-D warnings' cargo check --workspace
