@@ -1,0 +1,14 @@
+problem: Add a Rust MCP server workspace member using rmcp over stdio
+approach: Created core/mcp with rmcp tool/prompt/resource handlers backed by AppService, added write guards, truncation helpers, secret-redacting DTOs, docs, and targeted tests
+failed_paths:
+  - Initial rmcp implementation missed RoleServer import, generic router types, and recursive async boxing
+verification:
+  - cargo test -p axiomvault-mcp
+  - cargo check -p axiomvault-mcp
+workflow_learning: For rmcp 1.7 servers, store ToolRouter<Self>/PromptRouter<Self>, import RoleServer for RequestContext, and box recursive async tree walkers
+related_files:
+  - Cargo.toml
+  - README.md
+  - core/mcp/src/lib.rs
+  - core/mcp/src/main.rs
+  - core/mcp/README.md
