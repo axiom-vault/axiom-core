@@ -86,6 +86,12 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+### MCP Server
+
+```bash
+cargo run -p axiomvault-mcp
+```
+
 ### Lint
 
 ```bash
