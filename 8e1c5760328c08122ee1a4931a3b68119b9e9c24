@@ -1,0 +1,11 @@
+problem: Sensitive local metadata files/dirs were created with permissive defaults before chmod hardening
+approach: Applied Unix creation modes atomically with OpenOptions/DirBuilder so restrictive permissions are in place from first byte/entry
+failed_paths:
+  - Did not rely on post-creation chmod because it leaves a local race window
+verification:
+  - cargo test --workspace
+  - user-reported successful YubiKey-backed e2e test
+workflow_learning: For permission hardening, check file/directory creation APIs for atomic mode support before adding chmod cleanup
+related_files:
+  - core/app/src/local_index.rs
+  - core/sync/src/staging.rs
