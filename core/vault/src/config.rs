@@ -9,6 +9,7 @@ use axiomvault_common::{Error, Result, VaultId};
 use axiomvault_crypto::recovery::{
     self, create_recovery_verification, generate_master_key, unwrap_key, wrap_key, RecoveryKey,
 };
+use axiomvault_crypto::recovery::{create_hardware_key_verification, derive_hardware_key_kek};
 use axiomvault_crypto::{KdfParams, MasterKey, Salt};
 use zeroize::Zeroizing;
 
@@ -40,6 +41,53 @@ impl Default for VaultVersion {
     fn default() -> Self {
         Self::CURRENT
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HardwareKeyKind {
+ YubiKeyHmacSha1,
+ FidoDerivedSecret,
+ RawSecret,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareKeyMetadata {
+ pub kind: HardwareKeyKind,
+ #[serde(default, skip_serializing_if = "Option::is_none")]
+ pub label: Option<String>,
+ #[serde(default, skip_serializing_if = "Option::is_none")]
+ pub key_id: Option<String>,
+ pub enrolled_at: DateTime<Utc>,
+}
+
+impl HardwareKeyMetadata {
+ pub fn new(kind: HardwareKeyKind, label: Option<String>, key_id: Option<String>) -> Self {
+ Self {
+ kind,
+ label,
+ key_id,
+ enrolled_at: Utc::now(),
+ }
+ }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareKeyConfig {
+ pub metadata: HardwareKeyMetadata,
+ pub wrapped_master_key: Vec<u8>,
+ pub key_verification: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareKeyStatus {
+ pub enrolled: bool,
+ pub metadata: Option<HardwareKeyMetadata>,
+}
+
+impl HardwareKeyStatus {
+ pub fn is_enrolled(&self) -> bool {
+ self.enrolled
+ }
 }
 
 /// Encrypted vault configuration.
@@ -109,6 +157,8 @@ pub struct VaultConfig {
     /// re-display it later (requires unlocking with password first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_recovery_key: Option<Vec<u8>>,
+ #[serde(default, skip_serializing_if = "Option::is_none")]
+ pub hardware_key: Option<HardwareKeyConfig>,
 }
 
 /// Result of creating a new vault configuration.
@@ -181,6 +231,7 @@ impl VaultConfig {
             recovery_wrapped_master_key: Some(recovery_wrapped_master_key),
             recovery_key_verification: Some(recovery_key_verification),
             encrypted_recovery_key: Some(encrypted_recovery_key),
+ hardware_key: None,
         };
 
         Ok(VaultConfigCreation {
@@ -270,7 +321,53 @@ impl VaultConfig {
     /// This re-wraps the master key with a new password-derived KEK and
     /// updates the password verification data. The recovery key data
     /// remains unchanged.
-    pub fn reset_password(
+    pub fn verify_hardware_key(&self, secret: &[u8]) -> Result<Option<MasterKey>> {
+ let hardware_key = self
+ .hardware_key
+ .as_ref()
+ .ok_or_else(|| Error::Vault("No hardware key configured for this vault".to_string()))?;
+
+ if !recovery::verify_hardware_key(secret, &hardware_key.key_verification)? {
+ return Ok(None);
+ }
+
+ let hardware_kek = derive_hardware_key_kek(secret)?;
+ let master_key = unwrap_key(&hardware_key.wrapped_master_key, &hardware_kek)?;
+ Ok(Some(master_key))
+ }
+
+ pub fn enroll_hardware_key(
+ &mut self,
+ master_key: &MasterKey,
+ secret: &[u8],
+ metadata: HardwareKeyMetadata,
+ ) -> Result<()> {
+ let hardware_kek = derive_hardware_key_kek(secret)?;
+ let wrapped_master_key = wrap_key(master_key, &hardware_kek)?;
+ let key_verification = create_hardware_key_verification(secret)?;
+
+ self.hardware_key = Some(HardwareKeyConfig {
+ metadata,
+ wrapped_master_key,
+ key_verification,
+ });
+ self.modified_at = Utc::now();
+ Ok(())
+ }
+
+ pub fn remove_hardware_key(&mut self) {
+ self.hardware_key = None;
+ self.modified_at = Utc::now();
+ }
+
+ pub fn hardware_key_status(&self) -> HardwareKeyStatus {
+ HardwareKeyStatus {
+ enrolled: self.hardware_key.is_some(),
+ metadata: self.hardware_key.as_ref().map(|config| config.metadata.clone()),
+ }
+ }
+
+ pub fn reset_password(
         &mut self,
         recovery_key: &RecoveryKey,
         new_password: &[u8],
@@ -373,6 +470,7 @@ impl VaultConfig {
         self.recovery_wrapped_master_key = Some(recovery_wrapped);
         self.recovery_key_verification = Some(recovery_verification);
         self.encrypted_recovery_key = Some(encrypted_recovery_key);
+ self.hardware_key = None;
         self.modified_at = Utc::now();
 
         Ok(recovery_words)
@@ -528,10 +626,60 @@ mod tests {
         assert_eq!(restored.provider_type, config.provider_type);
         assert!(restored.wrapped_master_key.is_some());
         assert!(restored.verify_password(password).unwrap().is_some());
+ assert!(!restored.hardware_key_status().is_enrolled());
     }
 
     #[test]
-    fn test_legacy_format_detection() {
+    fn test_hardware_key_enroll_verify_remove_status_and_serialization() {
+ let id = VaultId::new("test-vault").unwrap();
+ let password = b"password";
+ let params = KdfParams::moderate();
+ let creation = VaultConfig::new(id, password, "memory", serde_json::Value::Null, params).unwrap();
+ let mut config = creation.config;
+ let master_key = config.verify_password(password).unwrap().unwrap();
+ let metadata = HardwareKeyMetadata::new(
+ HardwareKeyKind::YubiKeyHmacSha1,
+ Some("YubiKey slot 2".to_string()),
+ Some("yk-slot-2".to_string()),
+ );
+ let secret = b"simulated-yubikey-hmac-response";
+
+ assert!(!config.hardware_key_status().is_enrolled());
+ config.enroll_hardware_key(&master_key, secret, metadata.clone()).unwrap();
+ let status = config.hardware_key_status();
+ assert!(status.is_enrolled());
+ assert_eq!(status.metadata, Some(metadata.clone()));
+ assert!(config.verify_hardware_key(secret).unwrap().is_some());
+ assert!(config.verify_hardware_key(b"wrong-secret").unwrap().is_none());
+
+ let json = config.to_json().unwrap();
+ let restored = VaultConfig::from_json(&json).unwrap();
+ assert!(restored.hardware_key_status().is_enrolled());
+ assert_eq!(restored.hardware_key_status().metadata, Some(metadata));
+ assert!(restored.verify_hardware_key(secret).unwrap().is_some());
+
+ config.remove_hardware_key();
+ assert!(!config.hardware_key_status().is_enrolled());
+ assert!(config.verify_hardware_key(secret).is_err());
+ }
+
+ #[test]
+ fn test_old_vault_json_without_hardware_key_deserializes() {
+ let id = VaultId::new("legacy-json").unwrap();
+ let password = b"password";
+ let params = KdfParams::moderate();
+ let creation = VaultConfig::new(id, password, "memory", serde_json::Value::Null, params).unwrap();
+ let config = creation.config;
+ let json = config.to_json().unwrap();
+ let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+ assert!(value.get("hardware_key").is_none());
+ let restored = VaultConfig::from_json(&json).unwrap();
+ assert!(!restored.hardware_key_status().is_enrolled());
+ assert!(restored.verify_password(password).unwrap().is_some());
+ }
+
+ #[test]
+ fn test_legacy_format_detection() {
         let id = VaultId::new("legacy").unwrap();
         let password = b"password";
         let params = KdfParams::moderate();
@@ -556,6 +704,7 @@ mod tests {
             recovery_wrapped_master_key: None,
             recovery_key_verification: None,
             encrypted_recovery_key: None,
+            hardware_key: None,
         };
 
         assert!(config.is_legacy_format());
@@ -589,6 +738,7 @@ mod tests {
             recovery_wrapped_master_key: None,
             recovery_key_verification: None,
             encrypted_recovery_key: None,
+            hardware_key: None,
         };
 
         let recovery_words = config.migrate_to_v1_1(password).unwrap();
