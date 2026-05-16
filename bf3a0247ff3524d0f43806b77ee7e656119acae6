@@ -1,0 +1,12 @@
+problem: Harden hardware-key and recovery-key handling for PR #4 audit
+approach: Zeroized temporary mnemonic/digest buffers, rejected undersized hardware secrets, and updated tests for the stricter validation
+failed_paths:
+  - batch edit matching was unreliable on the minified source, so the crypto file was rewritten in formatted form before verification
+verification:
+  - cargo fmt --all
+  - cargo test -p axiomvault-crypto -p axiomvault-vault
+  - cargo clippy -p axiomvault-crypto -p axiomvault-vault --all-targets -- -D warnings
+workflow_learning: For secret-handling audits, inspect transient heap/stack buffers and enforce minimum entropy at API boundaries, then re-run focused crypto/vault checks
+related_files:
+  - core/crypto/src/recovery.rs
+  - core/vault/src/config.rs
