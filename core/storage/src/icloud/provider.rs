@@ -2,14 +2,13 @@
 //!
 //! Wraps `LocalProvider` around the iCloud Drive mount point on macOS.
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-
-use axiomvault_common::{Error, Result, VaultPath};
-
 use crate::local::LocalProvider;
 use crate::provider::{ByteStream, Metadata, StorageProvider};
+use async_trait::async_trait;
+use axiomvault_common::{Error, Result, VaultPath};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// iCloud Drive provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +17,8 @@ pub struct ICloudConfig {
     /// If not set, the provider auto-detects on macOS.
     #[serde(default)]
     pub root_path: Option<String>,
-    /// Subfolder within iCloud Drive (e.g., "AxiomVault").
+    /// Relative subfolder within iCloud Drive (for example `AxiomVault/work`).
+    /// Absolute paths, prefixes, traversal, and empty/whitespace components are rejected.
     #[serde(default)]
     pub subfolder: Option<String>,
 }
@@ -38,25 +38,73 @@ impl ICloudProvider {
     /// configured `root_path` override.
     pub fn new(config: ICloudConfig) -> Result<Self> {
         let base_path = match config.root_path {
-            Some(ref path) => std::path::PathBuf::from(path),
+            Some(ref path) => PathBuf::from(path),
             None => super::detect_icloud_path().ok_or_else(|| {
                 Error::NotFound(
-                    "iCloud Drive not found. \
-                     iCloud Drive is only available on macOS with iCloud enabled. \
-                     You can set a custom path via the 'root_path' config option."
-                        .to_string(),
+                    "iCloud Drive not found. iCloud Drive is only available on macOS with iCloud enabled. You can set a custom path via the 'root_path' config option.".to_string(),
                 )
             })?,
         };
 
-        let root = match config.subfolder {
-            Some(ref sub) => base_path.join(sub),
+        let root = match config.subfolder.as_deref() {
+            Some(subfolder) => base_path.join(validate_subfolder(subfolder)?),
             None => base_path,
         };
 
         let local = LocalProvider::new(&root)?;
         Ok(Self { local })
     }
+}
+
+fn validate_subfolder(subfolder: &str) -> Result<PathBuf> {
+    if subfolder.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "iCloud subfolder cannot be empty or whitespace".to_string(),
+        ));
+    }
+
+    if has_windows_drive_prefix(subfolder) {
+        return Err(Error::InvalidInput(
+            "iCloud subfolder must be a relative path without filesystem prefixes".to_string(),
+        ));
+    }
+
+    let path = Path::new(subfolder);
+    if path.is_absolute() || path.has_root() {
+        return Err(Error::InvalidInput(
+            "iCloud subfolder must be a relative path".to_string(),
+        ));
+    }
+
+    let mut sanitized = PathBuf::new();
+    for component in subfolder.split(['/', '\\']) {
+        if component.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "iCloud subfolder components cannot be empty or whitespace".to_string(),
+            ));
+        }
+
+        if component == "." || component == ".." {
+            return Err(Error::InvalidInput(
+                "iCloud subfolder cannot contain '.' or '..' path components".to_string(),
+            ));
+        }
+
+        sanitized.push(component);
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        return Err(Error::InvalidInput(
+            "iCloud subfolder cannot be empty or whitespace".to_string(),
+        ));
+    }
+
+    Ok(sanitized)
+}
+
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[async_trait]
@@ -118,13 +166,34 @@ impl StorageProvider for ICloudProvider {
 pub fn create_icloud_provider(config: serde_json::Value) -> Result<Arc<dyn StorageProvider>> {
     let icloud_config: ICloudConfig = serde_json::from_value(config)
         .map_err(|e| Error::InvalidInput(format!("Invalid iCloud config: {}", e)))?;
-
     Ok(Arc::new(ICloudProvider::new(icloud_config)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_root(dir: &tempfile::TempDir) -> ICloudConfig {
+        ICloudConfig {
+            root_path: Some(dir.path().to_string_lossy().to_string()),
+            subfolder: None,
+        }
+    }
+
+    fn config_with_subfolder(dir: &tempfile::TempDir, subfolder: &str) -> ICloudConfig {
+        ICloudConfig {
+            root_path: Some(dir.path().to_string_lossy().to_string()),
+            subfolder: Some(subfolder.to_string()),
+        }
+    }
+
+    fn invalid_subfolder_error(subfolder: &str) -> Error {
+        let dir = tempfile::TempDir::new().unwrap();
+        match ICloudProvider::new(config_with_subfolder(&dir, subfolder)) {
+            Ok(_) => panic!("invalid subfolder should be rejected: {subfolder}"),
+            Err(err) => err,
+        }
+    }
 
     #[test]
     fn test_icloud_config_serialization() {
@@ -143,58 +212,102 @@ mod tests {
     #[test]
     fn test_create_provider_with_custom_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: None,
-        };
+        let provider = ICloudProvider::new(config_with_root(&dir)).unwrap();
 
-        let provider = ICloudProvider::new(config).unwrap();
         assert_eq!(provider.name(), "icloud");
+    }
+
+    #[test]
+    fn test_create_provider_with_nested_subfolder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = ICloudProvider::new(config_with_subfolder(&dir, "AxiomVault/work")).unwrap();
+
+        assert_eq!(provider.name(), "icloud");
+        assert!(dir.path().join("AxiomVault").join("work").exists());
+    }
+
+    #[test]
+    fn test_rejects_absolute_subfolder() {
+        let err = invalid_subfolder_error("/escape");
+        assert!(matches!(err, Error::InvalidInput(message) if message.contains("relative path")));
+    }
+
+    #[test]
+    fn test_rejects_parent_traversal_subfolder() {
+        let err = invalid_subfolder_error("safe/../escape");
+        assert!(matches!(err, Error::InvalidInput(message) if message.contains("'.' or '..'")));
+    }
+
+    #[test]
+    fn test_rejects_empty_or_whitespace_subfolder_components() {
+        let repeated_separator_err = invalid_subfolder_error("safe//escape");
+        assert!(matches!(
+            repeated_separator_err,
+            Error::InvalidInput(message) if message.contains("empty or whitespace")
+        ));
+
+        let whitespace_component_err = invalid_subfolder_error("safe/ /escape");
+        assert!(matches!(
+            whitespace_component_err,
+            Error::InvalidInput(message) if message.contains("empty or whitespace")
+        ));
+    }
+
+    #[test]
+    fn test_rejects_windows_prefix_subfolder() {
+        let err = invalid_subfolder_error("C:\\escape");
+        assert!(matches!(err, Error::InvalidInput(message) if message.contains("prefixes")));
     }
 
     #[test]
     fn test_create_provider_factory() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = serde_json::json!({
-            "root_path": dir.path().to_string_lossy().to_string()
+            "root_path": dir.path().to_string_lossy().to_string(),
         });
-
         let provider = create_icloud_provider(config).unwrap();
+
         assert_eq!(provider.name(), "icloud");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_create_provider_without_root_path_fails_off_macos() {
+        let err = match ICloudProvider::new(ICloudConfig {
+            root_path: None,
+            subfolder: None,
+        }) {
+            Ok(_) => panic!("provider creation without a root path should fail off macOS"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::NotFound(message) if message.contains("iCloud Drive not found"))
+        );
     }
 
     #[tokio::test]
     async fn test_icloud_basic_operations() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: None,
-        };
+        let provider = ICloudProvider::new(config_with_root(&dir)).unwrap();
 
-        let provider = ICloudProvider::new(config).unwrap();
-
-        // Create a directory
         let dir_path = VaultPath::parse("test-dir").unwrap();
         provider.create_dir(&dir_path).await.unwrap();
         assert!(provider.exists(&dir_path).await.unwrap());
 
-        // Upload a file
         let file_path = VaultPath::parse("test-dir/hello.txt").unwrap();
         provider
             .upload(&file_path, b"hello world".to_vec())
             .await
             .unwrap();
 
-        // Download and verify
         let data = provider.download(&file_path).await.unwrap();
         assert_eq!(data, b"hello world");
 
-        // List directory
         let entries = provider.list(&dir_path).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
 
-        // Delete
         provider.delete(&file_path).await.unwrap();
         assert!(!provider.exists(&file_path).await.unwrap());
     }
