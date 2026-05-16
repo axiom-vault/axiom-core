@@ -7,18 +7,19 @@
 //! - Deriving a KEK from a recovery key via Blake2b (high-entropy input,
 //!   no need for slow Argon2id)
 
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-
 use crate::aead;
 use crate::keys::{MasterKey, KEY_LENGTH};
 use axiomvault_common::{Error, Result};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Context string for deriving a recovery KEK via Blake2b.
 const RECOVERY_KEK_CONTEXT: &[u8] = b"axiomvault_recovery_kek_v1";
 /// Context string for deriving a hardware-key KEK via Blake2b.
 const HARDWARE_KEY_KEK_CONTEXT: &[u8] = b"axiomvault_hardware_key_kek_v1";
+/// Minimum acceptable hardware-key secret length in bytes.
+const MIN_HARDWARE_KEY_SECRET_LENGTH: usize = 16;
 
 /// A 256-bit recovery key that can be encoded as BIP39 mnemonic words.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -58,17 +59,19 @@ impl RecoveryKey {
         let mnemonic: bip39::Mnemonic = words
             .parse()
             .map_err(|e| Error::Crypto(format!("Invalid recovery key words: {}", e)))?;
-        let entropy = mnemonic.to_entropy();
+        let mut entropy = mnemonic.to_entropy();
         if entropy.len() != KEY_LENGTH {
+            let actual_len = entropy.len();
+            entropy.zeroize();
             return Err(Error::Crypto(format!(
                 "Invalid recovery key length: expected {} bytes, got {}",
-                KEY_LENGTH,
-                entropy.len()
+                KEY_LENGTH, actual_len
             )));
         }
 
         let mut bytes = [0u8; KEY_LENGTH];
         bytes.copy_from_slice(&entropy);
+        entropy.zeroize();
         Ok(Self { entropy: bytes })
     }
 
@@ -77,10 +80,11 @@ impl RecoveryKey {
         let mut hasher = Blake2b::<U32>::new();
         hasher.update(self.entropy);
         hasher.update(RECOVERY_KEK_CONTEXT);
-        let result = hasher.finalize();
+        let mut result = hasher.finalize();
 
         let mut kek = Zeroizing::new([0u8; KEY_LENGTH]);
         kek.copy_from_slice(&result);
+        result.as_mut_slice().zeroize();
         kek
     }
 }
@@ -92,14 +96,21 @@ pub fn derive_hardware_key_kek(secret: &[u8]) -> Result<Zeroizing<[u8; KEY_LENGT
             "Hardware-key secret cannot be empty".to_string(),
         ));
     }
+    if secret.len() < MIN_HARDWARE_KEY_SECRET_LENGTH {
+        return Err(Error::InvalidInput(format!(
+            "Hardware-key secret must be at least {} bytes",
+            MIN_HARDWARE_KEY_SECRET_LENGTH
+        )));
+    }
 
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(secret);
     hasher.update(HARDWARE_KEY_KEK_CONTEXT);
-    let result = hasher.finalize();
+    let mut result = hasher.finalize();
 
     let mut kek = Zeroizing::new([0u8; KEY_LENGTH]);
     kek.copy_from_slice(&result);
+    result.as_mut_slice().zeroize();
     Ok(kek)
 }
 
@@ -143,8 +154,7 @@ pub fn unwrap_key(wrapped: &[u8], kek: &[u8; KEY_LENGTH]) -> Result<MasterKey> {
 /// Verification constant used to validate recovery keys.
 pub const RECOVERY_VERIFICATION_PLAINTEXT: &[u8] = b"AXIOMVAULT_RECOVERY_VERIFICATION_V1";
 /// Verification constant used to validate caller-provided hardware-key bytes.
-pub const HARDWARE_KEY_VERIFICATION_PLAINTEXT: &[u8] =
-    b"AXIOMVAULT_HARDWARE_KEY_VERIFICATION_V1";
+pub const HARDWARE_KEY_VERIFICATION_PLAINTEXT: &[u8] = b"AXIOMVAULT_HARDWARE_KEY_VERIFICATION_V1";
 
 /// Create verification data for a recovery key.
 pub fn create_recovery_verification(recovery_key: &RecoveryKey) -> Result<Vec<u8>> {
@@ -182,7 +192,11 @@ pub fn verify_hardware_key(secret: &[u8], verification: &[u8]) -> Result<bool> {
     match aead::decrypt(&*kek, verification) {
         Ok(mut plaintext) => {
             let valid = plaintext.len() == HARDWARE_KEY_VERIFICATION_PLAINTEXT.len()
-                && bool::from(plaintext.as_slice().ct_eq(HARDWARE_KEY_VERIFICATION_PLAINTEXT));
+                && bool::from(
+                    plaintext
+                        .as_slice()
+                        .ct_eq(HARDWARE_KEY_VERIFICATION_PLAINTEXT),
+                );
             plaintext.zeroize();
             Ok(valid)
         }
@@ -199,6 +213,7 @@ mod tests {
         let key = RecoveryKey::generate();
         let words = key.to_mnemonic().unwrap();
         assert_eq!(words.split_whitespace().count(), 24);
+
         let restored = RecoveryKey::from_mnemonic(&words).unwrap();
         assert_eq!(key.as_bytes(), restored.as_bytes());
     }
@@ -239,6 +254,7 @@ mod tests {
         let rk = RecoveryKey::generate();
         let verification = create_recovery_verification(&rk).unwrap();
         assert!(verify_recovery_key(&rk, &verification).unwrap());
+
         let rk2 = RecoveryKey::generate();
         assert!(!verify_recovery_key(&rk2, &verification).unwrap());
     }
@@ -263,11 +279,16 @@ mod tests {
         let secret = b"simulated-yubikey-response";
         let verification = create_hardware_key_verification(secret).unwrap();
         assert!(verify_hardware_key(secret, &verification).unwrap());
-        assert!(!verify_hardware_key(b"wrong-secret", &verification).unwrap());
+        assert!(!verify_hardware_key(b"totally-wrong-hardware-secret", &verification).unwrap());
     }
 
     #[test]
     fn test_hardware_key_secret_must_not_be_empty() {
         assert!(derive_hardware_key_kek(b"").is_err());
+    }
+
+    #[test]
+    fn test_hardware_key_secret_must_meet_minimum_length() {
+        assert!(derive_hardware_key_kek(b"short-hw-secret").is_err());
     }
 }
