@@ -83,11 +83,13 @@ fn validate_subfolder(subfolder: &str) -> Result<PathBuf> {
                 "iCloud subfolder components cannot be empty or whitespace".to_string(),
             ));
         }
+
         if component == "." || component == ".." {
             return Err(Error::InvalidInput(
                 "iCloud subfolder cannot contain '.' or '..' path components".to_string(),
             ));
         }
+
         sanitized.push(component);
     }
 
@@ -164,13 +166,34 @@ impl StorageProvider for ICloudProvider {
 pub fn create_icloud_provider(config: serde_json::Value) -> Result<Arc<dyn StorageProvider>> {
     let icloud_config: ICloudConfig = serde_json::from_value(config)
         .map_err(|e| Error::InvalidInput(format!("Invalid iCloud config: {}", e)))?;
-
     Ok(Arc::new(ICloudProvider::new(icloud_config)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_root(dir: &tempfile::TempDir) -> ICloudConfig {
+        ICloudConfig {
+            root_path: Some(dir.path().to_string_lossy().to_string()),
+            subfolder: None,
+        }
+    }
+
+    fn config_with_subfolder(dir: &tempfile::TempDir, subfolder: &str) -> ICloudConfig {
+        ICloudConfig {
+            root_path: Some(dir.path().to_string_lossy().to_string()),
+            subfolder: Some(subfolder.to_string()),
+        }
+    }
+
+    fn invalid_subfolder_error(subfolder: &str) -> Error {
+        let dir = tempfile::TempDir::new().unwrap();
+        match ICloudProvider::new(config_with_subfolder(&dir, subfolder)) {
+            Ok(_) => panic!("invalid subfolder should be rejected: {subfolder}"),
+            Err(err) => err,
+        }
+    }
 
     #[test]
     fn test_icloud_config_serialization() {
@@ -189,24 +212,15 @@ mod tests {
     #[test]
     fn test_create_provider_with_custom_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: None,
-        };
+        let provider = ICloudProvider::new(config_with_root(&dir)).unwrap();
 
-        let provider = ICloudProvider::new(config).unwrap();
         assert_eq!(provider.name(), "icloud");
     }
 
     #[test]
     fn test_create_provider_with_nested_subfolder() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("AxiomVault/work".to_string()),
-        };
-
-        let provider = ICloudProvider::new(config).unwrap();
+        let provider = ICloudProvider::new(config_with_subfolder(&dir, "AxiomVault/work")).unwrap();
 
         assert_eq!(provider.name(), "icloud");
         assert!(dir.path().join("AxiomVault").join("work").exists());
@@ -214,70 +228,34 @@ mod tests {
 
     #[test]
     fn test_rejects_absolute_subfolder() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let err = match ICloudProvider::new(ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("/escape".to_string()),
-        }) {
-            Ok(_) => panic!("absolute subfolder should be rejected"),
-            Err(err) => err,
-        };
-
+        let err = invalid_subfolder_error("/escape");
         assert!(matches!(err, Error::InvalidInput(message) if message.contains("relative path")));
     }
 
     #[test]
     fn test_rejects_parent_traversal_subfolder() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let err = match ICloudProvider::new(ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("safe/../escape".to_string()),
-        }) {
-            Ok(_) => panic!("parent traversal should be rejected"),
-            Err(err) => err,
-        };
-
+        let err = invalid_subfolder_error("safe/../escape");
         assert!(matches!(err, Error::InvalidInput(message) if message.contains("'.' or '..'")));
     }
 
     #[test]
     fn test_rejects_empty_or_whitespace_subfolder_components() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let repeated_separator_err = invalid_subfolder_error("safe//escape");
+        assert!(matches!(
+            repeated_separator_err,
+            Error::InvalidInput(message) if message.contains("empty or whitespace")
+        ));
 
-        let repeated_separator_err = match ICloudProvider::new(ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("safe//escape".to_string()),
-        }) {
-            Ok(_) => panic!("empty path components should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(repeated_separator_err, Error::InvalidInput(message) if message.contains("empty or whitespace"))
-        );
-
-        let whitespace_component_err = match ICloudProvider::new(ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("safe/ /escape".to_string()),
-        }) {
-            Ok(_) => panic!("whitespace-only path components should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(whitespace_component_err, Error::InvalidInput(message) if message.contains("empty or whitespace"))
-        );
+        let whitespace_component_err = invalid_subfolder_error("safe/ /escape");
+        assert!(matches!(
+            whitespace_component_err,
+            Error::InvalidInput(message) if message.contains("empty or whitespace")
+        ));
     }
 
     #[test]
     fn test_rejects_windows_prefix_subfolder() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let err = match ICloudProvider::new(ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: Some("C:\\escape".to_string()),
-        }) {
-            Ok(_) => panic!("windows-style prefixes should be rejected"),
-            Err(err) => err,
-        };
-
+        let err = invalid_subfolder_error("C:\\escape");
         assert!(matches!(err, Error::InvalidInput(message) if message.contains("prefixes")));
     }
 
@@ -285,10 +263,10 @@ mod tests {
     fn test_create_provider_factory() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = serde_json::json!({
-            "root_path": dir.path().to_string_lossy().to_string()
+            "root_path": dir.path().to_string_lossy().to_string(),
         });
-
         let provider = create_icloud_provider(config).unwrap();
+
         assert_eq!(provider.name(), "icloud");
     }
 
@@ -311,11 +289,7 @@ mod tests {
     #[tokio::test]
     async fn test_icloud_basic_operations() {
         let dir = tempfile::TempDir::new().unwrap();
-        let config = ICloudConfig {
-            root_path: Some(dir.path().to_string_lossy().to_string()),
-            subfolder: None,
-        };
-        let provider = ICloudProvider::new(config).unwrap();
+        let provider = ICloudProvider::new(config_with_root(&dir)).unwrap();
 
         let dir_path = VaultPath::parse("test-dir").unwrap();
         provider.create_dir(&dir_path).await.unwrap();
