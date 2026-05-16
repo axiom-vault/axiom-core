@@ -1,0 +1,12 @@
+problem: iCloud provider accepted unsafe subfolder values that could escape the configured base path
+approach: Validated subfolder inputs at provider construction, normalized safe nested relative segments, and added regression tests for absolute/traversal/whitespace/prefix and non-macOS default detection cases
+failed_paths:
+  - Initial tests used unwrap_err(), which required Debug on ICloudProvider; switched to explicit match extraction instead
+verification:
+  - cargo fmt --all
+  - cargo test -p axiomvault-storage icloud
+  - cargo clippy -p axiomvault-storage --all-targets -- -D warnings
+  - cargo test -p axiomvault-storage
+workflow_learning: Enforce path confinement at provider boundaries even when higher-level callers already validate paths, and add regression tests for platform-specific path forms
+related_files:
+  - core/storage/src/icloud/provider.rs
