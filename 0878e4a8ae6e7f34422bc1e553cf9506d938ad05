@@ -1,0 +1,14 @@
+problem: Rebase iCloud subfolder confinement so axiom-cli can pin a core commit that already includes hardware-key APIs
+approach: Merged PR #4 to main, rebuilt fix/icloud-subfolder-confinement by cherry-picking the confinement patch onto updated main, then reran focused fmt/clippy/tests
+failed_paths:
+  - Existing draft PR #5 was based on pre-hardware-key main and failed CI compatibility expectations
+verification:
+  - cargo fmt --all --check
+  - cargo clippy -p axiomvault-storage --all-targets -- -D warnings
+  - cargo test -p axiomvault-storage
+  - cargo test -p axiomvault-vault
+workflow_learning: When a dependent CLI PR pins a core SHA, first land shared base APIs on main, then rebuild the narrower fix branch on top to keep reviewable ancestry and green focused checks
+related_files:
+  - crates/axiomvault-storage/src/icloud.rs
+  - crates/axiomvault-storage/tests/icloud_config_validation.rs
+  - crates/axiomvault-vault/src/recovery.rs
