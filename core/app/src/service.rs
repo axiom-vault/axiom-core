@@ -1,5 +1,6 @@
 //! Application facade — the single entry point for all vault operations.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, RwLockReadGuard};
@@ -8,6 +9,8 @@ use zeroize::Zeroizing;
 
 use axiomvault_common::{VaultId, VaultPath};
 use axiomvault_crypto::KdfParams;
+use axiomvault_storage::StorageProvider;
+use axiomvault_sync::{ChangeType, SyncConfig, SyncEngine, SyncResult};
 use axiomvault_vault::{VaultManager, VaultOperations, VaultSession};
 
 use crate::dto::*;
@@ -29,8 +32,11 @@ fn now_timestamp() -> i64 {
 pub struct AppService {
     manager: VaultManager,
     session: RwLock<Option<ActiveVault>>,
+    sync_engine: RwLock<Option<Arc<AppSyncEngine>>>,
     event_tx: EventSender,
 }
+
+type AppSyncEngine = SyncEngine<dyn StorageProvider, dyn StorageProvider>;
 
 /// Internal state for an open vault.
 struct ActiveVault {
@@ -47,6 +53,7 @@ impl AppService {
         Self {
             manager: VaultManager::new(),
             session: RwLock::new(None),
+            sync_engine: RwLock::new(None),
             event_tx,
         }
     }
@@ -228,9 +235,7 @@ impl AppService {
 
         // Wipe cached plaintext metadata before locking.
         if let Some(ref index) = active.index {
-            if let Err(e) = index.wipe() {
-                tracing::warn!("Failed to wipe local index on lock: {}", e);
-            }
+            index.wipe()?;
         }
 
         let session = Arc::get_mut(&mut active.session).ok_or_else(|| {
@@ -253,9 +258,7 @@ impl AppService {
 
         // Wipe cached plaintext metadata before closing.
         if let Some(ref index) = active.index {
-            if let Err(e) = index.wipe() {
-                tracing::warn!("Failed to wipe local index on close: {}", e);
-            }
+            index.wipe()?;
         }
 
         *guard = None;
@@ -552,24 +555,55 @@ impl AppService {
 
     // -- File import/export --
 
-    /// Import a local file into the vault.
+    /// Import a local file into the vault with bounded memory.
     pub async fn import_file(&self, local_path: &str, vault_path: &str) -> AppResult<()> {
-        let content = tokio::fs::read(local_path)
+        let path = Self::parse_path(vault_path)?;
+        let size = tokio::fs::metadata(local_path)
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to read local file: {}", e)))?;
-
-        self.create_file(vault_path, &content).await
+            .map_err(|e| AppError::Storage(format!("Failed to inspect local file: {}", e)))?
+            .len();
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        Self::ops(active)?
+            .create_file_from_path(&path, local_path)
+            .await
+            .map_err(AppError::from)?;
+        let encrypted_name = active
+            .session
+            .tree()
+            .read()
+            .await
+            .get_node(&path)
+            .map_err(AppError::from)?
+            .metadata
+            .encrypted_name
+            .clone();
+        if let Some(ref index) = active.index {
+            index.upsert_entry(&IndexEntry {
+                path: vault_path.to_string(),
+                encrypted_name,
+                is_directory: false,
+                size: Some(i64::try_from(size).unwrap_or(i64::MAX)),
+                modified_at: now_timestamp(),
+                etag: None,
+            })?;
+        }
+        drop(guard);
+        self.emit(AppEvent::FileCreated {
+            path: vault_path.to_string(),
+        });
+        Ok(())
     }
 
-    /// Export a vault file to the local filesystem.
+    /// Export a vault file to the local filesystem with bounded memory.
     pub async fn export_file(&self, vault_path: &str, local_path: &str) -> AppResult<()> {
-        let content = self.read_file(vault_path).await?;
-
-        tokio::fs::write(local_path, content)
+        let path = Self::parse_path(vault_path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        Self::ops(active)?
+            .export_file_to_path(&path, local_path)
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to write local file: {}", e)))?;
-
-        Ok(())
+            .map_err(AppError::from)
     }
 
     /// Check if a vault exists at the given location.
@@ -588,6 +622,78 @@ impl AppService {
             .await
             .map_err(AppError::from)
     }
+    // -- Sync lifecycle --
+
+    /// Configure bidirectional synchronization with explicit remote transport
+    /// and local persistence providers.
+    pub async fn configure_sync(
+        &self,
+        remote: Arc<dyn StorageProvider>,
+        local: Arc<dyn StorageProvider>,
+        state_dir: impl AsRef<Path>,
+        config: SyncConfig,
+    ) -> AppResult<()> {
+        let engine = SyncEngine::from_arcs(remote, local, state_dir, config)
+            .await
+            .map_err(AppError::from)?;
+        *self.sync_engine.write().await = Some(Arc::new(engine));
+        Ok(())
+    }
+
+    /// Stage complete provider bytes for upload on the next sync.
+    pub async fn stage_sync_change(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        change_type: ChangeType,
+    ) -> AppResult<String> {
+        let path = Self::parse_path(path)?;
+        let engine = self
+            .sync_engine
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput("sync is not configured".to_string()))?;
+        engine
+            .stage_change(&path, data, change_type)
+            .await
+            .map_err(AppError::from)
+    }
+
+    /// Stage a provider-path deletion for the next sync.
+    pub async fn stage_sync_delete(&self, path: &str) -> AppResult<String> {
+        let path = Self::parse_path(path)?;
+        let engine = self
+            .sync_engine
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput("sync is not configured".to_string()))?;
+        engine.stage_delete(&path).await.map_err(AppError::from)
+    }
+
+    /// Run a complete bidirectional sync and emit lifecycle events for UI/FFI clients.
+    pub async fn sync_now(&self) -> AppResult<SyncResult> {
+        let engine = self
+            .sync_engine
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput("sync is not configured".to_string()))?;
+        self.emit(AppEvent::SyncStarted);
+        match engine.sync_full().await {
+            Ok(result) => {
+                self.emit(AppEvent::SyncCompleted);
+                Ok(result)
+            }
+            Err(error) => {
+                self.emit(AppEvent::SyncFailed {
+                    error: error.to_string(),
+                });
+                Err(AppError::from(error))
+            }
+        }
+    }
 }
 
 impl Default for AppService {
@@ -599,6 +705,55 @@ impl Default for AppService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    async fn service_with_corrupt_index() -> (AppService, TempDir) {
+        let service = AppService::new();
+        service
+            .create_vault(CreateVaultParams {
+                vault_id: "test-vault".to_string(),
+                password: Zeroizing::new("password".to_string()),
+                provider_type: "memory".to_string(),
+                provider_config: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let index = LocalIndex::open(&path).unwrap();
+        index
+            .upsert_entry(&IndexEntry {
+                path: "/plaintext-secret.txt".to_string(),
+                encrypted_name: "enc".to_string(),
+                is_directory: false,
+                size: Some(1),
+                modified_at: 0,
+                etag: None,
+            })
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE vault_entries", [])
+            .unwrap();
+        service.set_local_index(index).await.unwrap();
+        (service, dir)
+    }
+
+    #[tokio::test]
+    async fn lock_fails_closed_when_mandatory_index_wipe_fails() {
+        let (service, _dir) = service_with_corrupt_index().await;
+
+        assert!(service.lock_vault().await.is_err());
+        assert!(service.vault_info().await.unwrap().is_unlocked);
+    }
+
+    #[tokio::test]
+    async fn close_fails_closed_when_mandatory_index_wipe_fails() {
+        let (service, _dir) = service_with_corrupt_index().await;
+
+        assert!(service.close_vault().await.is_err());
+        assert!(service.is_vault_open().await);
+    }
 
     #[tokio::test]
     async fn test_create_and_open_vault() {

@@ -41,6 +41,15 @@ pub enum ConflictResolution {
 /// Byte stream type for upload/download operations.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>;
 
+/// Bytes and version metadata observed as one stable remote object revision.
+#[derive(Debug, Clone)]
+pub struct VersionedDownload {
+    /// Complete object bytes.
+    pub data: Vec<u8>,
+    /// Metadata for the exact revision represented by `data`.
+    pub metadata: Metadata,
+}
+
 /// Storage provider trait for different backends.
 ///
 /// All operations are async and use streams for large data transfers.
@@ -66,10 +75,35 @@ pub trait StorageProvider: Send + Sync {
     /// - Authentication errors
     async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata>;
 
+    /// Atomically replace a complete local object.
+    ///
+    /// Sync engines use this operation for downloaded objects and only advance
+    /// ETags after it succeeds. Providers with stronger transactional primitives
+    /// should override it. The default delegates to `upload`, whose contract is
+    /// already all-or-error for a complete byte vector; `LocalProvider`'s upload
+    /// uses same-directory write, fsync, and rename.
+    async fn replace_atomic(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.upload(path, data).await
+    }
+
     /// Upload data as a stream.
     ///
     /// For large files, this allows streaming without loading entire file into memory.
     async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata>;
+
+    /// Upload a stream whose complete byte length is known in advance.
+    ///
+    /// Providers with resumable/chunked APIs should override this method so the
+    /// transport can remain bounded-memory. The compatibility default delegates
+    /// to `upload_stream`.
+    async fn upload_sized_stream(
+        &self,
+        path: &VaultPath,
+        stream: ByteStream,
+        _total_size: u64,
+    ) -> Result<Metadata> {
+        self.upload_stream(path, stream).await
+    }
 
     /// Download data from storage.
     ///
@@ -83,6 +117,26 @@ pub trait StorageProvider: Send + Sync {
     /// - File not found
     /// - Network/I/O errors
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>>;
+
+    /// Download bytes together with metadata for the same stable revision.
+    ///
+    /// Providers with an atomic revision API should override this method. The
+    /// compatibility implementation validates that metadata is unchanged
+    /// across the download and fails with a retryable conflict otherwise.
+    async fn download_with_metadata(&self, path: &VaultPath) -> Result<VersionedDownload> {
+        let before = self.metadata(path).await?;
+        let data = self.download(path).await?;
+        let after = self.metadata(path).await?;
+        if before.etag != after.etag {
+            return Err(axiomvault_common::Error::Conflict(
+                "remote object changed during download".to_string(),
+            ));
+        }
+        Ok(VersionedDownload {
+            data,
+            metadata: after,
+        })
+    }
 
     /// Download data as a stream.
     ///

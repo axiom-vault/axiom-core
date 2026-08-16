@@ -4,10 +4,12 @@
 //! Keys are automatically zeroized when the session is dropped.
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::{VaultConfig, META_DIRNAME, TREE_FILENAME};
+use crate::freshness::{publication_lock, FreshnessAnchor, FreshnessState as AnchorFreshnessState};
+use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::RecoveryKey;
@@ -65,6 +67,14 @@ pub struct VaultSession {
     tree: Arc<RwLock<VaultTree>>,
     /// Session state.
     state: SessionState,
+    /// Monotonic snapshot state for manager-created sessions.
+    freshness: Option<FreshnessState>,
+}
+
+struct FreshnessState {
+    anchor: Arc<dyn FreshnessAnchor>,
+    anchor_id: VaultId,
+    generation: Mutex<u64>,
 }
 
 impl VaultSession {
@@ -82,6 +92,38 @@ impl VaultSession {
         provider: Arc<dyn StorageProvider>,
         tree: VaultTree,
     ) -> Result<Self> {
+        Self::from_master_key_internal(config, master_key, provider, tree, None)
+    }
+
+    pub(crate) fn from_master_key_with_freshness(
+        config: VaultConfig,
+        master_key: MasterKey,
+        provider: Arc<dyn StorageProvider>,
+        tree: VaultTree,
+        anchor: Arc<dyn FreshnessAnchor>,
+        anchor_id: VaultId,
+        generation: u64,
+    ) -> Result<Self> {
+        Self::from_master_key_internal(
+            config,
+            master_key,
+            provider,
+            tree,
+            Some(FreshnessState {
+                anchor,
+                anchor_id,
+                generation: Mutex::new(generation),
+            }),
+        )
+    }
+
+    fn from_master_key_internal(
+        config: VaultConfig,
+        master_key: MasterKey,
+        provider: Arc<dyn StorageProvider>,
+        tree: VaultTree,
+        freshness: Option<FreshnessState>,
+    ) -> Result<Self> {
         if !config.version.is_compatible() {
             return Err(Error::Vault(format!(
                 "Incompatible vault version: {:?}",
@@ -96,6 +138,7 @@ impl VaultSession {
             provider,
             tree: Arc::new(RwLock::new(tree)),
             state: SessionState::Active,
+            freshness,
         })
     }
 
@@ -129,8 +172,15 @@ impl VaultSession {
 
         let encrypted_bytes = provider.download(&tree_path).await?;
 
+        Self::decrypt_tree_bytes(master_key, &encrypted_bytes)
+    }
+
+    pub(crate) fn decrypt_tree_bytes(
+        master_key: &MasterKey,
+        encrypted_bytes: &[u8],
+    ) -> Result<VaultTree> {
         let tree_key = master_key.derive_file_key(TREE_KEY_CONTEXT);
-        let tree_bytes = decrypt(tree_key.as_bytes(), &encrypted_bytes).map_err(|e| {
+        let tree_bytes = decrypt(tree_key.as_bytes(), encrypted_bytes).map_err(|e| {
             Error::Crypto(format!(
                 "Failed to decrypt tree index (wrong password or corrupted vault): {}",
                 e
@@ -305,9 +355,37 @@ impl VaultSession {
         Ok(())
     }
 
-    /// Save the current tree state to storage (encrypted).
-    pub async fn save_tree(&self) -> Result<()> {
-        let tree = self.tree.read().await;
+    async fn restore_snapshot_object(
+        &self,
+        path: &VaultPath,
+        previous: Option<Vec<u8>>,
+    ) -> Result<()> {
+        match previous {
+            Some(bytes) => {
+                self.provider.upload(path, bytes).await?;
+            }
+            None if self.provider.exists(path).await? => {
+                self.provider.delete(path).await?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Persist a supplied tree snapshot to storage (encrypted).
+    ///
+    /// Callers can build and validate a candidate tree without exposing it
+    /// in-memory, then publish it only after this write succeeds.
+    pub(crate) async fn save_tree_snapshot(&self, tree: &VaultTree) -> Result<()> {
+        let publication = self
+            .freshness
+            .as_ref()
+            .map(|freshness| publication_lock(&freshness.anchor_id))
+            .transpose()?;
+        let _publication_guard = match &publication {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let tree_json = tree.to_json()?;
 
         let tree_key = self.master_key()?.derive_file_key(TREE_KEY_CONTEXT);
@@ -315,8 +393,69 @@ impl VaultSession {
             .map_err(|e| Error::Crypto(format!("Failed to encrypt tree index: {}", e)))?;
 
         let tree_path = VaultPath::parse(META_DIRNAME)?.join(TREE_FILENAME)?;
-        self.provider.upload(&tree_path, encrypted).await?;
+        let previous_tree = if self.provider.exists(&tree_path).await? {
+            Some(self.provider.download(&tree_path).await?)
+        } else {
+            None
+        };
+        let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
+        let previous_manifest = if self.provider.exists(&manifest_path).await? {
+            Some(self.provider.download(&manifest_path).await?)
+        } else {
+            None
+        };
+
+        self.provider.upload(&tree_path, encrypted.clone()).await?;
+
+        if let Some(freshness) = &self.freshness {
+            let mut generation = freshness.generation.lock().await;
+            let next_generation = generation
+                .checked_add(1)
+                .ok_or_else(|| Error::Vault("snapshot generation counter exhausted".to_string()))?;
+            let config_bytes = self.config.to_bytes()?;
+            let manifest = GenerationManifest::new(
+                self.config.id.clone(),
+                next_generation,
+                &encrypted,
+                &config_bytes,
+                tree.object_digests(),
+            );
+            let manifest_bytes = manifest.seal(self.master_key()?)?;
+            let manifest_digest = digest(&manifest_bytes);
+            if let Err(error) = self.provider.upload(&manifest_path, manifest_bytes).await {
+                self.restore_snapshot_object(&tree_path, previous_tree)
+                    .await?;
+                return Err(error);
+            }
+            if let Err(error) = freshness.anchor.store_state(
+                &freshness.anchor_id,
+                AnchorFreshnessState {
+                    generation: next_generation,
+                    manifest_digest: Some(manifest_digest),
+                },
+            ) {
+                let manifest_restore = self
+                    .restore_snapshot_object(&manifest_path, previous_manifest)
+                    .await;
+                let tree_restore = self
+                    .restore_snapshot_object(&tree_path, previous_tree)
+                    .await;
+                if let Err(rollback) = manifest_restore.and(tree_restore) {
+                    return Err(Error::Storage(format!(
+                        "freshness anchor update failed ({error}); snapshot rollback failed ({rollback})"
+                    )));
+                }
+                return Err(error);
+            }
+            *generation = next_generation;
+        }
         Ok(())
+    }
+
+    /// Save the current tree state to storage (encrypted).
+    pub async fn save_tree(&self) -> Result<()> {
+        let tree = self.tree.read().await;
+        self.save_tree_snapshot(&tree).await
     }
 }
 
