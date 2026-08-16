@@ -118,18 +118,14 @@ impl MigrationRegistry {
                 .migrations
                 .iter()
                 .find(|m| m.source_version() == current);
-            match next {
-                Some(migration) => {
-                    let target = migration.target_version();
-                    // Ensure we're moving forward and not past our target.
-                    if target.minor > to.minor || target.major != to.major {
-                        return None;
-                    }
-                    path.push(migration.as_ref());
-                    current = target;
-                }
-                None => return None,
+            let migration = next?;
+            let target = migration.target_version();
+            // Ensure we're moving forward and not past our target.
+            if target.minor > to.minor || target.major != to.major {
+                return None;
             }
+            path.push(migration.as_ref());
+            current = target;
         }
 
         Some(path)
