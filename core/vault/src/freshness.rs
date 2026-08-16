@@ -4,9 +4,33 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use axiomvault_common::{Error, Result, VaultId};
+use serde::{Deserialize, Serialize};
+
+/// Trusted identity of the latest accepted authenticated manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessState {
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+}
+
+/// Serialize snapshot publication for the same trusted anchor in this process.
+pub(crate) fn publication_lock(vault_id: &VaultId) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| Error::Vault("snapshot publication lock poisoned".to_string()))?;
+    if let Some(lock) = locks.get(vault_id.as_str()).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(vault_id.as_str().to_string(), Arc::downgrade(&lock));
+    Ok(lock)
+}
 
 /// Trusted state kept outside the storage provider controlled by an attacker.
 pub trait FreshnessAnchor: Send + Sync {
@@ -15,6 +39,27 @@ pub trait FreshnessAnchor: Send + Sync {
 
     /// Advance the anchor. Implementations must reject decreasing generations.
     fn store(&self, vault_id: &VaultId, generation: u64) -> Result<()>;
+
+    /// Load generation plus accepted manifest identity. The default reads a
+    /// legacy generation-only anchor so old implementations remain source
+    /// compatible; authenticated snapshots then fail closed on storing an
+    /// identity unless the implementation overrides `store_state`.
+    fn load_state(&self, vault_id: &VaultId) -> Result<Option<FreshnessState>> {
+        Ok(self.load(vault_id)?.map(|generation| FreshnessState {
+            generation,
+            manifest_digest: None,
+        }))
+    }
+
+    /// Atomically advance the accepted generation and manifest identity.
+    fn store_state(&self, vault_id: &VaultId, state: FreshnessState) -> Result<()> {
+        if state.manifest_digest.is_some() {
+            return Err(Error::Vault(
+                "freshness anchor does not support manifest identity".to_string(),
+            ));
+        }
+        self.store(vault_id, state.generation)
+    }
 }
 
 /// Anchor used when the platform cannot provide trusted local storage.
@@ -50,7 +95,7 @@ impl FreshnessAnchor for UnavailableFreshnessAnchor {
 /// Process-local anchor useful for tests and explicitly ephemeral clients.
 #[derive(Default)]
 pub struct InMemoryFreshnessAnchor {
-    generations: RwLock<HashMap<String, u64>>,
+    generations: RwLock<HashMap<String, FreshnessState>>,
 }
 
 impl InMemoryFreshnessAnchor {
@@ -65,7 +110,9 @@ impl FreshnessAnchor for InMemoryFreshnessAnchor {
             .generations
             .read()
             .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
-        Ok(generations.get(vault_id.as_str()).copied())
+        Ok(generations
+            .get(vault_id.as_str())
+            .map(|state| state.generation))
     }
 
     fn store(&self, vault_id: &VaultId, generation: u64) -> Result<()> {
@@ -73,15 +120,61 @@ impl FreshnessAnchor for InMemoryFreshnessAnchor {
             .generations
             .write()
             .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
-        if generations
-            .get(vault_id.as_str())
-            .is_some_and(|current| generation < *current)
-        {
-            return Err(Error::Conflict(
-                "refusing to decrease freshness anchor".to_string(),
-            ));
+        Self::store_locked(
+            &mut generations,
+            vault_id,
+            FreshnessState {
+                generation,
+                manifest_digest: None,
+            },
+        )
+    }
+
+    fn load_state(&self, vault_id: &VaultId) -> Result<Option<FreshnessState>> {
+        let generations = self
+            .generations
+            .read()
+            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
+        Ok(generations.get(vault_id.as_str()).cloned())
+    }
+
+    fn store_state(&self, vault_id: &VaultId, state: FreshnessState) -> Result<()> {
+        let mut generations = self
+            .generations
+            .write()
+            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
+        Self::store_locked(&mut generations, vault_id, state)
+    }
+}
+
+impl InMemoryFreshnessAnchor {
+    fn store_locked(
+        generations: &mut HashMap<String, FreshnessState>,
+        vault_id: &VaultId,
+        state: FreshnessState,
+    ) -> Result<()> {
+        if let Some(current) = generations.get(vault_id.as_str()) {
+            if state.generation < current.generation {
+                return Err(Error::Conflict(
+                    "refusing to decrease freshness anchor".to_string(),
+                ));
+            }
+            if state.generation == current.generation {
+                if let (Some(current), Some(incoming)) =
+                    (&current.manifest_digest, &state.manifest_digest)
+                {
+                    if current != incoming {
+                        return Err(Error::Conflict(
+                            "same-generation manifest fork detected".to_string(),
+                        ));
+                    }
+                }
+                if current.manifest_digest.is_some() && state.manifest_digest.is_none() {
+                    return Ok(());
+                }
+            }
         }
-        generations.insert(vault_id.as_str().to_string(), generation);
+        generations.insert(vault_id.as_str().to_string(), state);
         Ok(())
     }
 }
@@ -112,43 +205,54 @@ impl LocalFileFreshnessAnchor {
             .join(format!("{}.generation", vault_id.as_str()))
     }
 
-    fn read_generation(path: &Path) -> Result<Option<u64>> {
+    fn read_state(path: &Path) -> Result<Option<FreshnessState>> {
         match fs::read_to_string(path) {
-            Ok(value) => value.trim().parse::<u64>().map(Some).map_err(|_| {
-                Error::Vault("freshness anchor is corrupt; refusing to open vault".to_string())
-            }),
+            Ok(value) => {
+                let value = value.trim();
+                if let Ok(generation) = value.parse::<u64>() {
+                    return Ok(Some(FreshnessState {
+                        generation,
+                        manifest_digest: None,
+                    }));
+                }
+                serde_json::from_str(value).map(Some).map_err(|_| {
+                    Error::Vault("freshness anchor is corrupt; refusing to open vault".to_string())
+                })
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Error::Vault(format!(
                 "failed to read freshness anchor: {error}"
             ))),
         }
     }
-}
-
-impl FreshnessAnchor for LocalFileFreshnessAnchor {
-    fn load(&self, vault_id: &VaultId) -> Result<Option<u64>> {
-        let _guard = self
-            .lock
-            .read()
-            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
-        Self::read_generation(&self.path(vault_id))
-    }
-
-    fn store(&self, vault_id: &VaultId, generation: u64) -> Result<()> {
-        let _guard = self
-            .lock
-            .write()
-            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
+    fn write_state(&self, vault_id: &VaultId, state: FreshnessState) -> Result<()> {
         fs::create_dir_all(&self.directory).map_err(|error| {
             Error::Vault(format!(
                 "failed to create freshness anchor directory: {error}"
             ))
         })?;
         let path = self.path(vault_id);
-        if Self::read_generation(&path)?.is_some_and(|current| generation < current) {
-            return Err(Error::Conflict(
-                "refusing to decrease freshness anchor".to_string(),
-            ));
+        if let Some(current) = Self::read_state(&path)? {
+            if state.generation < current.generation {
+                return Err(Error::Conflict(
+                    "refusing to decrease freshness anchor".to_string(),
+                ));
+            }
+            if state.generation == current.generation
+                && current.manifest_digest.is_some()
+                && state.manifest_digest.is_some()
+                && current.manifest_digest != state.manifest_digest
+            {
+                return Err(Error::Conflict(
+                    "same-generation manifest fork detected".to_string(),
+                ));
+            }
+            if state.generation == current.generation
+                && current.manifest_digest.is_some()
+                && state.manifest_digest.is_none()
+            {
+                return Ok(());
+            }
         }
 
         let temporary = path.with_extension("generation.tmp");
@@ -162,7 +266,9 @@ impl FreshnessAnchor for LocalFileFreshnessAnchor {
         let mut file = options
             .open(&temporary)
             .map_err(|error| Error::Vault(format!("failed to write freshness anchor: {error}")))?;
-        writeln!(file, "{generation}")
+        serde_json::to_writer(&mut file, &state)
+            .map_err(|error| Error::Vault(format!("failed to write freshness anchor: {error}")))?;
+        writeln!(file)
             .map_err(|error| Error::Vault(format!("failed to write freshness anchor: {error}")))?;
         file.sync_all()
             .map_err(|error| Error::Vault(format!("failed to sync freshness anchor: {error}")))?;
@@ -170,6 +276,38 @@ impl FreshnessAnchor for LocalFileFreshnessAnchor {
             Error::Vault(format!("failed to replace freshness anchor: {error}"))
         })?;
         Ok(())
+    }
+}
+
+impl FreshnessAnchor for LocalFileFreshnessAnchor {
+    fn load(&self, vault_id: &VaultId) -> Result<Option<u64>> {
+        Ok(self.load_state(vault_id)?.map(|state| state.generation))
+    }
+
+    fn store(&self, vault_id: &VaultId, generation: u64) -> Result<()> {
+        self.store_state(
+            vault_id,
+            FreshnessState {
+                generation,
+                manifest_digest: None,
+            },
+        )
+    }
+
+    fn load_state(&self, vault_id: &VaultId) -> Result<Option<FreshnessState>> {
+        let _guard = self
+            .lock
+            .read()
+            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
+        Self::read_state(&self.path(vault_id))
+    }
+
+    fn store_state(&self, vault_id: &VaultId, state: FreshnessState) -> Result<()> {
+        let _guard = self
+            .lock
+            .write()
+            .map_err(|_| Error::Vault("freshness anchor lock poisoned".to_string()))?;
+        self.write_state(vault_id, state)
     }
 }
 

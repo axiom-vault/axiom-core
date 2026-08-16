@@ -41,6 +41,15 @@ pub enum ConflictResolution {
 /// Byte stream type for upload/download operations.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>;
 
+/// Bytes and version metadata observed as one stable remote object revision.
+#[derive(Debug, Clone)]
+pub struct VersionedDownload {
+    /// Complete object bytes.
+    pub data: Vec<u8>,
+    /// Metadata for the exact revision represented by `data`.
+    pub metadata: Metadata,
+}
+
 /// Storage provider trait for different backends.
 ///
 /// All operations are async and use streams for large data transfers.
@@ -108,6 +117,26 @@ pub trait StorageProvider: Send + Sync {
     /// - File not found
     /// - Network/I/O errors
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>>;
+
+    /// Download bytes together with metadata for the same stable revision.
+    ///
+    /// Providers with an atomic revision API should override this method. The
+    /// compatibility implementation validates that metadata is unchanged
+    /// across the download and fails with a retryable conflict otherwise.
+    async fn download_with_metadata(&self, path: &VaultPath) -> Result<VersionedDownload> {
+        let before = self.metadata(path).await?;
+        let data = self.download(path).await?;
+        let after = self.metadata(path).await?;
+        if before.etag != after.etag {
+            return Err(axiomvault_common::Error::Conflict(
+                "remote object changed during download".to_string(),
+            ));
+        }
+        Ok(VersionedDownload {
+            data,
+            metadata: after,
+        })
+    }
 
     /// Download data as a stream.
     ///

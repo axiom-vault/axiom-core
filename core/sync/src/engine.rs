@@ -96,6 +96,17 @@ pub struct SyncEngine<R: StorageProvider + ?Sized, L: StorageProvider + ?Sized =
     sync_lock: Arc<Mutex<()>>,
 }
 
+impl<P: StorageProvider + 'static> SyncEngine<P, P> {
+    /// Create a single-provider engine from an owned provider.
+    ///
+    /// This is the historical public constructor retained for source
+    /// compatibility. New production call sites should normally use distinct
+    /// local and remote providers through [`Self::from_arcs`].
+    pub async fn new(provider: P, state_dir: impl AsRef<Path>, config: SyncConfig) -> Result<Self> {
+        Self::from_arc(Arc::new(provider), state_dir, config).await
+    }
+}
+
 impl<P: StorageProvider + ?Sized + 'static> SyncEngine<P, P> {
     /// Backward-compatible single-provider constructor.
     ///
@@ -656,42 +667,40 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             };
             let remote = self.remote.clone();
             let download_path = remote_path.clone();
-            let data = self
+            let versioned = self
                 .retry_executor
-                .execute(move || {
-                    let provider = remote.clone();
-                    let path = download_path.clone();
-                    async move { provider.download(&path).await }
-                })
+                .execute_with_condition(
+                    move || {
+                        let provider = remote.clone();
+                        let path = download_path.clone();
+                        async move { provider.download_with_metadata(&path).await }
+                    },
+                    |error| matches!(error, Error::Conflict(_)),
+                )
                 .await;
 
-            let result = match data {
-                Ok(data) => self.local.replace_atomic(&local_path, data).await,
+            let result = match versioned {
+                Ok(versioned) => self
+                    .local
+                    .replace_atomic(&local_path, versioned.data)
+                    .await
+                    .map(|_| versioned.metadata),
                 Err(error) => Err(error),
             };
             match result {
-                Ok(_) => match self.remote.metadata(&remote_path).await {
-                    Ok(metadata) => {
-                        let mut state = self.state.write().await;
-                        if let Some(entry) = state.get_mut(&local_path) {
-                            entry.mark_synced(metadata.etag, metadata.modified);
-                        }
-                        drop(state);
-                        if let Err(error) = self.persist_state().await {
-                            error!("Failed to persist sync state: {}", error);
-                            failed += 1;
-                        } else {
-                            synced += 1;
-                        }
+                Ok(metadata) => {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(&local_path) {
+                        entry.mark_synced(metadata.etag, metadata.modified);
                     }
-                    Err(error) => {
-                        error!(
-                            "Failed to read remote metadata after persistence: {}",
-                            error
-                        );
+                    drop(state);
+                    if let Err(error) = self.persist_state().await {
+                        error!("Failed to persist sync state: {}", error);
                         failed += 1;
+                    } else {
+                        synced += 1;
                     }
-                },
+                }
                 Err(error) => {
                     error!("Failed to persist downloaded file: {}", error);
                     failed += 1;
@@ -723,24 +732,29 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             }
         } else {
             let remote_path = self.remote_path(path)?;
-            let remote_metadata = self.remote.metadata(&remote_path).await?;
+            let versioned = self
+                .retry_executor
+                .execute_with_condition(
+                    || self.remote.download_with_metadata(&remote_path),
+                    |error| matches!(error, Error::Conflict(_)),
+                )
+                .await?;
             let changed = {
                 let state = self.state.read().await;
                 state
                     .get(path)
-                    .is_none_or(|entry| entry.remote_etag != remote_metadata.etag)
+                    .is_none_or(|entry| entry.remote_etag != versioned.metadata.etag)
             };
             if changed {
-                let data = self.remote.download(&remote_path).await?;
-                self.local.replace_atomic(path, data).await?;
+                self.local.replace_atomic(path, versioned.data).await?;
                 let mut state = self.state.write().await;
                 if let Some(entry) = state.get_mut(path) {
-                    entry.mark_synced(remote_metadata.etag, remote_metadata.modified);
+                    entry.mark_synced(versioned.metadata.etag, versioned.metadata.modified);
                 } else {
                     state.insert(SyncEntry::new_synced(
                         path.to_string(),
-                        remote_metadata.etag,
-                        remote_metadata.modified,
+                        versioned.metadata.etag,
+                        versioned.metadata.modified,
                     ));
                 }
                 drop(state);
@@ -829,8 +843,10 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             return Err(Error::InvalidInput("Path is not in conflict".to_string()));
         }
 
-        let remote_metadata = self.remote.metadata(path).await?;
-        let conflict_info = ConflictInfo::from_entry_and_remote(&entry, &remote_metadata)?;
+        let remote_path = self.remote_path(path)?;
+        let remote_metadata = self.remote.metadata(&remote_path).await?;
+        let mut conflict_info = ConflictInfo::from_entry_and_remote(&entry, &remote_metadata)?;
+        conflict_info.path = remote_path;
 
         let result = self
             .conflict_resolver

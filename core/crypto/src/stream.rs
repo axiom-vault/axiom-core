@@ -220,6 +220,11 @@ impl<'a> DecryptingStream<'a> {
                 .try_into()
                 .map_err(|_| Error::Crypto("Invalid legacy chunk count".to_string()))?,
         );
+        if total_chunks == 0 {
+            return Err(Error::Crypto(
+                "Legacy stream declares zero chunks".to_string(),
+            ));
+        }
         let mut encrypted_buffer = vec![0u8; NONCE_SIZE + chunk_size + 8 + TAG_SIZE];
         let mut total_bytes = 0u64;
         for i in 0..total_chunks {
@@ -244,6 +249,12 @@ impl<'a> DecryptingStream<'a> {
             writer.write_all(&decrypted[8..])?;
             total_bytes += (decrypted.len() - 8) as u64;
             decrypted.zeroize();
+        }
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            return Err(Error::Crypto(
+                "Trailing data after legacy stream".to_string(),
+            ));
         }
         Ok(total_bytes)
     }
@@ -437,16 +448,32 @@ mod tests {
         );
     }
 
-    /// A version-1 empty stream remains readable after the version-2 migration.
+    /// An attacker cannot rewrite an existing legacy header to claim zero chunks
+    /// and truncate the authenticated chunk records.
     #[test]
-    fn test_zero_chunk_count_header() {
+    fn legacy_zero_chunk_rewrite_is_rejected() {
         let key = [42u8; KEY_LENGTH];
-        let mut header = vec![LEGACY_STREAM_VERSION];
-        header.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
-        header.extend_from_slice(&0u64.to_le_bytes());
-        let result = decrypt_bytes(&key, &header);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let mut rewritten = vec![LEGACY_STREAM_VERSION];
+        rewritten.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+        rewritten.extend_from_slice(&0u64.to_le_bytes());
+
+        let error = decrypt_bytes(&key, &rewritten).expect_err("zero-count legacy input must fail");
+        assert!(error.to_string().contains("zero chunks"));
+    }
+
+    /// Non-empty version-1 ciphertext remains readable after the version-2 migration.
+    #[test]
+    fn legitimate_legacy_stream_remains_readable() {
+        let key = [42u8; KEY_LENGTH];
+        let plaintext = b"legacy payload";
+        let mut legacy = vec![LEGACY_STREAM_VERSION];
+        legacy.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+        legacy.extend_from_slice(&1u64.to_le_bytes());
+        let mut indexed = 0u64.to_le_bytes().to_vec();
+        indexed.extend_from_slice(plaintext);
+        legacy.extend_from_slice(&encrypt(&key, &indexed).unwrap());
+
+        assert_eq!(decrypt_bytes(&key, &legacy).unwrap(), plaintext);
     }
 
     #[test]

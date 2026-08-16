@@ -1,7 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use axiomvault_common::VaultPath;
-use axiomvault_storage::{LocalProvider, MemoryProvider, StorageProvider};
+use async_trait::async_trait;
+use axiomvault_common::{Result, VaultPath};
+use axiomvault_storage::{ByteStream, LocalProvider, MemoryProvider, Metadata, StorageProvider};
 use axiomvault_sync::{
     ChangeType, ConflictStrategy, PrefixPathMapper, SyncConfig, SyncEngine, SyncStatus,
 };
@@ -9,6 +11,138 @@ use tempfile::TempDir;
 
 fn path(value: &str) -> VaultPath {
     VaultPath::parse(value).unwrap()
+}
+
+struct RacingDownloadProvider {
+    inner: MemoryProvider,
+    race_once: AtomicBool,
+}
+
+impl RacingDownloadProvider {
+    fn new() -> Self {
+        Self {
+            inner: MemoryProvider::new(),
+            race_once: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageProvider for RacingDownloadProvider {
+    fn name(&self) -> &str {
+        "racing"
+    }
+    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.inner.upload(path, data).await
+    }
+    async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+        self.inner.upload_stream(path, stream).await
+    }
+    async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+        let old = self.inner.download(path).await?;
+        if self.race_once.swap(false, Ordering::SeqCst) {
+            self.inner
+                .upload(path, b"version-B-longer".to_vec())
+                .await?;
+        }
+        Ok(old)
+    }
+    async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+        self.inner.download_stream(path).await
+    }
+    async fn exists(&self, path: &VaultPath) -> Result<bool> {
+        self.inner.exists(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+        self.inner.list(path).await
+    }
+    async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.metadata(path).await
+    }
+    async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.create_dir(path).await
+    }
+    async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete_dir(path).await
+    }
+    async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.rename(from, to).await
+    }
+    async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.copy(from, to).await
+    }
+}
+
+#[tokio::test]
+async fn owned_provider_constructor_remains_source_compatible() {
+    let state_dir = TempDir::new().unwrap();
+    let engine = SyncEngine::new(
+        MemoryProvider::new(),
+        state_dir.path(),
+        SyncConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.config().max_retries,
+        SyncConfig::default().max_retries
+    );
+}
+
+#[tokio::test]
+async fn full_sync_never_pairs_version_a_bytes_with_version_b_etag() {
+    let remote = Arc::new(RacingDownloadProvider::new());
+    remote
+        .upload(&path("/race.bin"), b"A".to_vec())
+        .await
+        .unwrap();
+    let local: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
+    let state_dir = TempDir::new().unwrap();
+    let config = SyncConfig {
+        max_retries: 1,
+        ..SyncConfig::default()
+    };
+    let engine = SyncEngine::from_arcs(remote, local.clone(), state_dir.path(), config)
+        .await
+        .unwrap();
+
+    let result = engine.sync_full().await.unwrap();
+    assert_eq!(result.files_synced, 1);
+    assert_eq!(
+        local.download(&path("/race.bin")).await.unwrap(),
+        b"version-B-longer"
+    );
+}
+
+#[tokio::test]
+async fn single_path_sync_never_pairs_version_a_bytes_with_version_b_etag() {
+    let remote = Arc::new(RacingDownloadProvider::new());
+    remote
+        .upload(&path("/race.bin"), b"A".to_vec())
+        .await
+        .unwrap();
+    let local: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
+    let state_dir = TempDir::new().unwrap();
+    let config = SyncConfig {
+        max_retries: 1,
+        ..SyncConfig::default()
+    };
+    let engine = SyncEngine::from_arcs(remote, local.clone(), state_dir.path(), config)
+        .await
+        .unwrap();
+
+    let result = engine
+        .sync_paths(vec!["/race.bin".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(result.files_synced, 1);
+    assert_eq!(
+        local.download(&path("/race.bin")).await.unwrap(),
+        b"version-B-longer"
+    );
 }
 
 async fn engine(
@@ -80,6 +214,70 @@ async fn prefix_mapping_uses_local_paths_for_state_and_remote_paths_for_transpor
     let state = state_handle.read().await;
     assert!(state.get(&path("/cache/item.bin")).is_some());
     assert!(state.get(&path("/vault/item.bin")).is_none());
+}
+
+#[tokio::test]
+async fn manual_conflict_resolution_uses_nonidentity_prefix_mapping() {
+    let remote: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
+    remote.create_dir(&path("/vault")).await.unwrap();
+    let local_a: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
+    let local_b: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
+    local_a.create_dir(&path("/cache")).await.unwrap();
+    local_b.create_dir(&path("/cache")).await.unwrap();
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let mapper_a = Arc::new(PrefixPathMapper::new(path("/cache"), path("/vault")));
+    let mapper_b = Arc::new(PrefixPathMapper::new(path("/cache"), path("/vault")));
+    let engine_a = SyncEngine::from_arcs_with_mapper(
+        remote.clone(),
+        local_a,
+        dir_a.path(),
+        SyncConfig::default(),
+        mapper_a,
+    )
+    .await
+    .unwrap();
+    let engine_b = SyncEngine::from_arcs_with_mapper(
+        remote.clone(),
+        local_b,
+        dir_b.path(),
+        SyncConfig::default(),
+        mapper_b,
+    )
+    .await
+    .unwrap();
+    let local_path = path("/cache/item.bin");
+
+    engine_a
+        .stage_change(&local_path, b"base".to_vec(), ChangeType::Create)
+        .await
+        .unwrap();
+    engine_a.sync_full().await.unwrap();
+    engine_b.sync_full().await.unwrap();
+    engine_a
+        .stage_change(&local_path, b"device-a".to_vec(), ChangeType::Update)
+        .await
+        .unwrap();
+    engine_b
+        .stage_change(&local_path, b"device-b".to_vec(), ChangeType::Update)
+        .await
+        .unwrap();
+    engine_a.sync_full().await.unwrap();
+    assert_eq!(engine_b.sync_full().await.unwrap().conflicts_found, 1);
+
+    engine_b
+        .resolve_conflict(
+            &local_path,
+            b"device-b".to_vec(),
+            ConflictStrategy::PreferLocal,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        remote.download(&path("/vault/item.bin")).await.unwrap(),
+        b"device-b"
+    );
+    assert!(!remote.exists(&local_path).await.unwrap());
 }
 
 #[tokio::test]

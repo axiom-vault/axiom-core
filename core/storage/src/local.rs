@@ -40,6 +40,20 @@ impl LocalProvider {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
 
+        // Never follow or chmod a symlink supplied as the provider root.
+        if let Ok(meta) = std::fs::symlink_metadata(&root) {
+            if meta.file_type().is_symlink() {
+                return Err(Error::NotPermitted(
+                    "local provider root must not be a symlink".to_string(),
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(Error::InvalidInput(
+                    "local provider root must be a directory".to_string(),
+                ));
+            }
+        }
+
         // Create root if it doesn't exist (sync for constructor).
         // On Unix, restrict mode to 0o700 so other local users cannot read
         // wrapped keys, KDF parameters, or ciphertext sitting at rest.
@@ -69,7 +83,12 @@ impl LocalProvider {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(&root)?;
+            let meta = std::fs::symlink_metadata(&root)?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(Error::NotPermitted(
+                    "local provider root changed or is a symlink".to_string(),
+                ));
+            }
             let current_mode = meta.permissions().mode() & 0o777;
             if current_mode != DIR_MODE {
                 std::fs::set_permissions(&root, std::fs::Permissions::from_mode(DIR_MODE))?;
@@ -79,13 +98,31 @@ impl LocalProvider {
         Ok(Self { root })
     }
 
-    /// Convert a VaultPath to a filesystem path.
-    fn to_fs_path(&self, path: &VaultPath) -> PathBuf {
+    /// Resolve a vault path while rejecting symlink roots and components at
+    /// each operation boundary.
+    fn checked_fs_path(&self, path: &VaultPath) -> Result<PathBuf> {
+        let root_meta = std::fs::symlink_metadata(&self.root)?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            return Err(Error::NotPermitted(
+                "local provider root changed or is a symlink".to_string(),
+            ));
+        }
+
         let mut fs_path = self.root.clone();
         for component in path.components() {
             fs_path.push(component);
+            match std::fs::symlink_metadata(&fs_path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(Error::NotPermitted(format!(
+                        "local provider path contains a symlink: {path}"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        fs_path
+        Ok(fs_path)
     }
 
     /// Create metadata from filesystem metadata.
@@ -118,7 +155,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         // Check parent exists
         if let Some(parent) = fs_path.parent() {
@@ -203,7 +240,7 @@ impl StorageProvider for LocalProvider {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
 
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
         let parent_dir = fs_path
             .parent()
             .ok_or_else(|| Error::InvalidInput("Cannot write to root path".to_string()))?;
@@ -255,7 +292,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("File not found: {}", path)));
@@ -271,7 +308,7 @@ impl StorageProvider for LocalProvider {
     async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
         use futures::StreamExt;
 
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("File not found: {}", path)));
         }
@@ -285,12 +322,12 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn exists(&self, path: &VaultPath) -> Result<bool> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
         Ok(fs_path.exists())
     }
 
     async fn delete(&self, path: &VaultPath) -> Result<()> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("File not found: {}", path)));
@@ -307,7 +344,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("Directory not found: {}", path)));
@@ -337,7 +374,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("Path not found: {}", path)));
@@ -348,7 +385,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if fs_path.exists() {
             return Err(Error::AlreadyExists(format!(
@@ -388,7 +425,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
-        let fs_path = self.to_fs_path(path);
+        let fs_path = self.checked_fs_path(path)?;
 
         if !fs_path.exists() {
             return Err(Error::NotFound(format!("Directory not found: {}", path)));
@@ -409,8 +446,8 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
-        let from_path = self.to_fs_path(from);
-        let to_path = self.to_fs_path(to);
+        let from_path = self.checked_fs_path(from)?;
+        let to_path = self.checked_fs_path(to)?;
 
         if !from_path.exists() {
             return Err(Error::NotFound(format!("Source not found: {}", from)));
@@ -430,8 +467,8 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
-        let from_path = self.to_fs_path(from);
-        let to_path = self.to_fs_path(to);
+        let from_path = self.checked_fs_path(from)?;
+        let to_path = self.checked_fs_path(to)?;
 
         if !from_path.exists() {
             return Err(Error::NotFound(format!("Source not found: {}", from)));
@@ -519,6 +556,66 @@ impl StorageProvider for LocalProvider {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_root_is_rejected_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = temp.path().join("root-link");
+        symlink(&target, &root).unwrap();
+
+        assert!(LocalProvider::new(&root).is_err());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target permissions must not change");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_rejects_symlink_component_inserted_after_construction() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let provider = LocalProvider::new(&root).unwrap();
+        symlink(&outside, root.join("swapped")).unwrap();
+
+        let path = VaultPath::parse("/swapped/escape.bin").unwrap();
+        assert!(provider.upload(&path, b"secret".to_vec()).await.is_err());
+        assert!(!outside.join("escape.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_rejects_root_replaced_by_symlink_after_construction() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let moved = temp.path().join("moved-root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let provider = LocalProvider::new(&root).unwrap();
+        std::fs::rename(&root, &moved).unwrap();
+        symlink(&outside, &root).unwrap();
+
+        assert!(provider
+            .upload(
+                &VaultPath::parse("/escape.bin").unwrap(),
+                b"secret".to_vec()
+            )
+            .await
+            .is_err());
+        assert!(!outside.join("escape.bin").exists());
+    }
 
     #[tokio::test]
     async fn test_local_upload_download() {
