@@ -1,6 +1,7 @@
 //! Authenticated snapshot generation manifest.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 
 use axiomvault_common::{Error, Result, VaultId};
 use axiomvault_crypto::{decrypt, encrypt, MasterKey};
@@ -87,7 +88,18 @@ impl GenerationManifest {
 }
 
 pub(crate) fn digest(bytes: &[u8]) -> String {
+    digest_reader(bytes).expect("reading a byte slice cannot fail")
+}
+
+pub(crate) fn digest_reader(mut reader: impl Read) -> Result<String> {
     let mut hasher = Blake2b::<U32>::new();
-    hasher.update(bytes);
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(hasher.finalize()))
 }
