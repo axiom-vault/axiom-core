@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
 use crate::freshness::{FreshnessAnchor, LocalFileFreshnessAnchor, UnavailableFreshnessAnchor};
-use crate::manifest::{GenerationManifest, MANIFEST_FILENAME};
+use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::session::VaultSession;
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
@@ -71,6 +71,7 @@ pub struct VaultManager {
     registry: ProviderRegistry,
     credential_resolver: Option<Arc<dyn LocalCredentialResolver>>,
     freshness_anchor: Arc<dyn FreshnessAnchor>,
+    ephemeral_namespace: String,
 }
 
 impl VaultManager {
@@ -128,7 +129,49 @@ impl VaultManager {
             registry,
             credential_resolver,
             freshness_anchor,
+            ephemeral_namespace: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    fn freshness_id_from(
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+        vault_id: &VaultId,
+        ephemeral_namespace: Option<&str>,
+    ) -> Result<VaultId> {
+        let stable_identity = match provider_type {
+            "memory" => serde_json::json!({ "instance": ephemeral_namespace }),
+            "local" => serde_json::json!({ "root": provider_config.get("root") }),
+            "gdrive" => serde_json::json!({ "folder_id": provider_config.get("folder_id") }),
+            "dropbox" => serde_json::json!({ "root_path": provider_config.get("root_path") }),
+            "onedrive" => serde_json::json!({
+                "drive_id": provider_config.get("drive_id"),
+                "folder_id": provider_config.get("folder_id"),
+                "root_path": provider_config.get("root_path")
+            }),
+            _ => provider_config.clone(),
+        };
+        let material = serde_json::to_vec(&serde_json::json!({
+            "provider": provider_type,
+            "vault_id": vault_id.as_str(),
+            "identity": stable_identity,
+        }))
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+        VaultId::new(format!("anchor-{}", digest(&material)))
+    }
+
+    fn freshness_id(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+        vault_id: &VaultId,
+    ) -> Result<VaultId> {
+        Self::freshness_id_from(
+            provider_type,
+            provider_config,
+            vault_id,
+            Some(&self.ephemeral_namespace),
+        )
     }
 
     /// Get the provider registry.
@@ -185,7 +228,8 @@ impl VaultManager {
         provider_config: serde_json::Value,
         kdf_params: KdfParams,
     ) -> Result<VaultCreation> {
-        if self.freshness_anchor.load(&vault_id)?.is_some() {
+        let anchor_id = self.freshness_id(provider_type, &provider_config, &vault_id)?;
+        if self.freshness_anchor.load(&anchor_id)?.is_some() {
             return Err(Error::AlreadyExists(
                 "freshness anchor already exists for vault ID".to_string(),
             ));
@@ -212,6 +256,7 @@ impl VaultManager {
             provider,
             VaultTree::new(),
             self.freshness_anchor.clone(),
+            anchor_id,
             0,
         )?;
         session.save_tree().await?;
@@ -262,13 +307,14 @@ impl VaultManager {
 
         let config_bytes = provider.download(&config_path).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
+        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
 
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
 
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
-        let anchored_generation = self.freshness_anchor.load(&config.id)?;
+        let anchored_generation = self.freshness_anchor.load(&anchor_id)?;
 
         if provider.exists(&manifest_path).await? {
             let tree_path = VaultPath::parse(META_DIRNAME)?.join(crate::config::TREE_FILENAME)?;
@@ -290,13 +336,14 @@ impl VaultManager {
             }
             let tree = VaultSession::decrypt_tree_bytes(&master_key, &encrypted_tree)?;
             self.freshness_anchor
-                .store(&config.id, manifest.generation)?;
+                .store(&anchor_id, manifest.generation)?;
             return VaultSession::from_master_key_with_freshness(
                 config,
                 master_key,
                 provider,
                 tree,
                 self.freshness_anchor.clone(),
+                anchor_id,
                 manifest.generation,
             );
         }
@@ -324,6 +371,7 @@ impl VaultManager {
             provider,
             tree,
             self.freshness_anchor.clone(),
+            anchor_id,
             0,
         )?;
         session.save_tree().await?;
@@ -353,6 +401,7 @@ impl VaultManager {
 
         let config_bytes = provider.download(&config_path).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
+        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
 
         let recovery_key = RecoveryKey::from_mnemonic(recovery_words)?;
 
@@ -363,7 +412,7 @@ impl VaultManager {
 
         // Verify the currently stored authenticated snapshot before mutating config.
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
-        let anchored_generation = self.freshness_anchor.load(&config.id)?;
+        let anchored_generation = self.freshness_anchor.load(&anchor_id)?;
         let (tree, generation) = if provider.exists(&manifest_path).await? {
             let tree_path = VaultPath::parse(META_DIRNAME)?.join(crate::config::TREE_FILENAME)?;
             if !provider.exists(&tree_path).await? {
@@ -382,7 +431,7 @@ impl VaultManager {
             }
             let tree = VaultSession::decrypt_tree_bytes(&master_key, &encrypted_tree)?;
             self.freshness_anchor
-                .store(&config.id, manifest.generation)?;
+                .store(&anchor_id, manifest.generation)?;
             (tree, manifest.generation)
         } else {
             if anchored_generation.is_some() {
@@ -413,6 +462,7 @@ impl VaultManager {
             provider,
             tree,
             self.freshness_anchor.clone(),
+            anchor_id,
             generation,
         )?;
         session.save_tree().await?;
@@ -463,6 +513,62 @@ mod tests {
     use crate::freshness::{FreshnessAnchor, InMemoryFreshnessAnchor};
     use crate::manifest::MANIFEST_FILENAME;
     use axiomvault_storage::MemoryProvider;
+
+    fn test_anchor_id(vault_id: &VaultId) -> VaultId {
+        VaultManager::freshness_id_from("test", &serde_json::Value::Null, vault_id, None).unwrap()
+    }
+
+    #[test]
+    fn freshness_identity_distinguishes_providers_and_ignores_rotating_cloud_tokens() {
+        let id = VaultId::new("same-user-id").unwrap();
+        let local_a = VaultManager::freshness_id_from(
+            "local",
+            &serde_json::json!({"root": "/tmp/a"}),
+            &id,
+            None,
+        )
+        .unwrap();
+        let local_b = VaultManager::freshness_id_from(
+            "local",
+            &serde_json::json!({"root": "/tmp/b"}),
+            &id,
+            None,
+        )
+        .unwrap();
+        assert_ne!(local_a, local_b);
+
+        let cloud_a = VaultManager::freshness_id_from(
+            "gdrive",
+            &serde_json::json!({"folder_id": "stable", "tokens": {"access_token": "a"}}),
+            &id,
+            None,
+        )
+        .unwrap();
+        let cloud_b = VaultManager::freshness_id_from(
+            "gdrive",
+            &serde_json::json!({"folder_id": "stable", "tokens": {"access_token": "b"}}),
+            &id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cloud_a, cloud_b);
+
+        let memory_a = VaultManager::freshness_id_from(
+            "memory",
+            &serde_json::Value::Null,
+            &id,
+            Some("instance-a"),
+        )
+        .unwrap();
+        let memory_b = VaultManager::freshness_id_from(
+            "memory",
+            &serde_json::Value::Null,
+            &id,
+            Some("instance-b"),
+        )
+        .unwrap();
+        assert_ne!(memory_a, memory_b);
+    }
 
     fn manager_with_storage(
         provider: Arc<MemoryProvider>,
@@ -581,7 +687,7 @@ mod tests {
             .join(MANIFEST_FILENAME)
             .unwrap();
         assert!(provider.exists(&manifest_path).await.unwrap());
-        assert_eq!(anchor.load(&vault_id).unwrap(), Some(1));
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(1));
     }
 
     #[tokio::test]
@@ -608,7 +714,7 @@ mod tests {
             .unwrap();
         reopened.save_tree().await.unwrap();
 
-        assert_eq!(anchor.load(&vault_id).unwrap(), Some(2));
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(2));
     }
 
     #[tokio::test]
@@ -682,7 +788,7 @@ mod tests {
             .await
             .unwrap();
         assert!(reopened.is_active());
-        assert_eq!(anchor.load(&vault_id).unwrap(), Some(2));
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(2));
     }
 
     #[tokio::test]
@@ -712,7 +818,7 @@ mod tests {
             .open_vault("test", serde_json::Value::Null, b"new-password")
             .await
             .unwrap();
-        assert_eq!(anchor.load(&vault_id).unwrap(), Some(2));
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(2));
     }
 
     #[tokio::test]
@@ -863,7 +969,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             new_anchor
-                .load(&VaultId::new("first-open").unwrap())
+                .load(&test_anchor_id(&VaultId::new("first-open").unwrap()))
                 .unwrap(),
             Some(1)
         );
@@ -904,7 +1010,7 @@ mod tests {
         assert!(provider.exists(&manifest_path()).await.unwrap());
         assert_eq!(
             anchor
-                .load(&VaultId::new("legacy-bootstrap").unwrap())
+                .load(&test_anchor_id(&VaultId::new("legacy-bootstrap").unwrap()))
                 .unwrap(),
             Some(1)
         );
@@ -1027,7 +1133,10 @@ mod tests {
         create_registry
             .register("gdrive", Box::new(move |_| Ok(create_storage.clone())))
             .unwrap();
-        let create_manager = VaultManager::with_registry(create_registry);
+        let create_manager = VaultManager::with_registry_and_anchor(
+            create_registry,
+            Arc::new(InMemoryFreshnessAnchor::new()),
+        );
         let creation = create_manager
             .create_vault(
                 VaultId::new("legacy-cloud").unwrap(),
@@ -1061,6 +1170,15 @@ mod tests {
             )
             .await
             .unwrap();
+        storage
+            .delete(
+                &VaultPath::parse(META_DIRNAME)
+                    .unwrap()
+                    .join(MANIFEST_FILENAME)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         drop(creation);
 
         let mut open_registry = ProviderRegistry::new();
@@ -1068,9 +1186,10 @@ mod tests {
         open_registry
             .register("gdrive", Box::new(move |_| Ok(open_storage.clone())))
             .unwrap();
-        let open_manager = VaultManager::with_registry_and_credential_resolver(
+        let open_manager = VaultManager::with_registry_credential_resolver_and_anchor(
             open_registry,
             Arc::new(TestCredentialResolver),
+            Arc::new(InMemoryFreshnessAnchor::new()),
         );
         let safe_config = serde_json::json!({
             "credential_schema": 1,
@@ -1110,9 +1229,10 @@ mod tests {
                 }),
             )
             .unwrap();
-        let manager = VaultManager::with_registry_and_credential_resolver(
+        let manager = VaultManager::with_registry_credential_resolver_and_anchor(
             registry,
             Arc::new(TestCredentialResolver),
+            Arc::new(InMemoryFreshnessAnchor::new()),
         );
         let safe_config = serde_json::json!({
             "credential_schema": 1,
@@ -1180,7 +1300,10 @@ mod tests {
             registry
                 .register(provider_type, Box::new(move |_| Ok(resolved.clone())))
                 .unwrap();
-            let manager = VaultManager::with_registry(registry);
+            let manager = VaultManager::with_registry_and_anchor(
+                registry,
+                Arc::new(InMemoryFreshnessAnchor::new()),
+            );
             let mut provider_config = serde_json::json!({
                 "credential_ref": format!("local:{provider_type}:test"),
                 "tokens": {
@@ -1233,7 +1356,10 @@ mod tests {
         registry
             .register("gdrive", Box::new(move |_| Ok(resolved.clone())))
             .unwrap();
-        let manager = VaultManager::with_registry(registry);
+        let manager = VaultManager::with_registry_and_anchor(
+            registry,
+            Arc::new(InMemoryFreshnessAnchor::new()),
+        );
         let provider_config = serde_json::json!({
             "folder_id": "remote-folder",
             "credential_ref": "local:gdrive:test",

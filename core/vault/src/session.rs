@@ -73,6 +73,7 @@ pub struct VaultSession {
 
 struct FreshnessState {
     anchor: Arc<dyn FreshnessAnchor>,
+    anchor_id: VaultId,
     generation: Mutex<u64>,
 }
 
@@ -100,6 +101,7 @@ impl VaultSession {
         provider: Arc<dyn StorageProvider>,
         tree: VaultTree,
         anchor: Arc<dyn FreshnessAnchor>,
+        anchor_id: VaultId,
         generation: u64,
     ) -> Result<Self> {
         Self::from_master_key_internal(
@@ -109,6 +111,7 @@ impl VaultSession {
             tree,
             Some(FreshnessState {
                 anchor,
+                anchor_id,
                 generation: Mutex::new(generation),
             }),
         )
@@ -382,7 +385,9 @@ impl VaultSession {
             let manifest_bytes = manifest.seal(self.master_key()?)?;
             let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
             self.provider.upload(&manifest_path, manifest_bytes).await?;
-            freshness.anchor.store(&self.config.id, next_generation)?;
+            freshness
+                .anchor
+                .store(&freshness.anchor_id, next_generation)?;
             *generation = next_generation;
         }
         Ok(())

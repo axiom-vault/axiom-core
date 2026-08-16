@@ -236,6 +236,7 @@ impl StorageProvider for LocalProvider {
         let write_result: Result<()> = async {
             while let Some(chunk) = stream.next().await {
                 file.write_all(&chunk?).await?;
+                file.flush().await?;
             }
             file.sync_all().await?;
             Ok(())
