@@ -23,6 +23,30 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
+    /// Reject untrusted work factors above the strongest supported preset.
+    ///
+    /// Vault configuration is read before authentication, so its parameters must
+    /// not request arbitrary allocation or CPU work. Custom parameters are
+    /// supported up to 256 MiB, four iterations, and four lanes.
+    pub fn validate(&self) -> Result<()> {
+        self.argon2_params().map(|_| ())
+    }
+
+    fn argon2_params(&self) -> Result<Params> {
+        if self.memory_cost > 262_144 || self.time_cost > 4 || self.parallelism > 4 {
+            return Err(Error::InvalidInput(
+                "vault config requests unsafe KDF resource limits (maximum 256 MiB, 4 iterations, 4 lanes)".to_string(),
+            ));
+        }
+        Params::new(
+            self.memory_cost,
+            self.time_cost,
+            self.parallelism,
+            Some(KEY_LENGTH),
+        )
+        .map_err(|error| Error::Crypto(format!("Invalid KDF parameters: {error}")))
+    }
+
     /// Create parameters suitable for interactive use.
     ///
     /// These parameters provide a balance between security and usability,
@@ -84,13 +108,7 @@ pub fn derive_key(password: &[u8], salt: &Salt, params: &KdfParams) -> Result<Ma
         return Err(Error::InvalidInput("Password cannot be empty".to_string()));
     }
 
-    let argon2_params = Params::new(
-        params.memory_cost,
-        params.time_cost,
-        params.parallelism,
-        Some(KEY_LENGTH),
-    )
-    .map_err(|e| Error::Crypto(format!("Invalid KDF parameters: {}", e)))?;
+    let argon2_params = params.argon2_params()?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params);
 
@@ -120,6 +138,34 @@ pub fn verify_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_limits_accept_presets_and_reject_untrusted_work_factors() {
+        for params in [
+            KdfParams::moderate(),
+            KdfParams::interactive(),
+            KdfParams::sensitive(),
+        ] {
+            params.validate().unwrap();
+        }
+        for params in [
+            KdfParams {
+                memory_cost: 262_145,
+                ..KdfParams::moderate()
+            },
+            KdfParams {
+                time_cost: 5,
+                ..KdfParams::moderate()
+            },
+            KdfParams {
+                parallelism: 5,
+                ..KdfParams::moderate()
+            },
+        ] {
+            assert!(params.validate().is_err());
+            assert!(derive_key(b"password", &Salt::generate(), &params).is_err());
+        }
+    }
 
     #[test]
     fn test_derive_key_deterministic() {

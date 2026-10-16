@@ -255,9 +255,9 @@ impl LocalFileFreshnessAnchor {
             }
         }
 
-        let temporary = path.with_extension("generation.tmp");
+        let temporary = path.with_extension(format!("generation.{}.tmp", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -272,9 +272,18 @@ impl LocalFileFreshnessAnchor {
             .map_err(|error| Error::Vault(format!("failed to write freshness anchor: {error}")))?;
         file.sync_all()
             .map_err(|error| Error::Vault(format!("failed to sync freshness anchor: {error}")))?;
+        drop(file);
         fs::rename(&temporary, &path).map_err(|error| {
             Error::Vault(format!("failed to replace freshness anchor: {error}"))
         })?;
+        #[cfg(unix)]
+        fs::File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                Error::Vault(format!(
+                    "failed to sync freshness anchor directory: {error}"
+                ))
+            })?;
         Ok(())
     }
 }

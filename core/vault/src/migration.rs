@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME};
 use axiomvault_common::{Error, Result, VaultPath};
-use axiomvault_crypto::recovery::RecoveryKey;
+use axiomvault_crypto::{recovery::RecoveryKey, MasterKey};
 use axiomvault_storage::StorageProvider;
 
 /// Backup filename for vault config during migration.
@@ -70,6 +70,11 @@ pub trait Migration: Send + Sync {
 /// Registry of all available migrations.
 pub struct MigrationRegistry {
     migrations: Vec<Box<dyn Migration>>,
+}
+
+struct AuthenticatedConfig {
+    config: VaultConfig,
+    master_key: MasterKey,
 }
 
 impl MigrationRegistry {
@@ -145,7 +150,7 @@ impl MigrationRegistry {
         let backup_path = VaultPath::parse(CONFIG_BACKUP_FILENAME)?;
         let temp_path = VaultPath::parse(CONFIG_MIGRATION_FILENAME)?;
 
-        self.recover_interrupted(provider, &config_path, &backup_path, &temp_path)
+        self.recover_interrupted(provider, password, &config_path, &backup_path, &temp_path)
             .await?;
 
         let original_bytes = provider.download(&config_path).await?;
@@ -245,21 +250,123 @@ impl MigrationRegistry {
     async fn recover_interrupted(
         &self,
         provider: &dyn StorageProvider,
+        password: &[u8],
         config_path: &VaultPath,
         backup_path: &VaultPath,
         temp_path: &VaultPath,
     ) -> Result<()> {
         let backup_exists = provider.exists(backup_path).await?;
         let config_exists = provider.exists(config_path).await?;
-        if backup_exists && !config_exists {
-            provider.rename(backup_path, config_path).await?;
-        } else if backup_exists {
-            return Err(Error::Vault(
-                "Unresolved migration backup exists; refusing to overwrite it".to_string(),
-            ));
+        let temp_exists = provider.exists(temp_path).await?;
+
+        if !backup_exists && !temp_exists {
+            return Ok(());
         }
-        if provider.exists(temp_path).await? {
-            provider.delete(temp_path).await?;
+
+        // Read, parse, and authenticate every surviving candidate before changing
+        // any storage state. Besides keeping wrong-password attempts side-effect
+        // free, this prevents a malformed artifact from being silently discarded.
+        let config = if config_exists {
+            Some(
+                self.load_authenticated_config(provider, config_path, password)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let backup = if backup_exists {
+            Some(
+                self.load_authenticated_config(provider, backup_path, password)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let temporary = if temp_exists {
+            Some(
+                self.load_authenticated_config(provider, temp_path, password)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        match (&config, &backup, &temporary) {
+            (Some(previous), None, Some(next)) => {
+                self.validate_interrupted_pair(previous, next)?;
+                provider.delete(temp_path).await?;
+            }
+            (None, Some(previous), Some(next)) => {
+                self.validate_interrupted_pair(previous, next)?;
+                provider.rename(backup_path, config_path).await?;
+                provider.delete(temp_path).await?;
+            }
+            (None, Some(_), None) => {
+                provider.rename(backup_path, config_path).await?;
+            }
+            (Some(next), Some(previous), None) => {
+                self.validate_interrupted_pair(previous, next)?;
+
+                // A crash after publishing the migrated config but before backup
+                // cleanup may have prevented its recovery words from reaching the
+                // caller. Move the committed candidate back to the temporary slot,
+                // restore the legacy config, and rerun the migration so fresh words
+                // are returned. Every intermediate state is handled by this same
+                // recovery state machine on retry.
+                provider.rename(config_path, temp_path).await?;
+                provider.rename(backup_path, config_path).await?;
+                provider.delete(temp_path).await?;
+            }
+            (Some(_), Some(_), Some(_)) => {
+                return Err(Error::Vault(
+                    "Invalid interrupted migration state: config, backup, and temporary config all exist"
+                        .to_string(),
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(Error::Vault(
+                    "Invalid interrupted migration state: temporary config has no source config"
+                        .to_string(),
+                ));
+            }
+            (Some(_), None, None) | (None, None, None) => {}
+        }
+        Ok(())
+    }
+
+    async fn load_authenticated_config(
+        &self,
+        provider: &dyn StorageProvider,
+        path: &VaultPath,
+        password: &[u8],
+    ) -> Result<AuthenticatedConfig> {
+        let bytes = provider.download(path).await?;
+        let config = VaultConfig::from_bytes(&bytes)?;
+        let master_key = config
+            .verify_password(password)?
+            .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
+        if config.version == VaultVersion::CURRENT {
+            validate_v1_1_invariants(&config)?;
+        }
+        Ok(AuthenticatedConfig { config, master_key })
+    }
+
+    fn validate_interrupted_pair(
+        &self,
+        previous: &AuthenticatedConfig,
+        next: &AuthenticatedConfig,
+    ) -> Result<()> {
+        let has_forward_path = self
+            .find_path(&previous.config.version, &next.config.version)
+            .is_some_and(|path| !path.is_empty());
+        if previous.config.id != next.config.id
+            || previous.master_key.as_bytes() != next.master_key.as_bytes()
+            || !has_forward_path
+        {
+            return Err(Error::Vault(
+                "Interrupted migration candidates do not represent the same vault migration"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -370,6 +477,22 @@ mod tests {
         let mut config = creation.config;
         config.version = version;
         config
+    }
+
+    fn make_legacy_config() -> VaultConfig {
+        let mut config = make_test_config(VaultVersion { major: 1, minor: 0 });
+        config.wrapped_master_key = None;
+        config.recovery_wrapped_master_key = None;
+        config.recovery_key_verification = None;
+        config.encrypted_recovery_key = None;
+        config
+    }
+
+    async fn upload_config(provider: &dyn StorageProvider, filename: &str, bytes: Vec<u8>) {
+        provider
+            .upload(&VaultPath::parse(filename).unwrap(), bytes)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -544,11 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_password_does_not_modify_legacy_config() {
-        let mut legacy = make_test_config(VaultVersion { major: 1, minor: 0 });
-        legacy.wrapped_master_key = None;
-        legacy.recovery_wrapped_master_key = None;
-        legacy.recovery_key_verification = None;
-        legacy.encrypted_recovery_key = None;
+        let legacy = make_legacy_config();
         let original = legacy.to_bytes().unwrap();
         let provider = axiomvault_storage::MemoryProvider::new();
         provider
@@ -579,6 +698,162 @@ mod tests {
             .exists(&VaultPath::parse(CONFIG_MIGRATION_FILENAME).unwrap())
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn wrong_password_does_not_restore_interrupted_backup() {
+        let backup = make_legacy_config().to_bytes().unwrap();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(&provider, CONFIG_BACKUP_FILENAME, backup.clone()).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .await;
+
+        assert!(matches!(result, Err(Error::NotPermitted(_))));
+        assert!(!provider
+            .exists(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+            .await
+            .unwrap());
+        assert_eq!(
+            provider
+                .download(&VaultPath::parse(CONFIG_BACKUP_FILENAME).unwrap())
+                .await
+                .unwrap(),
+            backup
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_password_does_not_delete_interrupted_temporary_config() {
+        let legacy = make_legacy_config();
+        let config_bytes = legacy.to_bytes().unwrap();
+        let mut staged = legacy.clone();
+        staged.migrate_to_v1_1(b"test").unwrap();
+        let staged_bytes = staged.to_bytes().unwrap();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(&provider, CONFIG_FILENAME, config_bytes.clone()).await;
+        upload_config(&provider, CONFIG_MIGRATION_FILENAME, staged_bytes.clone()).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .await;
+
+        assert!(matches!(result, Err(Error::NotPermitted(_))));
+        assert_eq!(
+            provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+            config_bytes
+        );
+        assert_eq!(
+            provider
+                .download(&VaultPath::parse(CONFIG_MIGRATION_FILENAME).unwrap())
+                .await
+                .unwrap(),
+            staged_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn postcommit_interruption_rolls_back_and_returns_new_recovery_words() {
+        let password = b"test";
+        let legacy = make_legacy_config();
+        let original_master_key = legacy.verify_password(password).unwrap().unwrap();
+        let backup_bytes = legacy.to_bytes().unwrap();
+        let mut committed = legacy.clone();
+        committed.migrate_to_v1_1(password).unwrap();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(&provider, CONFIG_FILENAME, committed.to_bytes().unwrap()).await;
+        upload_config(&provider, CONFIG_BACKUP_FILENAME, backup_bytes).await;
+
+        let outcome = MigrationRegistry::with_defaults()
+            .migrate(&provider, password, &VaultVersion::CURRENT)
+            .await
+            .unwrap();
+
+        let recovery_words = outcome
+            .recovery_words
+            .expect("retry must return replacement recovery words");
+        let recovery_key = RecoveryKey::from_mnemonic(&recovery_words).unwrap();
+        let recovered_master_key = outcome
+            .config
+            .verify_recovery_key(&recovery_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered_master_key.as_bytes(),
+            original_master_key.as_bytes()
+        );
+        let persisted = VaultConfig::from_bytes(
+            &provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted
+                .verify_password(password)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            original_master_key.as_bytes()
+        );
+        assert_eq!(
+            persisted
+                .verify_recovery_key(&recovery_key)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            original_master_key.as_bytes()
+        );
+        assert!(!provider
+            .exists(&VaultPath::parse(CONFIG_BACKUP_FILENAME).unwrap())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn malformed_interrupted_candidate_is_preserved_until_removed_then_retry_succeeds() {
+        let legacy = make_legacy_config();
+        let config_bytes = legacy.to_bytes().unwrap();
+        let malformed = b"not a vault config".to_vec();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(&provider, CONFIG_FILENAME, config_bytes.clone()).await;
+        upload_config(&provider, CONFIG_MIGRATION_FILENAME, malformed.clone()).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+            config_bytes
+        );
+        assert_eq!(
+            provider
+                .download(&VaultPath::parse(CONFIG_MIGRATION_FILENAME).unwrap())
+                .await
+                .unwrap(),
+            malformed
+        );
+
+        provider
+            .delete(&VaultPath::parse(CONFIG_MIGRATION_FILENAME).unwrap())
+            .await
+            .unwrap();
+        let outcome = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .await
+            .unwrap();
+        assert_eq!(outcome.config.version, VaultVersion::CURRENT);
+        assert!(outcome.recovery_words.is_some());
     }
 
     #[test]

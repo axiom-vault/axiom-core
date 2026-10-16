@@ -5,7 +5,7 @@ use std::path::Path;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::StreamExt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::config::DATA_DIRNAME;
@@ -108,14 +108,7 @@ impl<'a> VaultOperations<'a> {
             .await?;
 
         candidate.get_node_mut(path)?.metadata.content_digest = Some(digest(&encrypted_content));
-        if let Err(persist_err) = self.session.save_tree_snapshot(&candidate).await {
-            if let Err(rollback_err) = self.session.provider().delete(&storage_path).await {
-                return Err(Error::Storage(format!(
-                    "tree persistence failed ({persist_err}); blob rollback failed ({rollback_err})"
-                )));
-            }
-            return Err(persist_err);
-        }
+        self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
 
         info!(size = content.len(), "File created");
@@ -173,14 +166,7 @@ impl<'a> VaultOperations<'a> {
             .upload_sized_stream(&storage_path, encrypted_stream, encrypted_size)
             .await?;
 
-        if let Err(persist_err) = self.session.save_tree_snapshot(&candidate).await {
-            if let Err(rollback_err) = self.session.provider().delete(&storage_path).await {
-                return Err(Error::Storage(format!(
-                    "tree persistence failed ({persist_err}); blob rollback failed ({rollback_err})"
-                )));
-            }
-            return Err(persist_err);
-        }
+        self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
         info!(size, "File imported");
         Ok(())
@@ -369,7 +355,7 @@ impl<'a> VaultOperations<'a> {
         debug!("Updating encrypted file");
 
         let mut tree = self.session.tree().write().await;
-        let encrypted_name = {
+        let old_encrypted_name = {
             let node = tree.get_node(path)?;
             if !node.is_file() {
                 return Err(Error::InvalidInput("Not a file".to_string()));
@@ -377,14 +363,19 @@ impl<'a> VaultOperations<'a> {
             node.metadata.encrypted_name.clone()
         };
 
+        let name = path
+            .name()
+            .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
+        let encrypted_name = self.encrypt_name(name)?;
         let master_key = self.session.master_key()?;
         let file_key = master_key.derive_file_key(encrypted_name.as_bytes());
         let encrypted_content = encrypt(file_key.as_bytes(), content)?;
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let old_encrypted_content = self.session.provider().download(&storage_path).await?;
+        let old_storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&old_encrypted_name)?;
 
         let mut candidate = tree.clone();
         let node = candidate.get_node_mut(path)?;
+        node.metadata.encrypted_name = encrypted_name;
         node.metadata.size = Some(content.len() as u64);
         node.metadata.modified_at = chrono::Utc::now();
         node.metadata.content_digest = Some(digest(&encrypted_content));
@@ -395,20 +386,12 @@ impl<'a> VaultOperations<'a> {
             .upload(&storage_path, encrypted_content)
             .await?;
 
-        if let Err(persist_err) = self.session.save_tree_snapshot(&candidate).await {
-            if let Err(rollback_err) = self
-                .session
-                .provider()
-                .upload(&storage_path, old_encrypted_content)
-                .await
-            {
-                return Err(Error::Storage(format!(
-                    "tree persistence failed ({persist_err}); content rollback failed ({rollback_err})"
-                )));
-            }
-            return Err(persist_err);
-        }
+        self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
+
+        if let Err(error) = self.session.provider().delete(&old_storage_path).await {
+            warn!(%error, "File updated but obsolete blob cleanup failed");
+        }
 
         info!(size = content.len(), "File updated");
         Ok(())
@@ -420,12 +403,12 @@ impl<'a> VaultOperations<'a> {
     /// - File must exist
     ///
     /// # Postconditions
-    /// - File is removed from storage
     /// - Tree entry is removed
+    /// - The obsolete content blob is removed on a best-effort basis
     ///
     /// # Errors
     /// - File not found
-    /// - Storage failure
+    /// - Tree persistence failure
     pub async fn delete_file(&self, path: &VaultPath) -> Result<()> {
         debug!("Deleting file");
 
@@ -439,26 +422,15 @@ impl<'a> VaultOperations<'a> {
         };
 
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let old_encrypted_content = self.session.provider().download(&storage_path).await?;
         let mut candidate = tree.clone();
         candidate.remove(path)?;
 
-        self.session.provider().delete(&storage_path).await?;
-
-        if let Err(persist_err) = self.session.save_tree_snapshot(&candidate).await {
-            if let Err(rollback_err) = self
-                .session
-                .provider()
-                .upload(&storage_path, old_encrypted_content)
-                .await
-            {
-                return Err(Error::Storage(format!(
-                    "tree persistence failed ({persist_err}); delete rollback failed ({rollback_err})"
-                )));
-            }
-            return Err(persist_err);
-        }
+        self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
+
+        if let Err(error) = self.session.provider().delete(&storage_path).await {
+            warn!(%error, "File deleted but obsolete blob cleanup failed");
+        }
 
         info!("File deleted");
         Ok(())
@@ -763,20 +735,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_failure_preserves_tree_entry_and_content() {
+    async fn delete_cleanup_failure_does_not_undo_published_removal() {
         let (session, provider) = create_failing_test_session().await;
         let ops = VaultOperations::new(&session).unwrap();
         let path = VaultPath::parse("/not-deleted.txt").unwrap();
         ops.create_file(&path, b"old").await.unwrap();
         provider.fail_next_delete();
 
-        assert!(ops.delete_file(&path).await.is_err());
-        assert!(ops.exists(&path).await);
-        assert_eq!(ops.read_file(&path).await.unwrap(), b"old");
+        ops.delete_file(&path).await.unwrap();
+        assert!(!ops.exists(&path).await);
     }
 
     #[tokio::test]
-    async fn create_tree_persistence_failure_rolls_back_blob_and_tree() {
+    async fn create_tree_persistence_failure_keeps_recoverable_orphan() {
         let (session, provider) = create_failing_test_session().await;
         let ops = VaultOperations::new(&session).unwrap();
         let path = VaultPath::parse("/rolled-back.txt").unwrap();
@@ -784,11 +755,36 @@ mod tests {
 
         assert!(ops.create_file(&path, b"secret").await.is_err());
         assert!(!ops.exists(&path).await);
-        assert!(provider
-            .list(&VaultPath::parse("/d").unwrap())
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            provider
+                .list(&VaultPath::parse("/d").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_create_tree_persistence_failure_keeps_recoverable_orphan() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, b"secret").unwrap();
+        let path = VaultPath::parse("/rolled-back-stream.txt").unwrap();
+        provider.fail_next_tree_upload();
+
+        assert!(ops.create_file_from_path(&path, &source).await.is_err());
+        assert!(!ops.exists(&path).await);
+        assert_eq!(
+            provider
+                .list(&VaultPath::parse("/d").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

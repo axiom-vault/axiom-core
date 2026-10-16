@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_storage::StorageProvider;
 
-use crate::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy, ResolutionResult};
+use crate::conflict::{ConflictResolver, ConflictStrategy};
 use crate::mapping::{IdentityPathMapper, SyncPathMapper};
 use crate::retry::{RetryConfig, RetryExecutor};
 use crate::scheduler::{SyncMode, SyncRequest, SyncResult, SyncScheduler, SyncSchedulerHandle};
@@ -171,9 +171,27 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
 
         // The staging registry is authoritative for interrupted local changes.
         // Rebuild any missing state entries before persisting the loaded state.
+        let staged_paths: HashSet<VaultPath> = staging
+            .all_changes()
+            .map(|change| change.vault_path.clone())
+            .collect();
         for change in staging.all_changes() {
-            if state.get(&change.vault_path).is_none() {
+            if let Some(entry) = state.get_mut(&change.vault_path) {
+                if entry.status == SyncStatus::Synced {
+                    entry.mark_local_modified(entry.local_etag.clone());
+                }
+            } else {
                 state.insert(SyncEntry::new_local(change.vault_path.to_string(), None));
+            }
+        }
+        // A crash can durably discard a rejected staged revision just before
+        // persisting the selected remote state. Re-download such conflicts.
+        for entry in state.entries_mut() {
+            if entry.status == SyncStatus::Conflicted {
+                let path = VaultPath::parse(&entry.path)?;
+                if !staged_paths.contains(&path) {
+                    entry.status = SyncStatus::RemoteModified;
+                }
             }
         }
         persist_json_atomic(&state_path, &state).await?;
@@ -238,6 +256,7 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         data: Vec<u8>,
         change_type: ChangeType,
     ) -> Result<String> {
+        let _guard = self.sync_lock.lock().await;
         let mut staging = self.staging.write().await;
         let change_id = staging.stage_upload(path, data, change_type).await?;
 
@@ -258,6 +277,7 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
 
     /// Stage a file deletion.
     pub async fn stage_delete(&self, path: &VaultPath) -> Result<String> {
+        let _guard = self.sync_lock.lock().await;
         let mut staging = self.staging.write().await;
         let change_id = staging.stage_delete(path).await?;
 
@@ -301,8 +321,13 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         conflicts_found += upload_result.2;
 
         // 2. Check for remote changes
-        let remote_result = self.check_remote_changes().await;
-        conflicts_found += remote_result.unwrap_or(0);
+        match self.check_remote_changes().await {
+            Ok(remote_conflicts) => conflicts_found += remote_conflicts,
+            Err(error) => {
+                self.state.write().await.sync_in_progress = false;
+                return Err(error);
+            }
+        }
 
         // 3. Download remote changes
         let download_result = self.download_remote_changes().await;
@@ -333,6 +358,7 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
 
     /// Sync specific paths only.
     pub async fn sync_paths(&self, paths: Vec<String>) -> Result<SyncResult> {
+        let _guard = self.sync_lock.lock().await;
         let start = Instant::now();
         let mut files_synced = 0;
         let mut files_failed = 0;
@@ -425,9 +451,11 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                             } else {
                                 synced += 1;
                                 // Commit the change
-                                if let Err(e) = self.staging.write().await.commit(&change_id).await
-                                {
-                                    warn!("Failed to commit staged change: {}", e);
+                                let mut staging = self.staging.write().await;
+                                if staging.contains(&change_id) {
+                                    if let Err(e) = staging.commit(&change_id).await {
+                                        warn!("Failed to commit staged change: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -458,9 +486,13 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
     /// Upload a single staged file.
     async fn upload_staged_file(&self, change_id: &str, path: &VaultPath) -> Result<bool> {
         let remote_path = self.remote_path(path)?;
-        let data = {
+        let (data, change_type) = {
             let staging = self.staging.read().await;
-            staging.get_staged_data(change_id).await?
+            let change_type = staging
+                .get_change(change_id)
+                .ok_or_else(|| Error::NotFound(format!("Staged change not found: {change_id}")))?
+                .change_type;
+            (staging.get_staged_data(change_id).await?, change_type)
         };
 
         // Check for conflicts first
@@ -470,6 +502,14 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         };
 
         if let Some(ref entry) = local_entry {
+            // A conflict remains pending until an explicit resolution selects
+            // a version. Its remote ETag is the conflicting revision, so the
+            // normal divergence calculation alone cannot distinguish it from
+            // a safe retry.
+            if entry.status == SyncStatus::Conflicted {
+                return Ok(true);
+            }
+
             // Check if remote has changed
             let provider = self.remote.clone();
             let path_clone = remote_path.clone();
@@ -483,29 +523,51 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                 })
                 .await;
 
-            if let Ok(remote) = remote_metadata {
-                if self.conflict_resolver.detect_conflict(
-                    entry.local_etag.as_deref(),
-                    remote.etag.as_deref(),
-                    entry.remote_etag.as_deref(),
-                ) {
-                    // Conflict detection is based on local state, but remote
-                    // operations must use the mapped provider path.
-                    let mut conflict_info = ConflictInfo::from_entry_and_remote(entry, &remote)?;
-                    conflict_info.path = remote_path.clone();
-
-                    if self.config.auto_resolve_conflicts {
-                        let result = self
-                            .conflict_resolver
-                            .resolve(
-                                &conflict_info,
-                                data,
-                                self.remote.as_ref(),
-                                self.config.conflict_strategy,
+            match remote_metadata {
+                Ok(remote)
+                    if self.conflict_resolver.detect_conflict(
+                        entry.local_etag.as_deref(),
+                        remote.etag.as_deref(),
+                        entry.remote_etag.as_deref(),
+                    ) =>
+                {
+                    // A create may have reached the provider even when the
+                    // client observed a transport failure. Matching bytes
+                    // prove this is a retry of that successful upload.
+                    if change_type == ChangeType::Create {
+                        let versioned = self
+                            .retry_executor
+                            .execute_with_condition(
+                                || self.remote.download_with_metadata(&remote_path),
+                                |error| matches!(error, Error::Conflict(_)),
                             )
                             .await?;
+                        if versioned.data == data {
+                            let mut state = self.state.write().await;
+                            if let Some(entry) = state.get_mut(path) {
+                                entry.mark_synced(
+                                    versioned.metadata.etag,
+                                    versioned.metadata.modified,
+                                );
+                            }
+                            drop(state);
+                            self.persist_state().await?;
+                            return Ok(false);
+                        }
+                    }
 
-                        self.handle_resolution_result(path, result).await?;
+                    if self.config.auto_resolve_conflicts {
+                        if self.config.conflict_strategy == ConflictStrategy::Manual {
+                            let mut state = self.state.write().await;
+                            if let Some(entry) = state.get_mut(path) {
+                                entry.mark_conflicted(remote.etag.clone(), remote.modified);
+                            }
+                            drop(state);
+                            self.persist_state().await?;
+                            return Ok(true);
+                        }
+                        self.apply_conflict_resolution(path, data, self.config.conflict_strategy)
+                            .await?;
                         return Ok(false);
                     } else {
                         // Mark as conflicted
@@ -513,9 +575,13 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                         if let Some(entry) = state.get_mut(path) {
                             entry.mark_conflicted(remote.etag.clone(), remote.modified);
                         }
+                        drop(state);
+                        self.persist_state().await?;
                         return Ok(true);
                     }
                 }
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -559,7 +625,12 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             .execute(move || {
                 let p = provider.clone();
                 let path = path_clone.clone();
-                async move { p.delete(&path).await }
+                async move {
+                    match p.delete(&path).await {
+                        Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                }
             })
             .await?;
 
@@ -577,11 +648,15 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
     async fn check_remote_changes(&self) -> Result<usize> {
         let mut remote_files = Vec::new();
         let mut directories = vec![self.path_mapper.remote_root()];
+        self.ensure_local_directory(&self.path_mapper.local_root())
+            .await?;
         while let Some(directory) = directories.pop() {
             let children = self.remote.list(&directory).await?;
             for metadata in children {
                 let remote_path = directory.join(&metadata.name)?;
                 if metadata.is_directory {
+                    let local_directory = self.path_mapper.remote_to_local(&remote_path)?;
+                    self.ensure_local_directory(&local_directory).await?;
                     directories.push(remote_path);
                 } else {
                     remote_files.push((remote_path, metadata));
@@ -633,6 +708,17 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         }
         self.persist_state().await?;
         Ok(conflicts)
+    }
+
+    async fn ensure_local_directory(&self, directory: &VaultPath) -> Result<()> {
+        let mut current = VaultPath::root();
+        for component in directory.components() {
+            current = current.join(component)?;
+            if !self.local.exists(&current).await? {
+                self.local.create_dir(&current).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Download and durably persist every remotely modified object.
@@ -728,7 +814,10 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                 if has_conflict {
                     return Ok(SingleSyncResult { has_conflict: true });
                 }
-                self.staging.write().await.commit(&change_id).await?;
+                let mut staging = self.staging.write().await;
+                if staging.contains(&change_id) {
+                    staging.commit(&change_id).await?;
+                }
             }
         } else {
             let remote_path = self.remote_path(path)?;
@@ -767,50 +856,101 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         })
     }
 
-    /// Handle the result of conflict resolution.
-    async fn handle_resolution_result(
+    async fn apply_conflict_resolution(
         &self,
         path: &VaultPath,
-        result: ResolutionResult,
+        local_data: Vec<u8>,
+        strategy: ConflictStrategy,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
+        let remote_path = self.remote_path(path)?;
+        match strategy {
+            ConflictStrategy::Manual => Ok(()),
+            ConflictStrategy::PreferLocal => {
+                self.local.replace_atomic(path, local_data.clone()).await?;
+                let metadata = self.remote.upload(&remote_path, local_data).await?;
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(path) {
+                        entry.mark_synced(metadata.etag, metadata.modified);
+                    }
+                }
+                self.persist_state().await?;
+                self.staging.write().await.commit_path(path).await?;
+                Ok(())
+            }
+            ConflictStrategy::PreferRemote => {
+                let versioned = self
+                    .retry_executor
+                    .execute_with_condition(
+                        || self.remote.download_with_metadata(&remote_path),
+                        |error| matches!(error, Error::Conflict(_)),
+                    )
+                    .await?;
+                self.local.replace_atomic(path, versioned.data).await?;
+                // Remove rejected local bytes before recording remote as
+                // selected. A crash at this boundary safely re-downloads.
+                self.staging.write().await.commit_path(path).await?;
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(path) {
+                        entry.mark_synced(versioned.metadata.etag, versioned.metadata.modified);
+                    }
+                }
+                self.persist_state().await
+            }
+            ConflictStrategy::KeepBoth => {
+                let versioned = self
+                    .retry_executor
+                    .execute_with_condition(
+                        || self.remote.download_with_metadata(&remote_path),
+                        |error| matches!(error, Error::Conflict(_)),
+                    )
+                    .await?;
+                let renamed_remote = self
+                    .conflict_resolver
+                    .generate_conflict_path(&remote_path)?;
+                let renamed_local = self.path_mapper.remote_to_local(&renamed_remote)?;
+                let local_metadata = self
+                    .local
+                    .replace_atomic(&renamed_local, local_data.clone())
+                    .await?;
+                self.local.replace_atomic(path, versioned.data).await?;
+                self.staging
+                    .write()
+                    .await
+                    .retarget_path(path, &renamed_local)
+                    .await?;
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(path) {
+                        entry.mark_synced(
+                            versioned.metadata.etag.clone(),
+                            versioned.metadata.modified,
+                        );
+                    }
+                    state.insert(SyncEntry::new_local(
+                        renamed_local.to_string(),
+                        local_metadata.etag,
+                    ));
+                }
+                self.persist_state().await?;
 
-        match result {
-            ResolutionResult::UsedLocal { new_remote_etag } => {
-                if let Some(entry) = state.get_mut(path) {
-                    entry.mark_synced(new_remote_etag, chrono::Utc::now());
+                let renamed_metadata = self.remote.upload(&renamed_remote, local_data).await?;
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(&renamed_local) {
+                        entry.mark_synced(renamed_metadata.etag, renamed_metadata.modified);
+                    }
                 }
-            }
-            ResolutionResult::UsedRemote { new_local_etag } => {
-                if let Some(entry) = state.get_mut(path) {
-                    entry.mark_synced(new_local_etag, chrono::Utc::now());
-                }
-            }
-            ResolutionResult::KeptBoth {
-                original_path,
-                renamed_path,
-                remote_etag,
-            } => {
-                // Update original path to synced with remote
-                if let Some(entry) = state.get_mut(&original_path) {
-                    entry.mark_synced(remote_etag, chrono::Utc::now());
-                }
-                // Add entry for renamed file
-                let new_etag = Some(uuid::Uuid::new_v4().to_string());
-                state.insert(SyncEntry::new_synced(
-                    renamed_path.to_string(),
-                    new_etag,
-                    chrono::Utc::now(),
-                ));
-            }
-            ResolutionResult::Pending => {
-                // Nothing to do, conflict remains
+                self.persist_state().await?;
+                self.staging
+                    .write()
+                    .await
+                    .commit_path(&renamed_local)
+                    .await?;
+                Ok(())
             }
         }
-        drop(state);
-        self.persist_state().await?;
-
-        Ok(())
     }
 
     /// Get conflicts that need resolution.
@@ -830,6 +970,7 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         local_data: Vec<u8>,
         strategy: ConflictStrategy,
     ) -> Result<()> {
+        let _guard = self.sync_lock.lock().await;
         let entry = {
             let state = self.state.read().await;
             state.get(path).cloned()
@@ -843,17 +984,8 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             return Err(Error::InvalidInput("Path is not in conflict".to_string()));
         }
 
-        let remote_path = self.remote_path(path)?;
-        let remote_metadata = self.remote.metadata(&remote_path).await?;
-        let mut conflict_info = ConflictInfo::from_entry_and_remote(&entry, &remote_metadata)?;
-        conflict_info.path = remote_path;
-
-        let result = self
-            .conflict_resolver
-            .resolve(&conflict_info, local_data, self.remote.as_ref(), strategy)
-            .await?;
-
-        self.handle_resolution_result(path, result).await
+        self.apply_conflict_resolution(path, local_data, strategy)
+            .await
     }
 }
 

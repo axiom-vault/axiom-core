@@ -11,7 +11,7 @@ use crate::session::VaultSession;
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::RecoveryKey;
-use axiomvault_crypto::KdfParams;
+use axiomvault_crypto::{KdfParams, MasterKey};
 use axiomvault_storage::{create_default_registry, ProviderRegistry, StorageProvider};
 use zeroize::Zeroizing;
 
@@ -218,6 +218,26 @@ impl VaultManager {
         Ok(runtime_config)
     }
 
+    async fn load_bound_snapshot(
+        provider: &Arc<dyn StorageProvider>,
+        master_key: &MasterKey,
+        manifest_bytes: &[u8],
+    ) -> Result<(VaultConfig, Vec<u8>, VaultTree, GenerationManifest)> {
+        let manifest = GenerationManifest::open(master_key, manifest_bytes)?;
+        let (tree_path, config_path) = manifest.object_paths()?;
+        if !provider.exists(&tree_path).await? || !provider.exists(&config_path).await? {
+            return Err(Error::Crypto(
+                "snapshot manifest references a missing generation object".to_string(),
+            ));
+        }
+        let encrypted_tree = provider.download(&tree_path).await?;
+        let config_bytes = provider.download(&config_path).await?;
+        let config = VaultConfig::from_bytes(&config_bytes)?;
+        manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
+        let tree = VaultSession::decrypt_tree_bytes(master_key, &encrypted_tree)?;
+        Ok((config, config_bytes, tree, manifest))
+    }
+
     /// Create a new vault.
     ///
     /// # Returns
@@ -303,32 +323,43 @@ impl VaultManager {
         let provider = self.registry.resolve(provider_type, runtime_config)?;
 
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
-        if !provider.exists(&config_path).await? {
-            return Err(Error::NotFound("Vault configuration not found".to_string()));
-        }
-
-        let config_bytes = provider.download(&config_path).await?;
-        let mut config = VaultConfig::from_bytes(&config_bytes)?;
-        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-
-        let master_key = config
-            .verify_password(password)?
-            .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
-
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
-        let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
 
         if provider.exists(&manifest_path).await? {
-            let tree_path = VaultPath::parse(META_DIRNAME)?.join(crate::config::TREE_FILENAME)?;
-            if !provider.exists(&tree_path).await? {
+            let manifest_bytes = provider.download(&manifest_path).await?;
+            let credential_config_bytes =
+                match GenerationManifest::config_path_hint(&manifest_bytes)? {
+                    Some(path) => provider.download(&path).await?,
+                    None => {
+                        if !provider.exists(&config_path).await? {
+                            return Err(Error::NotFound(
+                                "Vault configuration not found".to_string(),
+                            ));
+                        }
+                        provider.download(&config_path).await?
+                    }
+                };
+            let credential_config = VaultConfig::from_bytes(&credential_config_bytes)?;
+            let master_key = credential_config
+                .verify_password(password)?
+                .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
+            let (snapshot_config, snapshot_config_bytes, tree, manifest) =
+                Self::load_bound_snapshot(&provider, &master_key, &manifest_bytes).await?;
+            let current_master_key =
+                snapshot_config.verify_password(password)?.ok_or_else(|| {
+                    Error::Conflict(
+                        "vault config does not match the current authenticated snapshot"
+                            .to_string(),
+                    )
+                })?;
+            if current_master_key.as_bytes() != master_key.as_bytes() {
                 return Err(Error::Crypto(
-                    "snapshot manifest exists but encrypted tree is missing".to_string(),
+                    "snapshot config unwraps a different master key".to_string(),
                 ));
             }
-            let encrypted_tree = provider.download(&tree_path).await?;
-            let manifest_bytes = provider.download(&manifest_path).await?;
-            let manifest = GenerationManifest::open(&master_key, &manifest_bytes)?;
-            manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
+            let config = snapshot_config;
+            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
+            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(format!(
@@ -347,7 +378,6 @@ impl VaultManager {
                     ));
                 }
             }
-            let tree = VaultSession::decrypt_tree_bytes(&master_key, &encrypted_tree)?;
             self.freshness_anchor.store_state(
                 &anchor_id,
                 FreshnessState {
@@ -355,6 +385,7 @@ impl VaultManager {
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
+            let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             return VaultSession::from_master_key_with_freshness(
                 config,
                 master_key,
@@ -365,6 +396,18 @@ impl VaultManager {
                 manifest.generation,
             );
         }
+
+        if !provider.exists(&config_path).await? {
+            return Err(Error::NotFound("Vault configuration not found".to_string()));
+        }
+        let config_bytes = provider.download(&config_path).await?;
+        let mut config = VaultConfig::from_bytes(&config_bytes)?;
+
+        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
+        let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
+        let master_key = config
+            .verify_password(password)?
+            .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
 
         if anchored_state.is_some() {
             return Err(Error::Conflict(
@@ -413,35 +456,52 @@ impl VaultManager {
         let provider = self.registry.resolve(provider_type, runtime_config)?;
 
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
-        if !provider.exists(&config_path).await? {
-            return Err(Error::NotFound("Vault configuration not found".to_string()));
-        }
-
-        let config_bytes = provider.download(&config_path).await?;
-        let mut config = VaultConfig::from_bytes(&config_bytes)?;
-        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-
         let recovery_key = RecoveryKey::from_mnemonic(recovery_words)?;
-
-        // Verify recovery key and get master key for tree decryption.
-        let master_key = config
-            .verify_recovery_key(&recovery_key)?
-            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
 
         // Verify the currently stored authenticated snapshot before mutating config.
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
-        let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
-        let (tree, generation) = if provider.exists(&manifest_path).await? {
-            let tree_path = VaultPath::parse(META_DIRNAME)?.join(crate::config::TREE_FILENAME)?;
-            if !provider.exists(&tree_path).await? {
+        let stored_manifest = if provider.exists(&manifest_path).await? {
+            Some(provider.download(&manifest_path).await?)
+        } else {
+            None
+        };
+        let credential_config_bytes = match stored_manifest.as_deref() {
+            Some(bytes) => match GenerationManifest::config_path_hint(bytes)? {
+                Some(path) => provider.download(&path).await?,
+                None => {
+                    if !provider.exists(&config_path).await? {
+                        return Err(Error::NotFound("Vault configuration not found".to_string()));
+                    }
+                    provider.download(&config_path).await?
+                }
+            },
+            None => {
+                if !provider.exists(&config_path).await? {
+                    return Err(Error::NotFound("Vault configuration not found".to_string()));
+                }
+                provider.download(&config_path).await?
+            }
+        };
+        let credential_config = VaultConfig::from_bytes(&credential_config_bytes)?;
+        let mut config = credential_config.clone();
+        let master_key = credential_config
+            .verify_recovery_key(&recovery_key)?
+            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
+
+        let (tree, generation) = if let Some(manifest_bytes) = stored_manifest {
+            let (snapshot_config, snapshot_config_bytes, tree, manifest) =
+                Self::load_bound_snapshot(&provider, &master_key, &manifest_bytes).await?;
+            let current_master_key = snapshot_config
+                .verify_recovery_key(&recovery_key)?
+                .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
+            if current_master_key.as_bytes() != master_key.as_bytes() {
                 return Err(Error::Crypto(
-                    "snapshot manifest exists but encrypted tree is missing".to_string(),
+                    "snapshot recovery config unwraps a different master key".to_string(),
                 ));
             }
-            let encrypted_tree = provider.download(&tree_path).await?;
-            let manifest_bytes = provider.download(&manifest_path).await?;
-            let manifest = GenerationManifest::open(&master_key, &manifest_bytes)?;
-            manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
+            config = snapshot_config;
+            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
+            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(
@@ -459,7 +519,6 @@ impl VaultManager {
                     ));
                 }
             }
-            let tree = VaultSession::decrypt_tree_bytes(&master_key, &encrypted_tree)?;
             self.freshness_anchor.store_state(
                 &anchor_id,
                 FreshnessState {
@@ -467,8 +526,11 @@ impl VaultManager {
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
+            let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             (tree, manifest.generation)
         } else {
+            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
+            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if anchored_state.is_some() {
                 return Err(Error::Conflict(
                     "snapshot manifest missing for a vault with trusted freshness state"
@@ -487,10 +549,7 @@ impl VaultManager {
             config.provider_config = persisted_provider_config(provider_type, &provider_config)?;
         }
 
-        // Persist config first; the following snapshot commit binds it to the tree.
-        let new_config_bytes = config.to_bytes()?;
-        provider.upload(&config_path, new_config_bytes).await?;
-
+        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
         let session = VaultSession::from_master_key_with_freshness(
             config,
             master_key,
@@ -500,10 +559,7 @@ impl VaultManager {
             anchor_id,
             generation,
         )?;
-        if let Err(error) = session.save_tree().await {
-            provider.upload(&config_path, config_bytes).await?;
-            return Err(error);
-        }
+        session.save_tree().await?;
         Ok(session)
     }
 
@@ -516,34 +572,17 @@ impl VaultManager {
         let runtime_config = self.runtime_provider_config(provider_type, &provider_config)?;
         let provider = self.registry.resolve(provider_type, runtime_config)?;
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
-        provider.exists(&config_path).await
+        if provider.exists(&config_path).await? {
+            return Ok(true);
+        }
+        let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
+        provider.exists(&manifest_path).await
     }
 
     /// Save vault configuration to storage.
-    pub async fn save_config(&self, session: &VaultSession) -> Result<()> {
-        let config_path = VaultPath::parse(CONFIG_FILENAME)?;
-        let config_bytes = session.config().to_bytes()?;
-        let previous_config = if session.provider().exists(&config_path).await? {
-            Some(session.provider().download(&config_path).await?)
-        } else {
-            None
-        };
-        session
-            .provider()
-            .upload(&config_path, config_bytes)
-            .await?;
-        // Config and tree are one authenticated snapshot generation. Re-sealing
-        // the tree binds this exact config and advances the trusted anchor.
-        if let Err(error) = session.save_tree().await {
-            match previous_config {
-                Some(bytes) => {
-                    session.provider().upload(&config_path, bytes).await?;
-                }
-                None if session.provider().exists(&config_path).await? => {
-                    session.provider().delete(&config_path).await?;
-                }
-                None => {}
-            }
+    pub async fn save_config(&self, session: &mut VaultSession) -> Result<()> {
+        if let Err(error) = session.save_tree_with_config().await {
+            session.restore_committed_config()?;
             return Err(error);
         }
         Ok(())
@@ -573,6 +612,8 @@ mod tests {
     struct ManifestFailProvider {
         inner: MemoryProvider,
         fail_next_manifest: AtomicBool,
+        pause_next_tree_after_commit: AtomicBool,
+        pause_next_canonical_tree_after_commit: AtomicBool,
     }
 
     impl ManifestFailProvider {
@@ -580,11 +621,23 @@ mod tests {
             Self {
                 inner: MemoryProvider::new(),
                 fail_next_manifest: AtomicBool::new(false),
+                pause_next_tree_after_commit: AtomicBool::new(false),
+                pause_next_canonical_tree_after_commit: AtomicBool::new(false),
             }
         }
 
         fn fail_next_manifest(&self) {
             self.fail_next_manifest.store(true, Ordering::SeqCst);
+        }
+
+        fn pause_next_tree_after_commit(&self) {
+            self.pause_next_tree_after_commit
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn pause_next_canonical_tree_after_commit(&self) {
+            self.pause_next_canonical_tree_after_commit
+                .store(true, Ordering::SeqCst);
         }
     }
 
@@ -598,7 +651,23 @@ mod tests {
             if path == &manifest_path() && self.fail_next_manifest.swap(false, Ordering::SeqCst) {
                 return Err(Error::Storage("injected manifest failure".to_string()));
             }
-            self.inner.upload(path, data).await
+            let metadata = self.inner.upload(path, data).await?;
+            let name = path.name().unwrap_or_default();
+            if (path == &tree_path() || name.starts_with("tree."))
+                && self
+                    .pause_next_tree_after_commit
+                    .swap(false, Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+            if path == &tree_path()
+                && self
+                    .pause_next_canonical_tree_after_commit
+                    .swap(false, Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(metadata)
         }
 
         async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
@@ -938,7 +1007,24 @@ mod tests {
         let old_ciphertext = provider.download(&object_path).await.unwrap();
 
         ops.update_file(&path, b"generation two").await.unwrap();
-        provider.upload(&object_path, old_ciphertext).await.unwrap();
+        let current_encrypted_name = creation
+            .session
+            .tree()
+            .read()
+            .await
+            .get_node(&path)
+            .unwrap()
+            .metadata
+            .encrypted_name
+            .clone();
+        let current_object_path = VaultPath::parse(DATA_DIRNAME)
+            .unwrap()
+            .join(&current_encrypted_name)
+            .unwrap();
+        provider
+            .upload(&current_object_path, old_ciphertext)
+            .await
+            .unwrap();
 
         assert!(ops.read_file(&path).await.is_err());
     }
@@ -964,7 +1050,7 @@ mod tests {
             .session
             .change_password(b"old-password", b"new-password")
             .unwrap();
-        manager.save_config(&creation.session).await.unwrap();
+        manager.save_config(&mut creation.session).await.unwrap();
         drop(creation);
 
         let reopened = manager
@@ -1045,7 +1131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_publication_failure_before_anchor_rolls_back_and_reopens() {
+    async fn transient_anchor_failure_is_retried_before_publication_returns() {
         use crate::operations::VaultOperations;
 
         let provider = Arc::new(MemoryProvider::new());
@@ -1064,9 +1150,9 @@ mod tests {
         let ops = VaultOperations::new(&creation.session).unwrap();
         anchor.fail_next_store();
         assert!(ops
-            .create_directory(&VaultPath::parse("/uncommitted").unwrap())
+            .create_directory(&VaultPath::parse("/committed").unwrap())
             .await
-            .is_err());
+            .is_ok());
         drop(creation);
 
         let reopened = manager
@@ -1074,18 +1160,18 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !VaultOperations::new(&reopened)
+            VaultOperations::new(&reopened)
                 .unwrap()
-                .exists(&VaultPath::parse("/uncommitted").unwrap())
+                .exists(&VaultPath::parse("/committed").unwrap())
                 .await
         );
     }
 
     #[tokio::test]
     async fn config_publication_failure_rolls_back_and_old_password_reopens() {
-        let provider = Arc::new(MemoryProvider::new());
-        let anchor = Arc::new(ToggleStoreFailureAnchor::new());
-        let manager = manager_with_storage(provider, anchor.clone());
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor);
         let mut creation = manager
             .create_vault(
                 VaultId::new("config-publication-rollback").unwrap(),
@@ -1100,9 +1186,188 @@ mod tests {
             .session
             .change_password(b"old-password", b"new-password")
             .unwrap();
-        anchor.fail_next_store();
-        assert!(manager.save_config(&creation.session).await.is_err());
+        provider.fail_next_manifest();
+        assert!(manager.save_config(&mut creation.session).await.is_err());
+        assert!(creation
+            .session
+            .config()
+            .verify_password(b"old-password")
+            .unwrap()
+            .is_some());
+        assert!(creation
+            .session
+            .config()
+            .verify_password(b"new-password")
+            .unwrap()
+            .is_none());
         drop(creation);
+
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"old-password")
+            .await
+            .is_ok());
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_tree_upload_keeps_previous_snapshot_openable() {
+        use crate::operations::VaultOperations;
+        use std::time::Duration;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor);
+        let creation = manager
+            .create_vault(
+                VaultId::new("cancelled-tree-publication").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+
+        provider.pause_next_tree_after_commit();
+        let path = VaultPath::parse("/uncommitted").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            VaultOperations::new(&creation.session)
+                .unwrap()
+                .create_directory(&path),
+        )
+        .await;
+        assert!(result.is_err(), "publication future must be cancelled");
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .expect("the previous committed snapshot must remain openable");
+        assert!(!VaultOperations::new(&reopened).unwrap().exists(&path).await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_manifest_commit_makes_live_session_stale() {
+        use crate::operations::VaultOperations;
+        use std::time::Duration;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor);
+        let creation = manager
+            .create_vault(
+                VaultId::new("cancelled-postcommit-publication").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let ops = VaultOperations::new(&creation.session).unwrap();
+        let committed = VaultPath::parse("/committed").unwrap();
+
+        provider.pause_next_canonical_tree_after_commit();
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), ops.create_directory(&committed)).await;
+        assert!(result.is_err(), "publication future must be cancelled");
+        assert!(!ops.exists(&committed).await);
+        let stale_error = ops
+            .create_directory(&VaultPath::parse("/must-reopen").unwrap())
+            .await
+            .expect_err("a post-commit cancelled session must not publish again");
+        assert!(stale_error.to_string().contains("advanced"));
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert!(
+            VaultOperations::new(&reopened)
+                .unwrap()
+                .exists(&committed)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_v1_password_upgrade_keeps_old_snapshot_openable() {
+        use std::time::Duration;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("cancelled-v1-password-upgrade").unwrap();
+        let creation = VaultConfig::new(
+            vault_id.clone(),
+            b"old-password",
+            "test",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let config_bytes = creation.config.to_bytes().unwrap();
+        let storage: Arc<dyn StorageProvider> = provider.clone();
+        manager
+            .initialize_vault_structure(&storage, &creation.config)
+            .await
+            .unwrap();
+        let legacy = VaultSession::from_master_key(
+            creation.config,
+            creation.master_key,
+            provider.clone(),
+            VaultTree::new(),
+        )
+        .unwrap();
+        legacy.save_tree().await.unwrap();
+        let encrypted_tree = provider.download(&tree_path()).await.unwrap();
+        let legacy_manifest = GenerationManifest::legacy_for_test(
+            vault_id.clone(),
+            1,
+            &encrypted_tree,
+            &config_bytes,
+            Default::default(),
+        );
+        let legacy_manifest_bytes = legacy_manifest.seal(legacy.master_key().unwrap()).unwrap();
+        provider
+            .upload(&manifest_path(), legacy_manifest_bytes.clone())
+            .await
+            .unwrap();
+        anchor
+            .store_state(
+                &test_anchor_id(&vault_id),
+                FreshnessState {
+                    generation: 1,
+                    manifest_digest: Some(digest(&legacy_manifest_bytes)),
+                },
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut session = manager
+            .open_vault("test", serde_json::Value::Null, b"old-password")
+            .await
+            .unwrap();
+        session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        provider.pause_next_tree_after_commit();
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), manager.save_config(&mut session))
+                .await;
+        assert!(result.is_err(), "v1 upgrade must be cancelled pre-commit");
+        let pending_error = crate::operations::VaultOperations::new(&session)
+            .unwrap()
+            .create_directory(&VaultPath::parse("/must-save-config-first").unwrap())
+            .await
+            .expect_err("pending config must not leak into a later tree mutation");
+        assert!(pending_error.to_string().contains("uncommitted changes"));
+        drop(session);
 
         assert!(manager
             .open_vault("test", serde_json::Value::Null, b"old-password")
@@ -1151,7 +1416,7 @@ mod tests {
         );
         assert_ne!(result_a.is_ok(), result_b.is_ok());
         let rejected = result_a.err().or_else(|| result_b.err()).unwrap();
-        assert!(rejected.to_string().contains("fork"));
+        assert!(rejected.to_string().contains("advanced"));
         drop(session_a);
         drop(session_b);
 
@@ -1195,7 +1460,7 @@ mod tests {
             .await
             .err()
             .expect("rollback must be rejected");
-        assert!(error.to_string().contains("rollback detected"));
+        assert!(matches!(error, Error::NotFound(_) | Error::Conflict(_)));
     }
 
     #[tokio::test]
@@ -1213,9 +1478,23 @@ mod tests {
             )
             .await
             .unwrap();
-        let old_tree = provider.download(&tree_path()).await.unwrap();
+        let first_manifest_bytes = provider.download(&manifest_path()).await.unwrap();
+        let first_manifest = GenerationManifest::open(
+            creation.session.master_key().unwrap(),
+            &first_manifest_bytes,
+        )
+        .unwrap();
+        let (first_tree_path, _) = first_manifest.object_paths().unwrap();
+        let old_tree = provider.download(&first_tree_path).await.unwrap();
         creation.session.save_tree().await.unwrap();
-        provider.upload(&tree_path(), old_tree).await.unwrap();
+        let current_manifest_bytes = provider.download(&manifest_path()).await.unwrap();
+        let current_manifest = GenerationManifest::open(
+            creation.session.master_key().unwrap(),
+            &current_manifest_bytes,
+        )
+        .unwrap();
+        let (current_tree_path, _) = current_manifest.object_paths().unwrap();
+        provider.upload(&current_tree_path, old_tree).await.unwrap();
 
         let error = manager
             .open_vault("test", serde_json::Value::Null, b"password")
@@ -1254,6 +1533,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unauthenticated_manifest_config_hint_cannot_escape_generation_namespace() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        manager
+            .create_vault(
+                VaultId::new("manifest-hint-tamper").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&provider.download(&manifest_path()).await.unwrap()).unwrap();
+        envelope["config_object"] = serde_json::Value::String("/vault.config".to_string());
+        provider
+            .upload(&manifest_path(), serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
+
+        let error = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("an out-of-namespace hint must fail closed");
+        assert!(error.to_string().contains("invalid config object hint"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_config_cannot_request_excessive_kdf_resources() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        manager
+            .create_vault(
+                VaultId::new("kdf-resource-limit").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let manifest_bytes = provider.download(&manifest_path()).await.unwrap();
+        let config_path = GenerationManifest::config_path_hint(&manifest_bytes)
+            .unwrap()
+            .unwrap();
+        let mut config =
+            VaultConfig::from_bytes(&provider.download(&config_path).await.unwrap()).unwrap();
+        config.kdf_params.memory_cost = 1_048_577;
+        provider
+            .upload(&config_path, config.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        let error = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("excessive KDF parameters must be rejected before derivation");
+        assert!(error.to_string().contains("unsafe KDF resource limits"));
+    }
+
+    #[tokio::test]
+    async fn v2_manifest_opens_without_canonical_config_cache() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        manager
+            .create_vault(
+                VaultId::new("missing-config-cache").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        provider
+            .delete(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+            .await
+            .unwrap();
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .expect("the authenticated v2 config object is authoritative");
+        assert!(reopened.is_active());
+    }
+
+    #[tokio::test]
     async fn pre_password_change_config_replay_is_rejected() {
         let provider = Arc::new(MemoryProvider::new());
         let manager =
@@ -1276,7 +1648,7 @@ mod tests {
             .session
             .change_password(b"old-password", b"new-password")
             .unwrap();
-        manager.save_config(&creation.session).await.unwrap();
+        manager.save_config(&mut creation.session).await.unwrap();
         provider
             .upload(&VaultPath::parse(CONFIG_FILENAME).unwrap(), old_config)
             .await
@@ -1287,7 +1659,11 @@ mod tests {
             .await
             .err()
             .expect("rollback must be rejected");
-        assert!(error.to_string().contains("config and snapshot manifest"));
+        assert!(matches!(error, Error::NotPermitted(_)));
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -125,6 +125,17 @@ impl LocalProvider {
         Ok(fs_path)
     }
 
+    /// Persist directory-entry changes before reporting a durable mutation.
+    async fn sync_parent(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent).await?.sync_all().await?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    }
+
     /// Create metadata from filesystem metadata.
     fn create_metadata(&self, path: &VaultPath, fs_meta: std::fs::Metadata) -> Metadata {
         let modified: DateTime<Utc> = fs_meta
@@ -232,6 +243,7 @@ impl StorageProvider for LocalProvider {
             return Err(e.into());
         }
 
+        Self::sync_parent(&fs_path).await?;
         let fs_meta = fs::metadata(&fs_path).await?;
         Ok(self.create_metadata(path, fs_meta))
     }
@@ -287,6 +299,7 @@ impl StorageProvider for LocalProvider {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(error.into());
         }
+        Self::sync_parent(&fs_path).await?;
         let fs_meta = fs::metadata(&fs_path).await?;
         Ok(self.create_metadata(path, fs_meta))
     }
@@ -340,6 +353,7 @@ impl StorageProvider for LocalProvider {
         }
 
         fs::remove_file(&fs_path).await?;
+        Self::sync_parent(&fs_path).await?;
         Ok(())
     }
 
@@ -420,6 +434,7 @@ impl StorageProvider for LocalProvider {
             fs::create_dir(&fs_path).await?;
         }
 
+        Self::sync_parent(&fs_path).await?;
         let fs_meta = fs::metadata(&fs_path).await?;
         Ok(self.create_metadata(path, fs_meta))
     }
@@ -442,6 +457,7 @@ impl StorageProvider for LocalProvider {
         }
 
         fs::remove_dir(&fs_path).await?;
+        Self::sync_parent(&fs_path).await?;
         Ok(())
     }
 
@@ -461,7 +477,9 @@ impl StorageProvider for LocalProvider {
         }
 
         fs::rename(&from_path, &to_path).await?;
+        Self::sync_parent(&from_path).await?;
 
+        Self::sync_parent(&to_path).await?;
         let fs_meta = fs::metadata(&to_path).await?;
         Ok(self.create_metadata(to, fs_meta))
     }
@@ -547,6 +565,7 @@ impl StorageProvider for LocalProvider {
             }
         }
 
+        Self::sync_parent(&to_path).await?;
         let fs_meta = fs::metadata(&to_path).await?;
         Ok(self.create_metadata(to, fs_meta))
     }

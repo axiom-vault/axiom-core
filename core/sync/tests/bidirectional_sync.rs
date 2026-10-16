@@ -281,7 +281,7 @@ async fn manual_conflict_resolution_uses_nonidentity_prefix_mapping() {
 }
 
 #[tokio::test]
-async fn failed_local_persistence_keeps_remote_change_pending_for_retry() {
+async fn fresh_local_provider_converges_nested_remote_directories() {
     let remote: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
     remote.create_dir(&path("/nested")).await.unwrap();
     remote
@@ -293,22 +293,9 @@ async fn failed_local_persistence_keeps_remote_change_pending_for_retry() {
     let state_dir = TempDir::new().unwrap();
     let engine = engine(remote, local.clone(), &state_dir).await;
 
-    let failed = engine.sync_full().await.unwrap();
-    assert_eq!(failed.files_failed, 1);
-    assert_eq!(
-        engine
-            .state()
-            .read()
-            .await
-            .get(&path("/nested/retry.bin"))
-            .unwrap()
-            .status,
-        SyncStatus::RemoteModified
-    );
-
-    local.create_dir(&path("/nested")).await.unwrap();
-    let retried = engine.sync_full().await.unwrap();
-    assert_eq!(retried.files_synced, 1);
+    let result = engine.sync_full().await.unwrap();
+    assert_eq!(result.files_failed, 0);
+    assert_eq!(result.files_synced, 1);
     assert_eq!(
         local.download(&path("/nested/retry.bin")).await.unwrap(),
         b"retry-me"

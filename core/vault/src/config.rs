@@ -522,7 +522,10 @@ impl VaultConfig {
 
     /// Deserialize configuration from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json).map_err(|e| Error::Serialization(e.to_string()))
+        let config: Self =
+            serde_json::from_str(json).map_err(|e| Error::Serialization(e.to_string()))?;
+        config.kdf_params.validate()?;
+        Ok(config)
     }
 
     /// Serialize to bytes for storage.
@@ -532,7 +535,10 @@ impl VaultConfig {
 
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))
+        let config: Self =
+            serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+        config.kdf_params.validate()?;
+        Ok(config)
     }
 }
 
@@ -551,6 +557,29 @@ pub const TREE_FILENAME: &str = "tree.json";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_config_rejects_unbounded_kdf_work_before_authentication() {
+        let config = VaultConfig::new(
+            VaultId::new("kdf-budget").unwrap(),
+            b"password",
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        for field in ["memory_cost", "time_cost", "parallelism"] {
+            let mut json = serde_json::to_value(&config).unwrap();
+            json["kdf_params"][field] = serde_json::json!(u32::MAX);
+            let bytes = serde_json::to_vec(&json).unwrap();
+            assert!(
+                VaultConfig::from_bytes(&bytes).is_err(),
+                "unbounded {field} accepted"
+            );
+            assert!(VaultConfig::from_json(std::str::from_utf8(&bytes).unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn test_vault_version_compatibility() {

@@ -298,7 +298,7 @@ impl AppService {
 
         // Persist the updated config.
         self.manager
-            .save_config(&active.session)
+            .save_config(session)
             .await
             .map_err(AppError::from)?;
 
@@ -579,14 +579,14 @@ impl AppService {
             .encrypted_name
             .clone();
         if let Some(ref index) = active.index {
-            index.upsert_entry(&IndexEntry {
+            let _ = index.upsert_entry(&IndexEntry {
                 path: vault_path.to_string(),
                 encrypted_name,
                 is_directory: false,
                 size: Some(i64::try_from(size).unwrap_or(i64::MAX)),
                 modified_at: now_timestamp(),
                 etag: None,
-            })?;
+            });
         }
         drop(guard);
         self.emit(AppEvent::FileCreated {
@@ -683,7 +683,13 @@ impl AppService {
         self.emit(AppEvent::SyncStarted);
         match engine.sync_full().await {
             Ok(result) => {
-                self.emit(AppEvent::SyncCompleted);
+                if result.files_failed == 0 {
+                    self.emit(AppEvent::SyncCompleted);
+                } else {
+                    self.emit(AppEvent::SyncFailed {
+                        error: format!("{} file(s) failed to synchronize", result.files_failed),
+                    });
+                }
                 Ok(result)
             }
             Err(error) => {
@@ -737,6 +743,23 @@ mod tests {
             .unwrap();
         service.set_local_index(index).await.unwrap();
         (service, dir)
+    }
+
+    #[tokio::test]
+    async fn import_reports_committed_file_when_optional_index_is_unavailable() {
+        let (service, directory) = service_with_corrupt_index().await;
+        let source = directory.path().join("source");
+        tokio::fs::write(&source, b"imported content")
+            .await
+            .unwrap();
+        service
+            .import_file(source.to_str().unwrap(), "/imported")
+            .await
+            .unwrap();
+        assert_eq!(
+            service.read_file("/imported").await.unwrap(),
+            b"imported content"
+        );
     }
 
     #[tokio::test]
