@@ -1,21 +1,83 @@
 //! Vault file operations with encryption/decryption.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use blake2::Digest;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::config::DATA_DIRNAME;
-use crate::manifest::{digest, digest_reader};
+use crate::manifest::{digest, finish_digest, DigestHasher};
 use crate::session::VaultSession;
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream};
 use axiomvault_storage::ByteStream;
 
 const STREAM_CONTENT_VERSION: u8 = 2;
+/// Ciphertext is handed to the provider in chunks of about this size.
+const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
+/// Chunks in flight between the blocking crypto task and the async provider.
+const UPLOAD_CHANNEL_CAPACITY: usize = 4;
+
+/// `Write` adapter that batches ciphertext into chunks for a provider upload
+/// stream while hashing everything it forwards.
+struct ChunkSender {
+    sender: tokio::sync::mpsc::Sender<Result<Vec<u8>>>,
+    buffer: Vec<u8>,
+    hasher: DigestHasher,
+}
+
+impl Write for ChunkSender {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() >= UPLOAD_CHUNK_SIZE {
+            self.flush()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.buffer);
+        self.hasher.update(&chunk);
+        self.sender.blocking_send(Ok(chunk)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "upload stopped consuming encrypted data",
+            )
+        })
+    }
+}
+
+/// `Read` adapter that serves downloaded ciphertext chunks to the decryptor.
+struct ChunkReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for ChunkReceiver {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset == self.pending.len() {
+            match self.receiver.blocking_recv() {
+                Some(chunk) => {
+                    self.pending = chunk;
+                    self.offset = 0;
+                }
+                None => return Ok(0),
+            }
+        }
+        let count = buffer.len().min(self.pending.len() - self.offset);
+        buffer[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
 
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
     let parent = destination
@@ -116,6 +178,9 @@ impl<'a> VaultOperations<'a> {
     }
 
     /// Import a local file through bounded-memory encryption and provider streaming.
+    ///
+    /// Ciphertext frames flow straight from the encryptor into the provider
+    /// upload; nothing is staged on disk or held in memory beyond a few chunks.
     pub async fn create_file_from_path(
         &self,
         path: &VaultPath,
@@ -135,37 +200,50 @@ impl<'a> VaultOperations<'a> {
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let encrypted_size = EncryptingStream::new(&key)?.encrypted_len(size);
 
-        let (encrypted_file, content_digest) =
-            tokio::task::spawn_blocking(move || -> Result<(tempfile::NamedTempFile, String)> {
-                let mut input = std::fs::File::open(source)?;
-                let mut output = tempfile::NamedTempFile::new()?;
-                EncryptingStream::new(&key)?.encrypt_stream(&mut input, output.as_file_mut())?;
-                output.as_file().sync_all()?;
-                let content_digest = digest_reader(std::fs::File::open(output.path())?)?;
-                Ok((output, content_digest))
-            })
-            .await
-            .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))??;
-
-        let encrypted_size = tokio::fs::metadata(encrypted_file.path()).await?.len();
-        let file = tokio::fs::File::open(encrypted_file.path()).await?;
-        let encrypted_stream: ByteStream = Box::pin(
-            tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)
-                .map(|item| item.map(|bytes| bytes.to_vec()).map_err(Error::from)),
-        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut output = ChunkSender {
+                sender,
+                buffer: Vec::new(),
+                hasher: DigestHasher::new(),
+            };
+            let result = std::fs::File::open(source)
+                .map_err(Error::from)
+                .and_then(|mut input| {
+                    EncryptingStream::new(&key)?.encrypt_stream(&mut input, &mut output)?;
+                    output.flush()?;
+                    Ok(finish_digest(std::mem::take(&mut output.hasher)))
+                });
+            if let Err(error) = &result {
+                // Abort the upload so the provider discards its partial object.
+                let _ = output
+                    .sender
+                    .blocking_send(Err(Error::Storage(error.to_string())));
+            }
+            result
+        });
+        let encrypted_stream: ByteStream =
+            Box::pin(futures::stream::poll_fn(move |cx| receiver.poll_recv(cx)));
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
         let mut tree = self.session.tree().write().await;
+        let upload_result = self
+            .session
+            .provider()
+            .upload_sized_stream(&storage_path, encrypted_stream, encrypted_size)
+            .await;
+        let encryption_result = encrypt_task
+            .await
+            .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
+        upload_result?;
+        let content_digest = encryption_result?;
+
         let mut candidate = tree.clone();
         candidate.create_file(path, &encrypted_name, size)?;
         let node = candidate.get_node_mut(path)?;
         node.metadata.content_version = STREAM_CONTENT_VERSION;
         node.metadata.content_digest = Some(content_digest);
-        self.session
-            .provider()
-            .upload_sized_stream(&storage_path, encrypted_stream, encrypted_size)
-            .await?;
-
         self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
         info!(size, "File imported");
@@ -174,7 +252,8 @@ impl<'a> VaultOperations<'a> {
 
     /// Export a vault file without materializing ciphertext or plaintext in memory.
     /// Plaintext is written to a temporary sibling and only published after every
-    /// frame, including the authenticated end frame, has verified successfully.
+    /// frame, including the authenticated end frame, has verified successfully and
+    /// the downloaded ciphertext matches the digest in the authenticated snapshot.
     pub async fn export_file_to_path(
         &self,
         path: &VaultPath,
@@ -211,34 +290,6 @@ impl<'a> VaultOperations<'a> {
                 content_version
             )));
         }
-        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut stream = self
-            .session
-            .provider()
-            .download_stream(&storage_path)
-            .await?;
-        let encrypted_file = tempfile::NamedTempFile::new()?;
-        let mut encrypted_output = tokio::fs::File::create(encrypted_file.path()).await?;
-        use tokio::io::AsyncWriteExt;
-        while let Some(chunk) = stream.next().await {
-            encrypted_output.write_all(&chunk?).await?;
-        }
-        encrypted_output.sync_all().await?;
-        drop(encrypted_output);
-        if let Some(expected) = expected_digest {
-            let encrypted_path = encrypted_file.path().to_path_buf();
-            let actual = tokio::task::spawn_blocking(move || -> Result<String> {
-                digest_reader(std::fs::File::open(encrypted_path)?)
-            })
-            .await
-            .map_err(|error| Error::Storage(format!("digest task failed: {error}")))??;
-            if actual != expected {
-                return Err(Error::Crypto(
-                    "encrypted file does not match the authenticated snapshot".to_string(),
-                ));
-            }
-        }
-
         let destination = destination.as_ref().to_path_buf();
         let parent = destination
             .parent()
@@ -249,34 +300,78 @@ impl<'a> VaultOperations<'a> {
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut input = std::fs::File::open(encrypted_file.path())?;
-                let mut output = tempfile::NamedTempFile::new_in(parent)?;
-                output
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                DecryptingStream::new(&key)?.decrypt_stream(&mut input, output.as_file_mut())?;
-                output.as_file().sync_all()?;
-                output
-                    .persist_noclobber(destination)
-                    .map_err(|error| Error::Io(error.error))?;
-                Ok(())
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+        let mut stream = self
+            .session
+            .provider()
+            .download_stream(&storage_path)
+            .await?;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let decrypt_task =
+            tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile> {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut input = ChunkReceiver {
+                        receiver,
+                        pending: Vec::new(),
+                        offset: 0,
+                    };
+                    let mut output = tempfile::NamedTempFile::new_in(parent)?;
+                    output
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    DecryptingStream::new(&key)?
+                        .decrypt_stream(&mut input, output.as_file_mut())?;
+                    output.as_file().sync_all()?;
+                    Ok(output)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (receiver, parent, key);
+                    Err(Error::NotPermitted(
+                        "secure plaintext-file ACL creation is not implemented on this platform"
+                            .to_string(),
+                    ))
+                }
+            });
+        let mut hasher = DigestHasher::new();
+        let mut download_result = Ok(());
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    // The decryptor stops consuming once it hits an invalid frame.
+                    if sender.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    download_result = Err(error);
+                    break;
+                }
             }
-            #[cfg(not(unix))]
-            {
-                let _ = (encrypted_file, parent, destination, key);
-                Err(Error::NotPermitted(
-                    "secure plaintext-file ACL creation is not implemented on this platform"
-                        .to_string(),
-                ))
-            }
+        }
+        drop(sender);
+        let decryption_result = decrypt_task
+            .await
+            .map_err(|error| Error::Storage(format!("decryption task failed: {}", error)))?;
+        download_result?;
+        let output = decryption_result?;
+        if expected_digest.is_some_and(|expected| expected != finish_digest(hasher)) {
+            return Err(Error::Crypto(
+                "encrypted file does not match the authenticated snapshot".to_string(),
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            output
+                .persist_noclobber(destination)
+                .map(|_| ())
+                .map_err(|error| Error::Io(error.error))
         })
         .await
-        .map_err(|error| Error::Storage(format!("decryption task failed: {}", error)))??;
-        Ok(())
+        .map_err(|error| Error::Storage(format!("plaintext write task failed: {error}")))?
     }
 
     /// Read and decrypt file content.
@@ -785,6 +880,25 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_create_with_unreadable_source_leaves_no_blob() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = VaultPath::parse("/missing.txt").unwrap();
+
+        assert!(ops
+            .create_file_from_path(&path, temp.path().join("missing.txt"))
+            .await
+            .is_err());
+        assert!(!ops.exists(&path).await);
+        assert!(provider
+            .list(&VaultPath::parse("/d").unwrap())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

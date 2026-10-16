@@ -57,6 +57,17 @@ impl<'a> EncryptingStream<'a> {
         self
     }
 
+    /// Exact ciphertext length `encrypt_stream` produces for `plaintext_len` input bytes.
+    ///
+    /// Lets callers announce the upload size before encrypting, so transports
+    /// that need the total length up front can stay bounded-memory.
+    pub fn encrypted_len(&self, plaintext_len: u64) -> u64 {
+        let frame_overhead =
+            (FRAME_LENGTH_SIZE + NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE) as u64;
+        let data_frames = plaintext_len.div_ceil(self.chunk_size as u64);
+        HEADER_SIZE as u64 + plaintext_len + (data_frames + 1) * frame_overhead
+    }
+
     /// Encrypt from `reader` to `writer` with bounded memory.
     ///
     /// Version 2 consists of a five-byte header followed by length-prefixed,
@@ -523,6 +534,27 @@ mod tests {
 
         let decrypted = decrypt_bytes(&key, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypted_len_matches_actual_output() {
+        let key = [42u8; KEY_LENGTH];
+        for (len, chunk_size) in [
+            (0, 16),
+            (1, 16),
+            (16, 16),
+            (17, 16),
+            (1000, DEFAULT_CHUNK_SIZE),
+        ] {
+            let stream = EncryptingStream::new(&key)
+                .unwrap()
+                .with_chunk_size(chunk_size);
+            let mut encrypted = Vec::new();
+            stream
+                .encrypt_stream(&vec![0u8; len][..], &mut encrypted)
+                .unwrap();
+            assert_eq!(stream.encrypted_len(len as u64), encrypted.len() as u64);
+        }
     }
 
     #[test]
