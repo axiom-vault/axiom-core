@@ -9,7 +9,7 @@
 //! Database files are created with restrictive permissions (0600) to limit
 //! access to the owning user.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -23,6 +23,70 @@ fn sqlite_err(e: rusqlite::Error) -> AppError {
 
 fn lock_err() -> AppError {
     AppError::Internal("Failed to acquire index lock".to_string())
+}
+
+#[cfg(unix)]
+fn index_io(error: std::io::Error) -> AppError {
+    AppError::Storage(format!("Failed to securely open index: {error}"))
+}
+
+#[cfg(unix)]
+fn secure_index_file(path: &Path) -> AppResult<(std::path::PathBuf, std::fs::File)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions or side effects.
+    let uid = unsafe { libc::geteuid() };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(index_io)?;
+    let metadata = std::fs::symlink_metadata(&parent).map_err(index_io)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err(AppError::Storage(
+            "Index parent must be owned by the current user and not writable by others".into(),
+        ));
+    }
+    for ancestor in parent.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(index_io)?;
+        // Root-owned sticky directories such as /tmp cannot rename a child
+        // owned by this user. Other writable ancestry is not a safe boundary.
+        let trusted_sticky = metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (metadata.mode() & 0o022 != 0 && !trusted_sticky)
+        {
+            return Err(AppError::Storage(
+                "Index parent has replaceable ancestry".into(),
+            ));
+        }
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| AppError::Storage("Index path has no filename".into()))?;
+    let path = parent.join(name);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(index_io)?;
+    let metadata = file.metadata().map_err(index_io)?;
+    if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+        return Err(AppError::Storage(
+            "Index must be an owned regular file without hard links".into(),
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(index_io)?;
+    if file.metadata().map_err(index_io)?.mode() & 0o777 != 0o600 {
+        return Err(AppError::Storage(
+            "Index permissions could not be secured".into(),
+        ));
+    }
+    Ok((path, file))
 }
 
 /// Represents a cached vault entry.
@@ -48,32 +112,42 @@ impl LocalIndex {
     /// to prevent other users from reading cached vault metadata.
     pub fn open(db_path: impl AsRef<Path>) -> AppResult<Self> {
         let db_path = db_path.as_ref();
-        let is_new = !db_path.exists() || db_path.to_str() == Some(":memory:");
 
-        // Pre-create the DB file with mode 0600 so SQLite opens an already-private
-        // file. Avoids the window where another local user could read cached
-        // vault metadata between SQLite's create and a later set_permissions call.
-        #[cfg(unix)]
-        if is_new && db_path.to_str() != Some(":memory:") {
-            use std::os::unix::fs::OpenOptionsExt;
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(db_path)
-            {
-                Ok(_) => {} // file now exists with 0600; SQLite will open it below
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // race: another process won
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to pre-create index db with restrictive perms: {}",
-                        e
-                    );
-                }
-            }
+        #[cfg(not(unix))]
+        if db_path.to_str() != Some(":memory:") {
+            return Err(AppError::Storage(
+                "secure local-index ACL creation is not implemented on this platform".to_string(),
+            ));
         }
 
-        let conn = Connection::open(db_path).map_err(sqlite_err)?;
+        // SQLite opens by path, so require a non-replaceable parent with a trusted
+        // ancestry. O_NOFOLLOW alone cannot prevent regular-file substitution.
+        #[cfg(unix)]
+        let secured = if db_path.to_str() == Some(":memory:") {
+            None
+        } else {
+            Some(secure_index_file(db_path)?)
+        };
+        #[cfg(unix)]
+        let db_path = secured.as_ref().map_or(db_path, |(path, _)| path.as_path());
+
+        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        if db_path.to_str() == Some(":memory:") {
+            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        // Never let SQLite recreate a missing disk file with default permissions.
+        let conn = Connection::open_with_flags(db_path, flags).map_err(sqlite_err)?;
+        #[cfg(unix)]
+        if let Some((path, file)) = &secured {
+            use std::os::unix::fs::MetadataExt;
+            let before = file.metadata().map_err(index_io)?;
+            let after = std::fs::symlink_metadata(path).map_err(index_io)?;
+            if !after.is_file() || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+                return Err(AppError::Storage(
+                    "Index file changed during SQLite open".into(),
+                ));
+            }
+        }
 
         conn.execute_batch(
             r#"
@@ -288,6 +362,67 @@ impl LocalIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_replaceable_parent_before_creating_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = dir.path().join("index.sqlite");
+        assert!(LocalIndex::open(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_hardlinked_database_without_changing_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, []).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("index.sqlite");
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(LocalIndex::open(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_repairs_unsafe_permissions_on_existing_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("index.sqlite");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _index = LocalIndex::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not modify").unwrap();
+        let path = dir.path().join("index.sqlite");
+        symlink(&victim, &path).unwrap();
+
+        assert!(LocalIndex::open(&path).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"do not modify");
+    }
 
     #[test]
     fn test_index_operations() {

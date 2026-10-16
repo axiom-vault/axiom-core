@@ -13,6 +13,41 @@ use axiomvault_crypto::recovery::{create_hardware_key_verification, derive_hardw
 use axiomvault_crypto::{KdfParams, MasterKey, Salt};
 use zeroize::Zeroizing;
 
+fn contains_oauth_credentials(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(entries) => entries.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace('-', "_");
+            matches!(
+                normalized.as_str(),
+                "tokens"
+                    | "auth_config"
+                    | "access_token"
+                    | "refresh_token"
+                    | "client_secret"
+                    | "authorization_code"
+                    | "code_verifier"
+            ) || contains_oauth_credentials(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_oauth_credentials),
+        _ => false,
+    }
+}
+
+fn serialize_provider_config<S>(
+    value: &serde_json::Value,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if contains_oauth_credentials(value) {
+        return Err(serde::ser::Error::custom(
+            "OAuth credentials are forbidden in serialized vault configuration",
+        ));
+    }
+    value.serialize(serializer)
+}
+
 /// Vault format version for migration support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VaultVersion {
@@ -127,6 +162,7 @@ pub struct VaultConfig {
     /// Storage provider type (e.g., "local", "gdrive").
     pub provider_type: String,
     /// Provider-specific configuration.
+    #[serde(serialize_with = "serialize_provider_config")]
     pub provider_config: serde_json::Value,
     /// Vault creation timestamp.
     pub created_at: DateTime<Utc>,
@@ -486,7 +522,10 @@ impl VaultConfig {
 
     /// Deserialize configuration from JSON.
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json).map_err(|e| Error::Serialization(e.to_string()))
+        let config: Self =
+            serde_json::from_str(json).map_err(|e| Error::Serialization(e.to_string()))?;
+        config.kdf_params.validate()?;
+        Ok(config)
     }
 
     /// Serialize to bytes for storage.
@@ -496,7 +535,10 @@ impl VaultConfig {
 
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))
+        let config: Self =
+            serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+        config.kdf_params.validate()?;
+        Ok(config)
     }
 }
 
@@ -515,6 +557,29 @@ pub const TREE_FILENAME: &str = "tree.json";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_config_rejects_unbounded_kdf_work_before_authentication() {
+        let config = VaultConfig::new(
+            VaultId::new("kdf-budget").unwrap(),
+            b"password",
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        for field in ["memory_cost", "time_cost", "parallelism"] {
+            let mut json = serde_json::to_value(&config).unwrap();
+            json["kdf_params"][field] = serde_json::json!(u32::MAX);
+            let bytes = serde_json::to_vec(&json).unwrap();
+            assert!(
+                VaultConfig::from_bytes(&bytes).is_err(),
+                "unbounded {field} accepted"
+            );
+            assert!(VaultConfig::from_json(std::str::from_utf8(&bytes).unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn test_vault_version_compatibility() {
@@ -604,6 +669,31 @@ mod tests {
         let mk_from_recovery = config.verify_recovery_key(&rk).unwrap().unwrap();
 
         assert_eq!(mk_from_password.as_bytes(), mk_from_recovery.as_bytes());
+    }
+
+    #[test]
+    fn oauth_credentials_cannot_be_serialized_in_vault_config() {
+        let mut config = VaultConfig::new(
+            VaultId::new("cloud-secrets").unwrap(),
+            b"password",
+            "gdrive",
+            serde_json::json!({
+                "credential_schema": 1,
+                "credential_ref": "local:gdrive:test",
+                "folder_id": "folder"
+            }),
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        config.provider_config["tokens"] = serde_json::json!({
+            "access_token": "must-never-serialize",
+            "refresh_token": "must-never-serialize",
+            "expires_at": "2099-01-01T00:00:00Z"
+        });
+
+        let error = serde_json::to_string(&config).unwrap_err();
+        assert!(error.to_string().contains("OAuth credentials"));
     }
 
     #[test]

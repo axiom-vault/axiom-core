@@ -3,11 +3,13 @@
 //! Sessions hold decrypted keys in memory and provide access to vault operations.
 //! Keys are automatically zeroized when the session is dropped.
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::config::{VaultConfig, META_DIRNAME, TREE_FILENAME};
+use crate::config::{VaultConfig, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
+use crate::freshness::{publication_lock, FreshnessAnchor, FreshnessState as AnchorFreshnessState};
+use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::RecoveryKey;
@@ -57,6 +59,7 @@ pub struct VaultSession {
     handle: SessionHandle,
     /// Vault configuration.
     config: VaultConfig,
+    committed_config: StdMutex<VaultConfig>,
     /// Master key (zeroized on drop).
     master_key: Option<MasterKey>,
     /// Storage provider.
@@ -65,6 +68,14 @@ pub struct VaultSession {
     tree: Arc<RwLock<VaultTree>>,
     /// Session state.
     state: SessionState,
+    /// Monotonic snapshot state for manager-created sessions.
+    freshness: Option<FreshnessState>,
+}
+
+struct FreshnessState {
+    anchor: Arc<dyn FreshnessAnchor>,
+    anchor_id: VaultId,
+    generation: Mutex<u64>,
 }
 
 impl VaultSession {
@@ -82,6 +93,38 @@ impl VaultSession {
         provider: Arc<dyn StorageProvider>,
         tree: VaultTree,
     ) -> Result<Self> {
+        Self::from_master_key_internal(config, master_key, provider, tree, None)
+    }
+
+    pub(crate) fn from_master_key_with_freshness(
+        config: VaultConfig,
+        master_key: MasterKey,
+        provider: Arc<dyn StorageProvider>,
+        tree: VaultTree,
+        anchor: Arc<dyn FreshnessAnchor>,
+        anchor_id: VaultId,
+        generation: u64,
+    ) -> Result<Self> {
+        Self::from_master_key_internal(
+            config,
+            master_key,
+            provider,
+            tree,
+            Some(FreshnessState {
+                anchor,
+                anchor_id,
+                generation: Mutex::new(generation),
+            }),
+        )
+    }
+
+    fn from_master_key_internal(
+        config: VaultConfig,
+        master_key: MasterKey,
+        provider: Arc<dyn StorageProvider>,
+        tree: VaultTree,
+        freshness: Option<FreshnessState>,
+    ) -> Result<Self> {
         if !config.version.is_compatible() {
             return Err(Error::Vault(format!(
                 "Incompatible vault version: {:?}",
@@ -91,11 +134,13 @@ impl VaultSession {
 
         Ok(Self {
             handle: SessionHandle::new(),
+            committed_config: StdMutex::new(config.clone()),
             config,
             master_key: Some(master_key),
             provider,
             tree: Arc::new(RwLock::new(tree)),
             state: SessionState::Active,
+            freshness,
         })
     }
 
@@ -129,8 +174,15 @@ impl VaultSession {
 
         let encrypted_bytes = provider.download(&tree_path).await?;
 
+        Self::decrypt_tree_bytes(master_key, &encrypted_bytes)
+    }
+
+    pub(crate) fn decrypt_tree_bytes(
+        master_key: &MasterKey,
+        encrypted_bytes: &[u8],
+    ) -> Result<VaultTree> {
         let tree_key = master_key.derive_file_key(TREE_KEY_CONTEXT);
-        let tree_bytes = decrypt(tree_key.as_bytes(), &encrypted_bytes).map_err(|e| {
+        let tree_bytes = decrypt(tree_key.as_bytes(), encrypted_bytes).map_err(|e| {
             Error::Crypto(format!(
                 "Failed to decrypt tree index (wrong password or corrupted vault): {}",
                 e
@@ -172,6 +224,15 @@ impl VaultSession {
     /// Get mutable reference to the vault configuration.
     pub fn config_mut(&mut self) -> &mut VaultConfig {
         &mut self.config
+    }
+
+    pub(crate) fn restore_committed_config(&mut self) -> Result<()> {
+        self.config = self
+            .committed_config
+            .lock()
+            .map_err(|_| Error::Vault("committed config lock poisoned".to_string()))?
+            .clone();
+        Ok(())
     }
 
     /// Get the storage provider.
@@ -305,9 +366,40 @@ impl VaultSession {
         Ok(())
     }
 
-    /// Save the current tree state to storage (encrypted).
-    pub async fn save_tree(&self) -> Result<()> {
-        let tree = self.tree.read().await;
+    /// Persist a supplied tree snapshot to storage (encrypted).
+    ///
+    /// Callers can build and validate a candidate tree without exposing it
+    /// in-memory, then publish it only after this write succeeds.
+    pub(crate) async fn save_tree_snapshot(&self, tree: &VaultTree) -> Result<()> {
+        self.save_tree_snapshot_internal(tree, false).await
+    }
+
+    async fn save_tree_snapshot_internal(
+        &self,
+        tree: &VaultTree,
+        allow_config_change: bool,
+    ) -> Result<()> {
+        if !allow_config_change {
+            let committed = self
+                .committed_config
+                .lock()
+                .map_err(|_| Error::Vault("committed config lock poisoned".to_string()))?;
+            if committed.to_bytes()? != self.config.to_bytes()? {
+                return Err(Error::Conflict(
+                    "vault config has uncommitted changes; save or reopen before mutating"
+                        .to_string(),
+                ));
+            }
+        }
+        let publication = self
+            .freshness
+            .as_ref()
+            .map(|freshness| publication_lock(&freshness.anchor_id))
+            .transpose()?;
+        let _publication_guard = match &publication {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let tree_json = tree.to_json()?;
 
         let tree_key = self.master_key()?.derive_file_key(TREE_KEY_CONTEXT);
@@ -315,8 +407,140 @@ impl VaultSession {
             .map_err(|e| Error::Crypto(format!("Failed to encrypt tree index: {}", e)))?;
 
         let tree_path = VaultPath::parse(META_DIRNAME)?.join(TREE_FILENAME)?;
-        self.provider.upload(&tree_path, encrypted).await?;
+        if self.freshness.is_none() {
+            self.provider.upload(&tree_path, encrypted).await?;
+            return Ok(());
+        }
+
+        let freshness = self.freshness.as_ref().expect("freshness checked above");
+        let mut generation = freshness.generation.lock().await;
+        let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
+        let previous_manifest = if self.provider.exists(&manifest_path).await? {
+            Some(self.provider.download(&manifest_path).await?)
+        } else {
+            None
+        };
+
+        let anchored = freshness.anchor.load_state(&freshness.anchor_id)?;
+        match (&anchored, &previous_manifest) {
+            (None, None) if *generation == 0 => {}
+            (Some(state), Some(bytes))
+                if state.generation == *generation
+                    && state
+                        .manifest_digest
+                        .as_ref()
+                        .is_none_or(|expected| expected == &digest(bytes)) =>
+            {
+                let stored = GenerationManifest::open(self.master_key()?, bytes)?;
+                if stored.generation != *generation {
+                    return Err(Error::Conflict(
+                        "stored snapshot advanced; reopen the vault before mutating it".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Conflict(
+                    "trusted snapshot advanced; reopen the vault before mutating it".to_string(),
+                ));
+            }
+        }
+
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Vault("snapshot generation counter exhausted".to_string()))?;
+        let config_bytes = self.config.to_bytes()?;
+        let manifest = GenerationManifest::new(
+            self.config.id.clone(),
+            next_generation,
+            &encrypted,
+            &config_bytes,
+            tree.object_digests(),
+        );
+        let (generation_tree_path, generation_config_path) = manifest.object_paths()?;
+        let manifest_bytes = manifest.seal(self.master_key()?)?;
+        let manifest_digest = digest(&manifest_bytes);
+        let config_path = VaultPath::parse(CONFIG_FILENAME)?;
+
+        self.provider
+            .upload(&generation_config_path, config_bytes.clone())
+            .await?;
+        self.provider
+            .upload(&generation_tree_path, encrypted.clone())
+            .await?;
+
+        if let Err(error) = self
+            .provider
+            .upload(&manifest_path, manifest_bytes.clone())
+            .await
+        {
+            let visible = self
+                .provider
+                .download(&manifest_path)
+                .await
+                .is_ok_and(|bytes| bytes == manifest_bytes);
+            if !visible {
+                return Err(error);
+            }
+            self.provider
+                .upload(&manifest_path, manifest_bytes.clone())
+                .await
+                .map_err(|retry| {
+                    Error::Storage(format!(
+                        "manifest upload failed ({error}); durability retry failed ({retry})"
+                    ))
+                })?;
+        }
+
+        let next_state = AnchorFreshnessState {
+            generation: next_generation,
+            manifest_digest: Some(manifest_digest),
+        };
+        if let Err(error) = freshness
+            .anchor
+            .store_state(&freshness.anchor_id, next_state.clone())
+        {
+            freshness
+                .anchor
+                .store_state(&freshness.anchor_id, next_state)
+                .map_err(|retry| {
+                    Error::Storage(format!(
+                        "freshness anchor update failed ({error}); durability retry failed ({retry})"
+                    ))
+                })?;
+        }
+        // Compatibility caches for health tooling and pre-manifest readers. They
+        // are deliberately written after the manifest commit and never authoritative.
+        let _ = self.provider.upload(&config_path, config_bytes).await;
+        let _ = self.provider.upload(&tree_path, encrypted).await;
+        if let Some(previous_bytes) = previous_manifest {
+            if let Ok(previous) = GenerationManifest::open(self.master_key()?, &previous_bytes) {
+                if previous.version == 2 {
+                    if let Ok((_, previous_config_path)) = previous.object_paths() {
+                        if previous_config_path != generation_config_path {
+                            let _ = self.provider.delete(&previous_config_path).await;
+                        }
+                    }
+                }
+            }
+        }
+        *self
+            .committed_config
+            .lock()
+            .map_err(|_| Error::Vault("committed config lock poisoned".to_string()))? =
+            self.config.clone();
+        *generation = next_generation;
         Ok(())
+    }
+
+    /// Save the current tree state to storage (encrypted).
+    pub async fn save_tree(&self) -> Result<()> {
+        let tree = self.tree.read().await;
+        self.save_tree_snapshot(&tree).await
+    }
+
+    pub(crate) async fn save_tree_with_config(&self) -> Result<()> {
+        let tree = self.tree.read().await;
+        self.save_tree_snapshot_internal(&tree, true).await
     }
 }
 
