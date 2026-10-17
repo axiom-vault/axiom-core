@@ -16,7 +16,7 @@ use tracing::warn;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::provider::Metadata;
-use crate::shard_map::{shard_backend_path, ChunkEntry, ShardMap};
+use crate::shard_map::{mirror_staging_path, shard_backend_path, ChunkEntry, ShardMap};
 use axiomvault_common::{Error, Result, VaultPath};
 
 use super::auth::{DOMAIN_SHARD, TAG_LEN};
@@ -230,28 +230,41 @@ impl CompositeStorageProvider {
         ))
     }
 
-    /// Best-effort removal of the shards of `superseded`, an entry the
-    /// committed map no longer points to. Only call this after the map commit
-    /// succeeded. A failed delete leaves an unreferenced file and nothing else.
+    /// Best-effort removal of the shards (or mirror staging copies) of
+    /// `superseded`, an entry the committed map no longer points to. Only call
+    /// this after the map commit succeeded. A failed delete leaves an
+    /// unreferenced file and nothing else.
     pub(crate) async fn delete_superseded(
         &self,
         path_str: &str,
         superseded: Option<ChunkEntry>,
         current: &[u8; 16],
     ) {
-        let Some(old) = superseded else { return };
-        if old.erasure_params.is_none() || &old.object_id == current {
-            return;
+        if let Some(old) = superseded.filter(|old| &old.object_id != current) {
+            self.delete_generation(path_str, &old).await;
         }
+    }
+
+    /// Best-effort removal of the files only `entry`'s write uses: its
+    /// erasure shards, or its mirror staging copies. `NotFound` is expected
+    /// (a copy already renamed into place, a shard never written).
+    pub(crate) async fn delete_generation(&self, path_str: &str, entry: &ChunkEntry) {
         let futures = self.backends.iter().enumerate().map(|(i, backend)| {
-            let shard = shard_backend_path(path_str, &old.object_id, i);
+            let file = if entry.erasure_params.is_some() {
+                shard_backend_path(path_str, &entry.object_id, i)
+            } else {
+                mirror_staging_path(path_str, &entry.object_id)
+            };
             async move {
-                let result = match VaultPath::parse(&shard) {
+                let result = match VaultPath::parse(&file) {
                     Ok(p) => backend.delete(&p).await,
                     Err(e) => Err(e),
                 };
-                if let Err(e) = result {
-                    warn!(shard = i, path = shard, error = %e, "Superseded shard not deleted; left unreferenced");
+                match result {
+                    Ok(()) | Err(Error::NotFound(_)) => {}
+                    Err(e) => {
+                        warn!(backend = i, path = file, error = %e, "Superseded file not deleted; left unreferenced")
+                    }
                 }
             }
         });

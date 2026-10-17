@@ -26,7 +26,7 @@ use tracing::warn;
 
 use crate::health::ProviderHealth;
 use crate::provider::{ByteStream, Metadata, StorageProvider};
-use crate::shard_map::{ChunkEntry, ShardMap};
+use crate::shard_map::{mirror_staging_path, ChunkEntry, ShardMap};
 use auth::{DOMAIN_MIRROR, TAG_LEN};
 use axiomvault_common::{Error, Result, VaultPath};
 
@@ -196,6 +196,64 @@ impl CompositeStorageProvider {
                 .verify(DOMAIN_MIRROR, &[&entry.object_id, &size, data], &tag)
     }
 
+    /// Where the staged copy of `entry`'s write of `path` lives.
+    pub(crate) fn mirror_staging(path: &VaultPath, entry: &ChunkEntry) -> Result<VaultPath> {
+        VaultPath::parse(&mirror_staging_path(
+            &path.to_string_path(),
+            &entry.object_id,
+        ))
+    }
+
+    /// Read the verified copy of `entry` from one backend: the copy at
+    /// `path`, else the staged copy (its write was committed but not yet
+    /// renamed into place on this backend).
+    pub(crate) async fn read_mirror_copy(
+        &self,
+        backend: &dyn StorageProvider,
+        path: &VaultPath,
+        entry: &ChunkEntry,
+    ) -> Result<Vec<u8>> {
+        let staged = Self::mirror_staging(path, entry)?;
+        let mut first_error = None;
+        let mut forged = false;
+        for candidate in [path, &staged] {
+            match backend.download(candidate).await {
+                Ok(data) if self.verify_mirror_copy(entry, &data) => return Ok(data),
+                Ok(_) => forged = true,
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) if !forged => Err(e),
+            _ => Err(Error::Crypto(format!(
+                "mirror copy of {} failed authentication; treating it as missing",
+                path
+            ))),
+        }
+    }
+
+    /// Rename the staged copy over `path` on each backend in `indices`.
+    /// Best effort: where it fails, reads keep using the staged copy.
+    async fn promote_mirror_copies(&self, path: &VaultPath, staged: &VaultPath, indices: &[usize]) {
+        let futures = indices.iter().map(|&i| {
+            let backend = Arc::clone(&self.backends[i]);
+            async move {
+                if backend.rename(staged, path).await.is_ok() {
+                    return;
+                }
+                // Destination present: replace it. A crash between the two
+                // calls leaves the staged copy, which reads fall back to.
+                let _ = backend.delete(path).await;
+                if let Err(e) = backend.rename(staged, path).await {
+                    warn!(backend = i, path = %path, error = %e, "Staged mirror copy not renamed into place; reads use it where it is");
+                }
+            }
+        });
+        futures::future::join_all(futures).await;
+    }
+
     /// Get a clone of the current shard map (for inspection/testing).
     pub async fn get_shard_map(&self) -> ShardMap {
         self.shard_map.read().await.clone()
@@ -232,6 +290,13 @@ impl CompositeStorageProvider {
     }
 }
 
+/// The logical name a mirror staging file `name.<32 hex>.staged` stands for.
+fn staged_logical_name(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".staged")?;
+    let (logical, id) = stem.rsplit_once('.')?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(logical)
+}
+
 /// Check whether a name matches the internal `.shardN` pattern.
 fn is_shard_file(name: &str) -> bool {
     if let Some(pos) = name.rfind(".shard") {
@@ -256,17 +321,24 @@ impl StorageProvider for CompositeStorageProvider {
                 let object_id = uuid::Uuid::new_v4().into_bytes();
                 let mirror_tag = self.mirror_tag(&object_id, &data);
                 let path = path.clone();
+                let path_str = path.to_string_path();
+                // Stage first: the committed copy at `path` is not touched
+                // until the map naming this write is committed.
+                let staged = VaultPath::parse(&mirror_staging_path(&path_str, &object_id))?;
                 let data: Bytes = data.into();
                 let (meta, succeeded) = self
                     .fan_out("upload", |backend| {
-                        let path = path.clone();
+                        let staged = staged.clone();
                         let data = data.clone();
-                        async move { backend.upload(&path, data.to_vec()).await }
+                        async move { backend.upload(&staged, data.to_vec()).await }
                     })
                     .await?;
+                let meta = Metadata {
+                    name: path.name().unwrap_or("/").to_string(),
+                    ..meta
+                };
 
                 // Record mirror entry with only the backends that succeeded
-                let path_str = path.to_string_path();
                 let entry = ShardMap::mirror_entry(
                     &path_str,
                     original_size,
@@ -275,11 +347,17 @@ impl StorageProvider for CompositeStorageProvider {
                     &self.backends,
                     Some(&succeeded),
                 );
-                {
+                let superseded = {
                     let mut map = self.shard_map.write().await;
+                    let old = map.get(&path_str).cloned();
                     map.insert(&path_str, entry);
-                }
+                    old
+                };
                 self.save_shard_map().await?;
+                // Committed: replace the previous copy and drop its staging.
+                self.promote_mirror_copies(&path, &staged, &succeeded).await;
+                self.delete_superseded(&path_str, superseded, &object_id)
+                    .await;
 
                 Ok(meta)
             }
@@ -301,21 +379,9 @@ impl StorageProvider for CompositeStorageProvider {
         match self.config.mode {
             RaidMode::Mirror => {
                 let entry = self.entry_for(path).await?;
-                let path = path.clone();
-                self.try_first("download", |backend| {
-                    let path = path.clone();
-                    let entry = &entry;
-                    async move {
-                        let data = backend.download(&path).await?;
-                        if self.verify_mirror_copy(entry, &data) {
-                            Ok(data)
-                        } else {
-                            Err(Error::Crypto(format!(
-                                "mirror copy of {} failed authentication; treating it as missing",
-                                path
-                            )))
-                        }
-                    }
+                let (path, entry) = (&path, &entry);
+                self.try_first("download", |backend| async move {
+                    self.read_mirror_copy(backend.as_ref(), path, entry).await
                 })
                 .await
             }
@@ -330,17 +396,9 @@ impl StorageProvider for CompositeStorageProvider {
 
     async fn exists(&self, path: &VaultPath) -> Result<bool> {
         match self.config.mode {
-            RaidMode::Mirror => {
-                let path = path.clone();
-                self.try_first("exists", |backend| {
-                    let path = path.clone();
-                    async move { backend.exists(&path).await }
-                })
-                .await
-            }
-            // Shard paths carry the write's object_id, so the authenticated
-            // map is what says whether the object exists.
-            RaidMode::Erasure { .. } => match self.entry_for(path).await {
+            // Shard and staged paths carry the write's object_id, so the
+            // authenticated map is what says whether the object exists.
+            RaidMode::Mirror | RaidMode::Erasure { .. } => match self.entry_for(path).await {
                 Ok(_) => Ok(true),
                 Err(Error::NotFound(_)) => Ok(false),
                 Err(e) => Err(e),
@@ -360,10 +418,11 @@ impl StorageProvider for CompositeStorageProvider {
                 .await?;
 
                 // Remove from shard map
-                {
-                    self.shard_map.write().await.remove(&path.to_string_path());
-                }
+                let removed = self.shard_map.write().await.remove(&path.to_string_path());
                 self.save_shard_map().await?;
+                if let Some(entry) = removed {
+                    self.delete_generation(&path.to_string_path(), &entry).await;
+                }
 
                 Ok(())
             }
@@ -394,7 +453,13 @@ impl StorageProvider for CompositeStorageProvider {
             match result {
                 Ok(entries) => {
                     any_success = true;
-                    for entry in entries {
+                    for mut entry in entries {
+                        // A staged mirror copy lists under its logical name.
+                        if self.config.mode == RaidMode::Mirror {
+                            if let Some(logical) = staged_logical_name(&entry.name) {
+                                entry.name = logical.to_string();
+                            }
+                        }
                         merged
                             .entry(entry.name.clone())
                             .and_modify(|existing| {
@@ -434,12 +499,22 @@ impl StorageProvider for CompositeStorageProvider {
     async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
         match self.config.mode {
             RaidMode::Mirror => {
-                let path = path.clone();
-                self.try_first("metadata", |backend| {
-                    let path = path.clone();
-                    async move { backend.metadata(&path).await }
+                let entry = self.entry_for(path).await?;
+                let staged = Self::mirror_staging(path, &entry)?;
+                let (path, staged) = (&path, &staged);
+                let meta = self
+                    .try_first("metadata", |backend| async move {
+                        match backend.metadata(path).await {
+                            Err(Error::NotFound(_)) => backend.metadata(staged).await,
+                            other => other,
+                        }
+                    })
+                    .await?;
+                Ok(Metadata {
+                    name: path.name().unwrap_or("/").to_string(),
+                    size: Some(entry.original_size),
+                    ..meta
                 })
-                .await
             }
             RaidMode::Erasure { .. } => {
                 let entry = self.entry_for(path).await?;

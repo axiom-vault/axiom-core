@@ -341,8 +341,13 @@ impl<'a> RaidRebuilder<'a> {
                                 continue;
                             }
                             let src = shard.shard_index;
-                            if src < backends.len()
-                                && backends[src].exists(&vault_path).await.unwrap_or(false)
+                            if src >= backends.len() {
+                                continue;
+                            }
+                            let staged =
+                                CompositeStorageProvider::mirror_staging(&vault_path, entry)?;
+                            if backends[src].exists(&vault_path).await.unwrap_or(false)
+                                || backends[src].exists(&staged).await.unwrap_or(false)
                             {
                                 candidates.push(src);
                             }
@@ -514,20 +519,20 @@ impl<'a> RaidRebuilder<'a> {
         let vault_path = VaultPath::parse(path)?;
         let mut last_err = None;
         for &src in source_indexes {
-            match backends[src].download(&vault_path).await {
-                Ok(data) if composite.verify_mirror_copy(entry, &data) => {
+            match composite
+                .read_mirror_copy(backends[src].as_ref(), &vault_path, entry)
+                .await
+            {
+                Ok(data) => {
                     backends[target_index].upload(&vault_path, data).await?;
                     return Ok(());
                 }
-                Ok(_) => {
+                Err(e @ Error::Crypto(_)) => {
                     warn!(
                         source = src,
                         path, "Mirror rebuild: source copy failed authentication, skipping it"
                     );
-                    last_err = Some(Error::Crypto(format!(
-                        "Mirror rebuild: copy of '{}' on backend {} failed authentication",
-                        path, src
-                    )));
+                    last_err = Some(e);
                 }
                 Err(e) => {
                     warn!(source = src, path, error = %e, "Mirror rebuild: download failed, trying next candidate");

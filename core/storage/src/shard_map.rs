@@ -112,6 +112,18 @@ pub(crate) fn shard_backend_path(path: &str, object_id: &[u8; 16], index: usize)
     )
 }
 
+/// Backend path a mirror copy of the write `object_id` of `path` is first
+/// written to. It is renamed over `path` only once the map naming
+/// `object_id` is committed, so the committed copy at `path` survives a crash
+/// before the commit; reads fall back to it when the rename did not happen.
+pub(crate) fn mirror_staging_path(path: &str, object_id: &[u8; 16]) -> String {
+    format!(
+        "{}.{}.staged",
+        path,
+        uuid::Uuid::from_bytes(*object_id).simple()
+    )
+}
+
 impl ShardMap {
     /// Create a new, empty shard map.
     pub fn new() -> Self {

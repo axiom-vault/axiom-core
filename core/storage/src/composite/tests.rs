@@ -1714,3 +1714,34 @@ async fn test_m16_superseded_shards_deleted_after_commit_and_failed_delete_is_ha
     let restarted = new_composite(backends, erasure_config(3, 2)).unwrap();
     assert_eq!(restarted.download(&path).await.unwrap(), vec![3u8; 90]);
 }
+
+fn set_map_writes_fail(backends: &[Arc<CrashableProvider>], fail: bool) {
+    for b in backends {
+        b.fail_map_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Mirror mode: an overwrite whose copies are written but whose map commit
+/// never happens must leave the committed copy readable after a restart.
+#[tokio::test]
+async fn test_m16_mirror_crash_before_map_commit_keeps_old_content() {
+    let (raw, backends) = crashable_backends(3);
+    let provider = new_composite(backends.clone(), mirror_config()).unwrap();
+    let path = VaultPath::parse("/m.bin").unwrap();
+    provider
+        .upload(&path, b"version one".to_vec())
+        .await
+        .unwrap();
+
+    set_map_writes_fail(&raw, true);
+    assert!(provider
+        .upload(&path, b"version two".to_vec())
+        .await
+        .is_err());
+    drop(provider);
+
+    set_map_writes_fail(&raw, false);
+    let restarted = new_composite(backends, mirror_config()).unwrap();
+    assert_eq!(restarted.download(&path).await.unwrap(), b"version one");
+}
