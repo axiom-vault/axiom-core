@@ -232,6 +232,25 @@ impl LocalFileFreshnessAnchor {
             ))
         })?;
         let path = self.path(vault_id);
+        // `self.lock` only serializes callers in this process. Hold an
+        // exclusive advisory lock on a sidecar file across the read, compare
+        // and rename so two processes cannot interleave and lower the anchor.
+        // The lock is released when `_anchor_lock` is dropped, on every path.
+        let mut lock_options = OpenOptions::new();
+        lock_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let _anchor_lock = lock_options
+            .open(path.with_extension("generation.lock"))
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|error| Error::Vault(format!("failed to lock freshness anchor: {error}")))?;
         if let Some(current) = Self::read_state(&path)? {
             if state.generation < current.generation {
                 return Err(Error::Conflict(
@@ -335,6 +354,49 @@ mod tests {
         assert_eq!(anchor.load(&vault_id).unwrap(), Some(4));
         assert!(anchor.store(&vault_id, 3).is_err());
         assert_eq!(anchor.load(&vault_id).unwrap(), Some(4));
+    }
+
+    /// Two anchors on the same directory stand in for two processes: each has
+    /// its own in-process lock, so only the file lock serializes them. Once a
+    /// store has returned, no later load may see a lower generation.
+    #[test]
+    fn local_anchors_on_the_same_path_do_not_lose_an_update() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const STORES_PER_THREAD: u64 = 2_000;
+        let directory = tempfile::tempdir().unwrap();
+        let committed = AtomicU64::new(0);
+
+        std::thread::scope(|scope| {
+            for parity in 0..2 {
+                let directory = directory.path();
+                let committed = &committed;
+                scope.spawn(move || {
+                    let vault_id = VaultId::new("shared-anchor").unwrap();
+                    let anchor = LocalFileFreshnessAnchor::new(directory);
+                    for step in 1..=STORES_PER_THREAD {
+                        let generation = step * 2 + parity;
+                        let floor = committed.load(Ordering::SeqCst);
+                        match anchor.store(&vault_id, generation) {
+                            Ok(()) => {
+                                committed.fetch_max(generation, Ordering::SeqCst);
+                            }
+                            Err(Error::Conflict(_)) => {}
+                            Err(error) => panic!("unexpected anchor error: {error}"),
+                        }
+                        let loaded = anchor.load(&vault_id).unwrap().unwrap();
+                        assert!(loaded >= floor, "anchor fell from {floor} to {loaded}");
+                    }
+                });
+            }
+        });
+
+        let vault_id = VaultId::new("shared-anchor").unwrap();
+        let anchor = LocalFileFreshnessAnchor::new(directory.path());
+        assert_eq!(
+            anchor.load(&vault_id).unwrap(),
+            Some(committed.load(Ordering::SeqCst))
+        );
     }
 
     #[test]
