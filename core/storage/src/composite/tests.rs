@@ -1745,3 +1745,88 @@ async fn test_m16_mirror_crash_before_map_commit_keeps_old_content() {
     let restarted = new_composite(backends, mirror_config()).unwrap();
     assert_eq!(restarted.download(&path).await.unwrap(), b"version one");
 }
+
+/// Only one of five backends accepts the new map: nothing of the committed
+/// generation is deleted, and with that backend gone the old content reads.
+#[tokio::test]
+async fn test_m16_minority_map_commit_deletes_nothing() {
+    let (raw, backends) = crashable_backends(5);
+    let provider = new_composite(backends.clone(), erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/doc.bin").unwrap();
+    let v1: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+    provider.upload(&path, v1.clone()).await.unwrap();
+    let v1_shards: Vec<VaultPath> =
+        futures::future::join_all((0..5).map(|i| shard_of(&provider, "/doc.bin", i))).await;
+
+    set_map_writes_fail(&raw[1..], true);
+    let _ = provider.upload(&path, vec![0xEE; 300]).await;
+    for (b, p) in backends.iter().zip(&v1_shards) {
+        assert!(
+            b.exists(p).await.unwrap(),
+            "committed shard {p} was deleted"
+        );
+    }
+
+    // The one backend that took the new map is lost.
+    set_map_writes_fail(&raw[1..], false);
+    let mut survivors = backends.clone();
+    survivors[0] = Arc::new(FailingProvider);
+    let restarted = new_composite(survivors, erasure_config(3, 2)).unwrap();
+    assert_eq!(restarted.download(&path).await.unwrap(), v1);
+}
+
+/// The same for a mirror set: the committed copy is not overwritten.
+#[tokio::test]
+async fn test_m16_mirror_minority_map_commit_keeps_committed_copy() {
+    let (raw, backends) = crashable_backends(3);
+    let provider = new_composite(backends.clone(), mirror_config()).unwrap();
+    let path = VaultPath::parse("/m.bin").unwrap();
+    provider
+        .upload(&path, b"version one".to_vec())
+        .await
+        .unwrap();
+
+    set_map_writes_fail(&raw[1..], true);
+    let _ = provider.upload(&path, b"version two".to_vec()).await;
+    for b in &backends {
+        assert_eq!(b.download(&path).await.unwrap(), b"version one");
+    }
+
+    set_map_writes_fail(&raw[1..], false);
+    let mut survivors = backends.clone();
+    survivors[0] = Arc::new(FailingProvider);
+    let restarted = new_composite(survivors, mirror_config()).unwrap();
+    assert_eq!(restarted.download(&path).await.unwrap(), b"version one");
+}
+
+/// Two mirrors with one down never reach a map majority, so the copy stays
+/// staged. It still reads, exists, lists under its own name and has the
+/// right size.
+#[tokio::test]
+async fn test_m16_unpromoted_mirror_copy_stays_usable() {
+    let healthy = Arc::new(MemoryProvider::new());
+    seed_empty_shard_map(healthy.as_ref()).await;
+    let dir = VaultPath::parse("/data").unwrap();
+    healthy.create_dir(&dir).await.unwrap();
+    let backends: Vec<Arc<dyn StorageProvider>> = vec![Arc::new(FailingProvider), healthy.clone()];
+    let provider = new_composite(backends, mirror_config()).unwrap();
+    let path = VaultPath::parse("/data/file.bin").unwrap();
+
+    provider.upload(&path, b"staged".to_vec()).await.unwrap();
+    assert!(
+        !healthy.exists(&path).await.unwrap(),
+        "promoted without a majority"
+    );
+
+    assert_eq!(provider.download(&path).await.unwrap(), b"staged");
+    assert!(provider.exists(&path).await.unwrap());
+    assert_eq!(provider.metadata(&path).await.unwrap().size, Some(6));
+    let names: Vec<String> = provider
+        .list(&dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    assert_eq!(names, vec!["file.bin"]);
+}

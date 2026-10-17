@@ -157,10 +157,33 @@ impl CompositeStorageProvider {
         Ok(())
     }
 
-    /// Persist the current shard map to all backends.
-    pub async fn save_shard_map(&self) -> Result<()> {
+    /// Persist the current shard map to all backends. Returns how many
+    /// accepted it.
+    pub async fn save_shard_map(&self) -> Result<usize> {
         let map = self.shard_map.read().await;
         map.save_to_all(&self.backends, &self.key).await
+    }
+
+    /// Persist the shard map and report whether a majority of backends
+    /// accepted it. Only then may the generation it supersedes be deleted or
+    /// overwritten: with fewer, losing the backends that took the new map
+    /// would leave a merged map that still points at the old generation.
+    ///
+    /// Known limitation: nothing collects orphans. The generation kept by a
+    /// minority commit, the files of a failed best-effort delete, and the
+    /// shards or staged copies of a write that crashed before its commit stay
+    /// on the backends, unreferenced, until removed by hand.
+    pub(crate) async fn commit_shard_map(&self) -> Result<bool> {
+        let accepted = self.save_shard_map().await?;
+        let majority = accepted * 2 > self.backends.len();
+        if !majority {
+            warn!(
+                accepted,
+                total = self.backends.len(),
+                "Shard map reached no majority of backends; keeping the previous generation"
+            );
+        }
+        Ok(majority)
     }
 
     /// The authenticated shard map entry for `path`, loading the map first.
@@ -353,11 +376,13 @@ impl StorageProvider for CompositeStorageProvider {
                     map.insert(&path_str, entry);
                     old
                 };
-                self.save_shard_map().await?;
-                // Committed: replace the previous copy and drop its staging.
-                self.promote_mirror_copies(&path, &staged, &succeeded).await;
-                self.delete_superseded(&path_str, superseded, &object_id)
-                    .await;
+                // Committed by a majority: replace the previous copy and drop
+                // its staging. Otherwise reads use the staged copy.
+                if self.commit_shard_map().await? {
+                    self.promote_mirror_copies(&path, &staged, &succeeded).await;
+                    self.delete_superseded(&path_str, superseded, &object_id)
+                        .await;
+                }
 
                 Ok(meta)
             }
@@ -610,9 +635,10 @@ impl StorageProvider for CompositeStorageProvider {
                     map.rename(&from_str, &to_str);
                     old
                 };
-                self.save_shard_map().await?;
-                self.delete_superseded(&to_str, superseded, &object_id)
-                    .await;
+                if self.commit_shard_map().await? {
+                    self.delete_superseded(&to_str, superseded, &object_id)
+                        .await;
+                }
 
                 Ok(meta)
             }
@@ -684,9 +710,10 @@ impl StorageProvider for CompositeStorageProvider {
                     }
                     old
                 };
-                self.save_shard_map().await?;
-                self.delete_superseded(&to_str, superseded, &object_id)
-                    .await;
+                if self.commit_shard_map().await? {
+                    self.delete_superseded(&to_str, superseded, &object_id)
+                        .await;
+                }
 
                 Ok(meta)
             }

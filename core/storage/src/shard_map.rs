@@ -327,12 +327,13 @@ impl ShardMap {
     /// Save the shard map redundantly to all provided backends concurrently.
     ///
     /// Tolerates partial failures — warns but continues if some backends fail.
-    /// Returns error only if ALL backends fail.
+    /// Returns the number of backends that accepted the map, or an error only
+    /// if ALL backends fail.
     pub async fn save_to_all(
         &self,
         backends: &[Arc<dyn StorageProvider>],
         key: &CompositeKey,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let data = self.to_authenticated(key)?;
         let futures: Vec<_> = backends
             .iter()
@@ -352,12 +353,12 @@ impl ShardMap {
 
         let results = futures::future::join_all(futures).await;
 
-        let mut any_success = false;
+        let mut accepted = 0usize;
         let mut last_error: Option<Error> = None;
 
         for (i, backend_name, result) in results {
             match result {
-                Ok(()) => any_success = true,
+                Ok(()) => accepted += 1,
                 Err(e) => {
                     warn!(
                         backend = backend_name,
@@ -370,8 +371,8 @@ impl ShardMap {
             }
         }
 
-        if any_success {
-            Ok(())
+        if accepted > 0 {
+            Ok(accepted)
         } else {
             Err(last_error.unwrap_or_else(|| {
                 Error::Storage("Failed to save shard map to any backend".into())

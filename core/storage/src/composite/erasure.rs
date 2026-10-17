@@ -368,10 +368,11 @@ impl CompositeStorageProvider {
             map.insert(&path_str, entry);
             old
         };
-        self.save_shard_map().await?;
-        // Committed: the previous generation is unreferenced now.
-        self.delete_superseded(&path_str, superseded, &object_id)
-            .await;
+        // Committed by a majority: the previous generation is unreferenced now.
+        if self.commit_shard_map().await? {
+            self.delete_superseded(&path_str, superseded, &object_id)
+                .await;
+        }
 
         Ok(meta)
     }
