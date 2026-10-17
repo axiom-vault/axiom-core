@@ -677,8 +677,8 @@ impl VaultConfig {
             if !bound_by_manifest && self.version >= VaultVersion::V1_1 {
                 return Err(Error::Crypto(format!(
                     "{CONFIG_FILENAME} is not authenticated: a {} config with no integrity tag \
-                     (config_mac) and no snapshot manifest is refused; it must be written by \
-                     `axiom vault migrate` or recovered from a tagged config",
+                     (config_mac) and no snapshot manifest is refused; restore a tagged copy of \
+                     {CONFIG_FILENAME}, or a copy bound by a snapshot manifest",
                     self.version
                 )));
             }
@@ -699,7 +699,7 @@ impl VaultConfig {
 #[cfg(test)]
 pub(crate) const UNAUTHENTICATED_V1_1: &str = "Cryptographic error: vault.config is not \
     authenticated: a 1.1 config with no integrity tag (config_mac) and no snapshot manifest is \
-    refused; it must be written by `axiom vault migrate` or recovered from a tagged config";
+    refused; restore a tagged copy of vault.config, or a copy bound by a snapshot manifest";
 
 /// Configuration file name in vault root.
 pub const CONFIG_FILENAME: &str = "vault.config";
