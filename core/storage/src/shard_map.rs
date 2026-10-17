@@ -99,6 +99,19 @@ pub struct ShardMap {
     pub tombstones: HashMap<String, DateTime<Utc>>,
 }
 
+/// Backend path of shard `index` of the write `object_id` of `path`.
+///
+/// Each write's shards live under its own `object_id`, so an overwrite never
+/// replaces the shards the committed map still points to (M-16).
+pub(crate) fn shard_backend_path(path: &str, object_id: &[u8; 16], index: usize) -> String {
+    format!(
+        "{}.{}.shard{}",
+        path,
+        uuid::Uuid::from_bytes(*object_id).simple(),
+        index
+    )
+}
+
 impl ShardMap {
     /// Create a new, empty shard map.
     pub fn new() -> Self {
@@ -503,7 +516,7 @@ impl ShardMap {
                 ShardLocation {
                     shard_index: i,
                     backend_id,
-                    backend_path: format!("{}.shard{}", path, i),
+                    backend_path: shard_backend_path(path, &object_id, i),
                     is_parity: i >= data_shards,
                 },
             );
@@ -645,7 +658,7 @@ mod tests {
             assert!(!entry.shards[&i].is_parity);
             assert_eq!(
                 entry.shards[&i].backend_path,
-                format!("/data/file.enc.shard{}", i)
+                format!("/data/file.enc.{}.shard{}", "0".repeat(32), i)
             );
         }
         for i in 3..5 {

@@ -594,8 +594,11 @@ impl<'a> RaidRebuilder<'a> {
                 continue;
             }
 
-            let shard_path =
-                CompositeStorageProvider::shard_path(&VaultPath::parse(path)?, target_index)?;
+            let shard_path = CompositeStorageProvider::shard_path(
+                &VaultPath::parse(path)?,
+                &entry.object_id,
+                target_index,
+            )?;
             match backends[target_index].exists(&shard_path).await {
                 Ok(true) => {
                     skipped += 1;
@@ -677,26 +680,27 @@ impl<'a> RaidRebuilder<'a> {
 
         // Update shard map entries for rebuilt shards.
         // Separate lock acquisition from backend I/O to avoid holding the lock during async calls.
-        let paths_to_check: Vec<String> = {
+        let paths_to_check: Vec<(String, [u8; 16])> = {
             let map = self.composite.shard_map_ref().read().await;
             map.entries
                 .iter()
                 .filter(|(_, e)| !e.shards.contains_key(&target_index))
-                .map(|(p, _)| p.clone())
+                .map(|(p, e)| (p.clone(), e.object_id))
                 .collect()
         };
 
         // Probe without holding the shard map lock.
         let mut confirmed: Vec<(String, String)> = Vec::new(); // (path, shard_path_str)
-        for path in paths_to_check {
+        for (path, object_id) in paths_to_check {
             let vault_path = match VaultPath::parse(&path) {
                 Ok(vp) => vp,
                 Err(_) => continue,
             };
-            let shard_path = match CompositeStorageProvider::shard_path(&vault_path, target_index) {
-                Ok(sp) => sp,
-                Err(_) => continue,
-            };
+            let shard_path =
+                match CompositeStorageProvider::shard_path(&vault_path, &object_id, target_index) {
+                    Ok(sp) => sp,
+                    Err(_) => continue,
+                };
             if backends[target_index]
                 .exists(&shard_path)
                 .await
@@ -773,7 +777,8 @@ impl<'a> RaidRebuilder<'a> {
             if i == target_index {
                 continue; // This is the shard we need to rebuild.
             }
-            let shard_path = CompositeStorageProvider::shard_path(&vault_path, i)?;
+            let shard_path =
+                CompositeStorageProvider::shard_path(&vault_path, &entry.object_id, i)?;
             match backends[i].download(&shard_path).await {
                 Ok(payload) => {
                     let Some(shard_data) = composite.open_shard(entry, i, &payload) else {
@@ -820,7 +825,8 @@ impl<'a> RaidRebuilder<'a> {
         )?;
 
         // Upload to target backend.
-        let shard_path = CompositeStorageProvider::shard_path(&vault_path, target_index)?;
+        let shard_path =
+            CompositeStorageProvider::shard_path(&vault_path, &entry.object_id, target_index)?;
         backends[target_index].upload(&shard_path, payload).await?;
 
         info!(
@@ -977,9 +983,20 @@ mod tests {
         upload_file(&composite, "/file1.enc", b"erasure test data here").await;
 
         // Determine shard path for backend 2.
-        let shard_path =
-            CompositeStorageProvider::shard_path(&VaultPath::parse("/file1.enc").unwrap(), 2)
-                .unwrap();
+        let shard_path = {
+            let entry = composite
+                .get_shard_map()
+                .await
+                .get("/file1.enc")
+                .unwrap()
+                .clone();
+            CompositeStorageProvider::shard_path(
+                &VaultPath::parse("/file1.enc").unwrap(),
+                &entry.object_id,
+                2,
+            )
+            .unwrap()
+        };
 
         // Verify shard exists.
         assert!(backends[2].exists(&shard_path).await.unwrap());
@@ -1028,9 +1045,20 @@ mod tests {
         upload_file(&composite, "/file1.enc", b"parity rebuild test").await;
 
         let target = 4; // Last parity shard.
-        let shard_path =
-            CompositeStorageProvider::shard_path(&VaultPath::parse("/file1.enc").unwrap(), target)
-                .unwrap();
+        let shard_path = {
+            let entry = composite
+                .get_shard_map()
+                .await
+                .get("/file1.enc")
+                .unwrap()
+                .clone();
+            CompositeStorageProvider::shard_path(
+                &VaultPath::parse("/file1.enc").unwrap(),
+                &entry.object_id,
+                target,
+            )
+            .unwrap()
+        };
 
         backends[target].delete(&shard_path).await.unwrap();
 

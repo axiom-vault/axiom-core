@@ -338,15 +338,13 @@ impl StorageProvider for CompositeStorageProvider {
                 })
                 .await
             }
-            RaidMode::Erasure { .. } => {
-                // Try shard 0 across backends in order until one responds
-                let shard_path = Self::shard_path(path, 0)?;
-                self.try_first("exists", |backend| {
-                    let sp = shard_path.clone();
-                    async move { backend.exists(&sp).await }
-                })
-                .await
-            }
+            // Shard paths carry the write's object_id, so the authenticated
+            // map is what says whether the object exists.
+            RaidMode::Erasure { .. } => match self.entry_for(path).await {
+                Ok(_) => Ok(true),
+                Err(Error::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            },
         }
     }
 
@@ -444,10 +442,11 @@ impl StorageProvider for CompositeStorageProvider {
                 .await
             }
             RaidMode::Erasure { .. } => {
-                let shard_path = Self::shard_path(path, 0)?;
+                let entry = self.entry_for(path).await?;
+                let shard_path = Self::shard_path(path, &entry.object_id, 0)?;
                 let file_name = path.name().unwrap_or("/").to_string();
                 // The size comes from the authenticated shard map, not a shard header.
-                let original_size = self.entry_for(path).await?.original_size;
+                let original_size = entry.original_size;
                 // Get filesystem metadata (timestamps etc) from the backend
                 let shard_meta = self
                     .try_first("metadata", |backend| {
@@ -514,12 +513,13 @@ impl StorageProvider for CompositeStorageProvider {
                 Ok(meta)
             }
             RaidMode::Erasure { .. } => {
+                let object_id = self.entry_for(from).await?.object_id;
                 let total = self.backends.len();
                 let mut futures = Vec::with_capacity(total);
                 for i in 0..total {
                     let backend = Arc::clone(&self.backends[i]);
-                    let from_shard = Self::shard_path(from, i)?;
-                    let to_shard = Self::shard_path(to, i)?;
+                    let from_shard = Self::shard_path(from, &object_id, i)?;
+                    let to_shard = Self::shard_path(to, &object_id, i)?;
                     futures.push(async move { backend.rename(&from_shard, &to_shard).await });
                 }
                 let meta = self
@@ -529,10 +529,15 @@ impl StorageProvider for CompositeStorageProvider {
                 // Update shard map
                 let from_str = from.to_string_path();
                 let to_str = to.to_string_path();
-                {
-                    self.shard_map.write().await.rename(&from_str, &to_str);
-                }
+                let superseded = {
+                    let mut map = self.shard_map.write().await;
+                    let old = map.get(&to_str).cloned();
+                    map.rename(&from_str, &to_str);
+                    old
+                };
                 self.save_shard_map().await?;
+                self.delete_superseded(&to_str, superseded, &object_id)
+                    .await;
 
                 Ok(meta)
             }
@@ -573,12 +578,13 @@ impl StorageProvider for CompositeStorageProvider {
                 Ok(meta)
             }
             RaidMode::Erasure { .. } => {
+                let object_id = self.entry_for(from).await?.object_id;
                 let total = self.backends.len();
                 let mut futures = Vec::with_capacity(total);
                 for i in 0..total {
                     let backend = Arc::clone(&self.backends[i]);
-                    let from_shard = Self::shard_path(from, i)?;
-                    let to_shard = Self::shard_path(to, i)?;
+                    let from_shard = Self::shard_path(from, &object_id, i)?;
+                    let to_shard = Self::shard_path(to, &object_id, i)?;
                     futures.push(async move { backend.copy(&from_shard, &to_shard).await });
                 }
                 let meta = self
@@ -588,8 +594,9 @@ impl StorageProvider for CompositeStorageProvider {
                 // Copy shard map entry for the new path
                 let from_str = from.to_string_path();
                 let to_str = to.to_string_path();
-                {
+                let superseded = {
                     let mut map = self.shard_map.write().await;
+                    let old = map.get(&to_str).cloned();
                     if let Some(entry) = map.get(&from_str).cloned() {
                         let mut new_entry = entry;
                         for shard in new_entry.shards.values_mut() {
@@ -600,8 +607,11 @@ impl StorageProvider for CompositeStorageProvider {
                         new_entry.updated_at = chrono::Utc::now();
                         map.insert(&to_str, new_entry);
                     }
-                }
+                    old
+                };
                 self.save_shard_map().await?;
+                self.delete_superseded(&to_str, superseded, &object_id)
+                    .await;
 
                 Ok(meta)
             }

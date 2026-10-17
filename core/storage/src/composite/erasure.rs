@@ -16,7 +16,7 @@ use tracing::warn;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::provider::Metadata;
-use crate::shard_map::{ChunkEntry, ShardMap};
+use crate::shard_map::{shard_backend_path, ChunkEntry, ShardMap};
 use axiomvault_common::{Error, Result, VaultPath};
 
 use super::auth::{DOMAIN_SHARD, TAG_LEN};
@@ -217,10 +217,45 @@ impl CompositeStorageProvider {
         valid.then_some(data)
     }
 
-    /// Build the shard path for a given file path and shard index.
-    pub(crate) fn shard_path(path: &VaultPath, shard_index: usize) -> Result<VaultPath> {
-        let path_str = path.to_string_path();
-        VaultPath::parse(&format!("{}.shard{}", path_str, shard_index))
+    /// Path of shard `shard_index` of the write `object_id` of `path`.
+    pub(crate) fn shard_path(
+        path: &VaultPath,
+        object_id: &[u8; 16],
+        shard_index: usize,
+    ) -> Result<VaultPath> {
+        VaultPath::parse(&shard_backend_path(
+            &path.to_string_path(),
+            object_id,
+            shard_index,
+        ))
+    }
+
+    /// Best-effort removal of the shards of `superseded`, an entry the
+    /// committed map no longer points to. Only call this after the map commit
+    /// succeeded. A failed delete leaves an unreferenced file and nothing else.
+    pub(crate) async fn delete_superseded(
+        &self,
+        path_str: &str,
+        superseded: Option<ChunkEntry>,
+        current: &[u8; 16],
+    ) {
+        let Some(old) = superseded else { return };
+        if old.erasure_params.is_none() || &old.object_id == current {
+            return;
+        }
+        let futures = self.backends.iter().enumerate().map(|(i, backend)| {
+            let shard = shard_backend_path(path_str, &old.object_id, i);
+            async move {
+                let result = match VaultPath::parse(&shard) {
+                    Ok(p) => backend.delete(&p).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = result {
+                    warn!(shard = i, path = shard, error = %e, "Superseded shard not deleted; left unreferenced");
+                }
+            }
+        });
+        futures::future::join_all(futures).await;
     }
 
     /// Upload data in erasure mode: encode into shards, write each to its backend.
@@ -233,7 +268,9 @@ impl CompositeStorageProvider {
         let mut futures = Vec::with_capacity(shards.len());
         for (i, shard) in shards.into_iter().enumerate() {
             let backend = Arc::clone(&self.backends[i]);
-            let shard_path = Self::shard_path(path, i)?;
+            // A path of its own: the committed generation stays intact until
+            // the map that supersedes it is written.
+            let shard_path = Self::shard_path(path, &object_id, i)?;
             let payload = self.seal_shard(&object_id, i, original_size as u64, &shard)?;
             futures.push(async move {
                 let start = tokio::time::Instant::now();
@@ -312,11 +349,16 @@ impl CompositeStorageProvider {
             &self.backends,
             Some(&succeeded),
         );
-        {
+        let superseded = {
             let mut map = self.shard_map.write().await;
+            let old = map.get(&path_str).cloned();
             map.insert(&path_str, entry);
-        }
+            old
+        };
         self.save_shard_map().await?;
+        // Committed: the previous generation is unreferenced now.
+        self.delete_superseded(&path_str, superseded, &object_id)
+            .await;
 
         Ok(meta)
     }
@@ -342,7 +384,7 @@ impl CompositeStorageProvider {
         let mut futures = Vec::with_capacity(total);
         for i in 0..total {
             let backend = Arc::clone(&self.backends[i]);
-            let shard_path = Self::shard_path(path, i)?;
+            let shard_path = Self::shard_path(path, &entry.object_id, i)?;
             futures.push(async move {
                 let start = tokio::time::Instant::now();
                 let result = backend.download(&shard_path).await;
@@ -388,11 +430,12 @@ impl CompositeStorageProvider {
 
     /// Delete shards across all backends in erasure mode.
     pub(crate) async fn erasure_delete(&self, path: &VaultPath) -> Result<()> {
+        let entry = self.entry_for(path).await?;
         let total = self.backends.len();
         let mut futures = Vec::with_capacity(total);
         for i in 0..total {
             let backend = Arc::clone(&self.backends[i]);
-            let shard_path = Self::shard_path(path, i)?;
+            let shard_path = Self::shard_path(path, &entry.object_id, i)?;
             futures.push(async move { backend.delete(&shard_path).await });
         }
 

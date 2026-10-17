@@ -25,6 +25,13 @@ fn new_composite(
     CompositeStorageProvider::new(backends, config, test_key())
 }
 
+/// Where shard `index` of the committed write of `path` lives.
+async fn shard_of(provider: &CompositeStorageProvider, path: &str, index: usize) -> VaultPath {
+    let entry = provider.get_shard_map().await.get(path).unwrap().clone();
+    CompositeStorageProvider::shard_path(&VaultPath::parse(path).unwrap(), &entry.object_id, index)
+        .unwrap()
+}
+
 fn mirror_config() -> CompositeConfig {
     CompositeConfig {
         mode: RaidMode::Mirror,
@@ -531,8 +538,8 @@ async fn test_erasure_reconstruct_with_exactly_k_shards() {
     provider.upload(&path, data.clone()).await.unwrap();
 
     // Delete shards from backends 0 and 1 (simulating 2 backend failures)
-    let shard0 = VaultPath::parse("/recover.txt.shard0").unwrap();
-    let shard1 = VaultPath::parse("/recover.txt.shard1").unwrap();
+    let shard0 = shard_of(&provider, "/recover.txt", 0).await;
+    let shard1 = shard_of(&provider, "/recover.txt", 1).await;
     backends[0].delete(&shard0).await.unwrap();
     backends[1].delete(&shard1).await.unwrap();
 
@@ -554,15 +561,15 @@ async fn test_erasure_fails_with_too_few_shards() {
 
     // Delete 3 shards — only 2 remain, need 3
     backends[0]
-        .delete(&VaultPath::parse("/fail.txt.shard0").unwrap())
+        .delete(&shard_of(&provider, "/fail.txt", 0).await)
         .await
         .unwrap();
     backends[1]
-        .delete(&VaultPath::parse("/fail.txt.shard1").unwrap())
+        .delete(&shard_of(&provider, "/fail.txt", 1).await)
         .await
         .unwrap();
     backends[2]
-        .delete(&VaultPath::parse("/fail.txt.shard2").unwrap())
+        .delete(&shard_of(&provider, "/fail.txt", 2).await)
         .await
         .unwrap();
 
@@ -590,13 +597,17 @@ async fn test_erasure_delete() {
 
     let path = VaultPath::parse("/del.bin").unwrap();
     provider.upload(&path, vec![1, 2, 3]).await.unwrap();
+    let shard_paths = [
+        shard_of(&provider, "/del.bin", 0).await,
+        shard_of(&provider, "/del.bin", 1).await,
+        shard_of(&provider, "/del.bin", 2).await,
+    ];
 
     provider.delete(&path).await.unwrap();
 
     // All shard files should be gone
-    for (i, backend) in backends.iter().enumerate() {
-        let shard_path = VaultPath::parse(&format!("/del.bin.shard{}", i)).unwrap();
-        assert!(!backend.exists(&shard_path).await.unwrap());
+    for (backend, shard_path) in backends.iter().zip(&shard_paths) {
+        assert!(!backend.exists(shard_path).await.unwrap());
     }
 }
 
@@ -691,7 +702,7 @@ async fn test_erasure_5_backends_3_of_5_knock_out_2() {
     for (path, _) in &files {
         let path_str = path.to_string_path();
         for shard_idx in [3, 4] {
-            let shard_path = VaultPath::parse(&format!("{}.shard{}", path_str, shard_idx)).unwrap();
+            let shard_path = shard_of(&provider, &path_str, shard_idx).await;
             backends[shard_idx].delete(&shard_path).await.unwrap();
         }
     }
@@ -730,7 +741,7 @@ async fn test_erasure_corrupted_shard_detected() {
     provider.upload(&path, data.clone()).await.unwrap();
 
     // Corrupt shard 0 by overwriting with garbage
-    let shard0_path = VaultPath::parse("/corrupt.bin.shard0").unwrap();
+    let shard0_path = shard_of(&provider, "/corrupt.bin", 0).await;
     backends[0]
         .upload(
             &shard0_path,
@@ -798,6 +809,9 @@ fn test_is_shard_file() {
     assert!(!is_shard_file("file.shard"));
     assert!(!is_shard_file("file.shardX"));
     assert!(!is_shard_file("noshard"));
+    assert!(is_shard_file(
+        "file.txt.0123456789abcdef0123456789abcdef.shard3"
+    ));
 }
 
 // -- Toggleable provider for health tests ---------------------------------
@@ -1204,10 +1218,6 @@ fn attacker_composite(config: CompositeConfig, n: usize) -> CompositeStorageProv
     .unwrap()
 }
 
-fn shard_file(path: &str, index: usize) -> VaultPath {
-    VaultPath::parse(&format!("{}.shard{}", path, index)).unwrap()
-}
-
 /// Backend `index` replaces its shard of `path` with different bytes of the
 /// same length and re-seals it as well as it can: the integrity field is
 /// recomputed over the new bytes, under a key that is not the vault's.
@@ -1227,7 +1237,7 @@ async fn rewrite_shard(
         .seal_shard(&entry.object_id, index, entry.original_size, &garbage)
         .unwrap();
     backends[index]
-        .upload(&shard_file(path, index), payload)
+        .upload(&shard_of(provider, path, index).await, payload)
         .await
         .unwrap();
 }
@@ -1261,21 +1271,21 @@ async fn test_m16_stale_shard_version_is_rejected() {
 
     provider.upload(&path, v1).await.unwrap();
     let old0 = backends[0]
-        .download(&shard_file("/doc.bin", 0))
+        .download(&shard_of(&provider, "/doc.bin", 0).await)
         .await
         .unwrap();
     let old1 = backends[1]
-        .download(&shard_file("/doc.bin", 1))
+        .download(&shard_of(&provider, "/doc.bin", 1).await)
         .await
         .unwrap();
     provider.upload(&path, v2.clone()).await.unwrap();
 
     backends[0]
-        .upload(&shard_file("/doc.bin", 0), old0)
+        .upload(&shard_of(&provider, "/doc.bin", 0).await, old0)
         .await
         .unwrap();
     backends[1]
-        .upload(&shard_file("/doc.bin", 1), old1)
+        .upload(&shard_of(&provider, "/doc.bin", 1).await, old1)
         .await
         .unwrap();
 
@@ -1429,8 +1439,14 @@ async fn test_m16_genuine_erasure_set_with_backend_missing_reads_and_rebuilds() 
     assert_eq!((result.rebuilt, result.failed), (1, 0));
 
     // Only shards 2, 3 and the rebuilt 4 are left: the read needs shard 4.
-    backends[0].delete(&shard_file("/d.bin", 0)).await.unwrap();
-    backends[1].delete(&shard_file("/d.bin", 1)).await.unwrap();
+    backends[0]
+        .delete(&shard_of(&provider, "/d.bin", 0).await)
+        .await
+        .unwrap();
+    backends[1]
+        .delete(&shard_of(&provider, "/d.bin", 1).await)
+        .await
+        .unwrap();
     assert_eq!(replaced.download(&path).await.unwrap(), data);
 }
 
@@ -1519,12 +1535,15 @@ async fn test_m16_erasure_rebuild_skips_forged_shards() {
         .await
         .unwrap();
     let genuine4 = backends[4]
-        .download(&shard_file("/e.bin", 4))
+        .download(&shard_of(&provider, "/e.bin", 4).await)
         .await
         .unwrap();
 
     rewrite_shard(&provider, &backends, "/e.bin", 0).await;
-    backends[4].delete(&shard_file("/e.bin", 4)).await.unwrap();
+    backends[4]
+        .delete(&shard_of(&provider, "/e.bin", 4).await)
+        .await
+        .unwrap();
     let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
         .unwrap()
         .rebuild()
@@ -1533,19 +1552,165 @@ async fn test_m16_erasure_rebuild_skips_forged_shards() {
     assert_eq!((result.rebuilt, result.failed), (1, 0));
     assert_eq!(
         backends[4]
-            .download(&shard_file("/e.bin", 4))
+            .download(&shard_of(&provider, "/e.bin", 4).await)
             .await
             .unwrap(),
         genuine4
     );
 
     rewrite_shard(&provider, &backends, "/e.bin", 1).await;
-    backends[4].delete(&shard_file("/e.bin", 4)).await.unwrap();
+    backends[4]
+        .delete(&shard_of(&provider, "/e.bin", 4).await)
+        .await
+        .unwrap();
     let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
         .unwrap()
         .rebuild()
         .await
         .unwrap();
     assert_eq!((result.rebuilt, result.failed), (0, 1));
-    assert!(!backends[4].exists(&shard_file("/e.bin", 4)).await.unwrap());
+    assert!(!backends[4]
+        .exists(&shard_of(&provider, "/e.bin", 4).await)
+        .await
+        .unwrap());
+}
+
+// -- M-16 follow-up: an interrupted overwrite keeps the old generation -----
+
+/// A backend that can refuse shard-map writes (a crash before the map
+/// commit) and deletes (a failed cleanup); everything else is in memory.
+struct CrashableProvider {
+    inner: MemoryProvider,
+    fail_map_writes: std::sync::atomic::AtomicBool,
+    fail_deletes: std::sync::atomic::AtomicBool,
+}
+
+impl CrashableProvider {
+    fn new() -> Self {
+        Self {
+            inner: MemoryProvider::new(),
+            fail_map_writes: Default::default(),
+            fail_deletes: Default::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageProvider for CrashableProvider {
+    fn name(&self) -> &str {
+        "crashable"
+    }
+    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        let is_map = path.to_string_path().contains(".axiomvault/shard_map");
+        if is_map
+            && self
+                .fail_map_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Storage("crashed before the map commit".into()));
+        }
+        self.inner.upload(path, data).await
+    }
+    async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+        self.inner.upload_stream(path, stream).await
+    }
+    async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+        self.inner.download(path).await
+    }
+    async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+        self.inner.download_stream(path).await
+    }
+    async fn exists(&self, path: &VaultPath) -> Result<bool> {
+        self.inner.exists(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<()> {
+        if self.fail_deletes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Storage("delete refused".into()));
+        }
+        self.inner.delete(path).await
+    }
+    async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+        self.inner.list(path).await
+    }
+    async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.metadata(path).await
+    }
+    async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.create_dir(path).await
+    }
+    async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete_dir(path).await
+    }
+    async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.rename(from, to).await
+    }
+    async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.copy(from, to).await
+    }
+}
+
+fn crashable_backends(n: usize) -> (Vec<Arc<CrashableProvider>>, Vec<Arc<dyn StorageProvider>>) {
+    let raw: Vec<Arc<CrashableProvider>> =
+        (0..n).map(|_| Arc::new(CrashableProvider::new())).collect();
+    let dyns = raw
+        .iter()
+        .map(|b| Arc::clone(b) as Arc<dyn StorageProvider>)
+        .collect();
+    (raw, dyns)
+}
+
+/// An overwrite whose shards are all written but whose map commit never
+/// happens (the process dies in between) must leave the old content readable.
+#[tokio::test]
+async fn test_m16_crash_before_map_commit_keeps_old_content() {
+    let (raw, backends) = crashable_backends(5);
+    let provider = new_composite(backends.clone(), erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/doc.bin").unwrap();
+    let v1: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+    provider.upload(&path, v1.clone()).await.unwrap();
+
+    for b in &raw {
+        b.fail_map_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    assert!(provider.upload(&path, vec![0xEE; 400]).await.is_err());
+    drop(provider);
+
+    // Restart: a fresh composite sees only what reached the backends.
+    for b in &raw {
+        b.fail_map_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    let restarted = new_composite(backends, erasure_config(3, 2)).unwrap();
+    assert_eq!(restarted.download(&path).await.unwrap(), v1);
+}
+
+/// After a committed overwrite the previous generation's shards are
+/// deleted, and a backend that refuses the delete does not fail the write.
+#[tokio::test]
+async fn test_m16_superseded_shards_deleted_after_commit_and_failed_delete_is_harmless() {
+    let (raw, backends) = crashable_backends(5);
+    let provider = new_composite(backends.clone(), erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/doc.bin").unwrap();
+
+    provider.upload(&path, vec![1u8; 90]).await.unwrap();
+    let v1_shards: Vec<VaultPath> =
+        futures::future::join_all((0..5).map(|i| shard_of(&provider, "/doc.bin", i))).await;
+    provider.upload(&path, vec![2u8; 90]).await.unwrap();
+    for (b, p) in backends.iter().zip(&v1_shards) {
+        assert!(
+            !b.exists(p).await.unwrap(),
+            "superseded shard {p} left behind"
+        );
+    }
+
+    raw[0]
+        .fail_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let v2_shard0 = shard_of(&provider, "/doc.bin", 0).await;
+    provider.upload(&path, vec![3u8; 90]).await.unwrap();
+    assert!(backends[0].exists(&v2_shard0).await.unwrap());
+    assert_eq!(provider.download(&path).await.unwrap(), vec![3u8; 90]);
+    let restarted = new_composite(backends, erasure_config(3, 2)).unwrap();
+    assert_eq!(restarted.download(&path).await.unwrap(), vec![3u8; 90]);
 }
