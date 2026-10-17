@@ -58,7 +58,14 @@ pub struct VaultVersion {
 impl VaultVersion {
     /// Current vault format version.
     /// Bumped to 1.1 to indicate recovery key / key-wrapping support.
-    pub const CURRENT: Self = Self { major: 1, minor: 1 };
+    /// Bumped to 2.0 for manifest-based generations: `vault.config` and
+    /// `m/tree.json` became non-authoritative caches, so 1.x clients (whose
+    /// only gate is the major version) must refuse these vaults.
+    pub const CURRENT: Self = Self { major: 2, minor: 0 };
+
+    /// Key-wrapping and recovery format; the last version that registry
+    /// migrations write. A 1.1 vault is upgraded to `CURRENT` on open.
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
 
     /// Check if this version is compatible with the current version.
     pub fn is_compatible(&self) -> bool {
@@ -504,7 +511,7 @@ impl VaultConfig {
         let encrypted_recovery_key = encrypt(master_key.as_bytes(), recovery_key.as_bytes())?;
         let recovery_words = recovery_key.to_mnemonic()?;
 
-        self.version = VaultVersion::CURRENT;
+        self.version = VaultVersion::V1_1;
         self.wrapped_master_key = Some(wrapped_master_key);
         self.recovery_wrapped_master_key = Some(recovery_wrapped);
         self.recovery_key_verification = Some(recovery_verification);
@@ -586,12 +593,38 @@ mod tests {
         let current = VaultVersion::CURRENT;
         assert!(current.is_compatible());
 
-        let incompatible = VaultVersion { major: 2, minor: 0 };
+        let incompatible = VaultVersion { major: 3, minor: 0 };
         assert!(!incompatible.is_compatible());
 
-        // v1.0 should be compatible with v1.1
-        let legacy = VaultVersion { major: 1, minor: 0 };
-        assert!(legacy.is_compatible());
+        // 1.x vaults are not directly usable; they upgrade through migration
+        // (1.0) or on open (1.1) before a session is created.
+        assert!(!VaultVersion { major: 1, minor: 0 }.is_compatible());
+        assert!(!VaultVersion::V1_1.is_compatible());
+    }
+
+    #[test]
+    fn v1_1_client_gate_refuses_current_format() {
+        // Copy of the 1.1 client's only open-path gate (b6520ff
+        // `VaultVersion::is_compatible`, called by `VaultSession::from_master_key`).
+        fn v1_1_client_is_compatible(version: &VaultVersion) -> bool {
+            version.major == VaultVersion::V1_1.major
+        }
+        assert!(!v1_1_client_is_compatible(&VaultVersion::CURRENT));
+        assert!(v1_1_client_is_compatible(&VaultVersion::V1_1));
+    }
+
+    #[test]
+    fn new_config_reports_current_version() {
+        let config = VaultConfig::new(
+            VaultId::new("fresh").unwrap(),
+            b"password",
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.version, VaultVersion { major: 2, minor: 0 });
     }
 
     #[test]

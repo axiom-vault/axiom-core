@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
+use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
 use crate::freshness::{
     FreshnessAnchor, FreshnessState, LocalFileFreshnessAnchor, UnavailableFreshnessAnchor,
 };
 use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
+use crate::migration::{check_migration_needed, MigrationStatus};
 use crate::session::VaultSession;
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
@@ -44,6 +45,25 @@ fn persisted_provider_config(
         "credential_ref": credential_ref,
         "credential_schema": 1,
     }))
+}
+
+/// Whether an authenticated 1.1 config must be upgraded to `CURRENT` on open.
+///
+/// Callers relabel only their in-memory copy and publish it as a new manifest
+/// generation; `vault.config` is a cache written after the manifest commit, so
+/// it never reads 2.0 while the authoritative snapshot is still 1.1.
+fn needs_format_upgrade(config: &VaultConfig) -> Result<bool> {
+    match check_migration_needed(config) {
+        MigrationStatus::UpToDate => Ok(false),
+        MigrationStatus::NeedsMigration { from, .. } if from == VaultVersion::V1_1 => Ok(true),
+        MigrationStatus::NeedsMigration { from, .. } => Err(Error::Vault(format!(
+            "vault version {from} must be migrated to {} before it can be opened",
+            VaultVersion::V1_1
+        ))),
+        MigrationStatus::Incompatible { version } => Err(Error::Vault(format!(
+            "Incompatible vault version: {version}"
+        ))),
+    }
 }
 
 fn is_oauth_cloud_provider(provider_type: &str) -> bool {
@@ -357,7 +377,8 @@ impl VaultManager {
                     "snapshot config unwraps a different master key".to_string(),
                 ));
             }
-            let config = snapshot_config;
+            let mut config = snapshot_config;
+            let upgrade = needs_format_upgrade(&config)?;
             let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
             let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if let Some(accepted) = &anchored_state {
@@ -386,7 +407,10 @@ impl VaultManager {
                 },
             )?;
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
-            return VaultSession::from_master_key_with_freshness(
+            if upgrade {
+                config.version = VaultVersion::CURRENT;
+            }
+            let session = VaultSession::from_master_key_with_freshness(
                 config,
                 master_key,
                 provider,
@@ -394,7 +418,12 @@ impl VaultManager {
                 self.freshness_anchor.clone(),
                 anchor_id,
                 manifest.generation,
-            );
+            )?;
+            if upgrade {
+                // Commits a 2.0 generation; on failure the 1.1 snapshot stays current.
+                session.save_tree().await?;
+            }
+            return Ok(session);
         }
 
         if !provider.exists(&config_path).await? {
@@ -414,6 +443,7 @@ impl VaultManager {
                 "snapshot manifest missing for a vault with trusted freshness state".to_string(),
             ));
         }
+        let upgrade = needs_format_upgrade(&config)?;
 
         // Legacy bootstrap is allowed only when neither storage nor this device has
         // freshness state. Authenticate and decrypt before sanitizing a legacy config.
@@ -424,6 +454,11 @@ impl VaultManager {
                 config.provider_config = safe_config;
                 provider.upload(&config_path, config.to_bytes()?).await?;
             }
+        }
+        // Relabel only after the sanitizing upload above, so the first manifest
+        // (written by `save_tree` below) precedes any 2.0 `vault.config`.
+        if upgrade {
+            config.version = VaultVersion::CURRENT;
         }
 
         let session = VaultSession::from_master_key_with_freshness(
@@ -542,6 +577,11 @@ impl VaultManager {
                 0,
             )
         };
+
+        // A 1.1 vault is published as 2.0 by the `save_tree` below.
+        if needs_format_upgrade(&config)? {
+            config.version = VaultVersion::CURRENT;
+        }
 
         // Reset password in config. The master key itself doesn't change.
         config.reset_password(&recovery_key, new_password)?;
@@ -2124,5 +2164,474 @@ mod tests {
                 "folder_id": "remote-folder"
             })
         );
+    }
+
+    const V1_1_CONTENT: &[u8] = b"one-shot content written by a 1.1 client";
+
+    fn config_path() -> VaultPath {
+        VaultPath::parse(CONFIG_FILENAME).unwrap()
+    }
+
+    async fn stored_config<P: StorageProvider + ?Sized>(provider: &P) -> VaultConfig {
+        VaultConfig::from_bytes(&provider.download(&config_path()).await.unwrap()).unwrap()
+    }
+
+    async fn committed_config<P: StorageProvider + ?Sized>(
+        provider: &P,
+        master_key: &MasterKey,
+    ) -> (u64, VaultConfig) {
+        let manifest = GenerationManifest::open(
+            master_key,
+            &provider.download(&manifest_path()).await.unwrap(),
+        )
+        .unwrap();
+        let (_, config_object) = manifest.object_paths().unwrap();
+        let config =
+            VaultConfig::from_bytes(&provider.download(&config_object).await.unwrap()).unwrap();
+        (manifest.generation, config)
+    }
+
+    /// A b6520ff-style vault: 1.1 `vault.config`, `m/tree.json`, no manifest,
+    /// and one file in the one-shot AEAD encoding (`content_version` 0).
+    async fn write_v1_1_vault_without_manifest(
+        provider: Arc<dyn StorageProvider>,
+        vault_id: &str,
+    ) -> (VaultPath, Zeroizing<String>) {
+        use crate::operations::VaultOperations;
+
+        let creation = VaultConfig::new(
+            VaultId::new(vault_id).unwrap(),
+            b"password",
+            "test",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut v1_1 = creation.config.clone();
+        v1_1.version = VaultVersion::V1_1;
+        provider
+            .create_dir(&VaultPath::parse(DATA_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        provider
+            .create_dir(&VaultPath::parse(META_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        let session = VaultSession::from_master_key(
+            creation.config,
+            creation.master_key,
+            provider.clone(),
+            VaultTree::new(),
+        )
+        .unwrap();
+        let file = VaultPath::parse("/notes.txt").unwrap();
+        VaultOperations::new(&session)
+            .unwrap()
+            .create_file(&file, V1_1_CONTENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .tree()
+                .read()
+                .await
+                .get_node(&file)
+                .unwrap()
+                .metadata
+                .content_version,
+            0
+        );
+        drop(session);
+        provider
+            .upload(&config_path(), v1_1.to_bytes().unwrap())
+            .await
+            .unwrap();
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        (file, creation.recovery_words)
+    }
+
+    #[tokio::test]
+    async fn fresh_vault_opens_at_current_version() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        manager
+            .create_vault(
+                VaultId::new("fresh-version").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.config().version,
+            VaultVersion { major: 2, minor: 0 }
+        );
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_1_vault_without_manifest_upgrades_on_open_and_survives_interruption() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-bootstrap").unwrap();
+        let (file, _) =
+            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+        let v1_1_bytes = provider.download(&config_path()).await.unwrap();
+
+        // Interrupted before the first manifest commit: storage is still 1.1.
+        provider.fail_next_manifest();
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .is_err());
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        assert_eq!(provider.download(&config_path()).await.unwrap(), v1_1_bytes);
+
+        let session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        let (generation, committed) =
+            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
+        assert_eq!(generation, 1);
+        assert_eq!(committed.version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+        drop(session);
+
+        // A 2.0 vault reopens without another upgrade generation.
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(1));
+        assert_eq!(
+            VaultOperations::new(&reopened)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_1_vault_with_manifest_upgrades_on_open_and_survives_interruption() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-manifest").unwrap();
+        let creation = manager
+            .create_vault(
+                vault_id.clone(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let file = VaultPath::parse("/notes.txt").unwrap();
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&file, V1_1_CONTENT)
+            .await
+            .unwrap();
+
+        // Republish the committed snapshot labelled 1.1, as a pre-bump client did.
+        let master_key = creation.session.master_key().unwrap();
+        let current = GenerationManifest::open(
+            master_key,
+            &provider.download(&manifest_path()).await.unwrap(),
+        )
+        .unwrap();
+        let (tree_object, _) = current.object_paths().unwrap();
+        let encrypted_tree = provider.download(&tree_object).await.unwrap();
+        let mut v1_1 = creation.session.config().clone();
+        v1_1.version = VaultVersion::V1_1;
+        let v1_1_bytes = v1_1.to_bytes().unwrap();
+        let labelled = GenerationManifest::new(
+            vault_id.clone(),
+            current.generation + 1,
+            &encrypted_tree,
+            &v1_1_bytes,
+            current.object_digests.clone(),
+        );
+        let (labelled_tree, labelled_config) = labelled.object_paths().unwrap();
+        provider
+            .upload(&labelled_tree, encrypted_tree)
+            .await
+            .unwrap();
+        provider
+            .upload(&labelled_config, v1_1_bytes.clone())
+            .await
+            .unwrap();
+        let labelled_bytes = labelled.seal(master_key).unwrap();
+        provider
+            .upload(&manifest_path(), labelled_bytes.clone())
+            .await
+            .unwrap();
+        provider
+            .upload(&config_path(), v1_1_bytes.clone())
+            .await
+            .unwrap();
+        anchor
+            .store_state(
+                &test_anchor_id(&vault_id),
+                FreshnessState {
+                    generation: labelled.generation,
+                    manifest_digest: Some(digest(&labelled_bytes)),
+                },
+            )
+            .unwrap();
+        let v1_1_generation = labelled.generation;
+        drop(creation);
+
+        // Interrupted before the 2.0 manifest commit: still a 1.1 vault.
+        provider.fail_next_manifest();
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .is_err());
+        assert_eq!(
+            provider.download(&manifest_path()).await.unwrap(),
+            labelled_bytes
+        );
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::V1_1
+        );
+
+        let session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        let (generation, committed) =
+            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
+        assert_eq!(generation, v1_1_generation + 1);
+        assert_eq!(committed.version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+        drop(session);
+
+        // Committed, but the `vault.config` cache write was lost: the manifest is
+        // authoritative, so the vault opens at 2.0 and the cache is rewritten.
+        provider.upload(&config_path(), v1_1_bytes).await.unwrap();
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(reopened.config().version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            anchor.load(&test_anchor_id(&vault_id)).unwrap(),
+            Some(v1_1_generation + 1)
+        );
+        assert_eq!(
+            VaultOperations::new(&reopened)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn recovering_a_v1_1_vault_publishes_it_as_current() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let (file, words) =
+            write_v1_1_vault_without_manifest(provider.clone(), "v1-1-recover").await;
+
+        let session = manager
+            .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        let (_, committed) =
+            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
+        assert_eq!(committed.version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_0_vault_is_refused_on_open_until_migrated_then_upgrades() {
+        use crate::migration::MigrationRegistry;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut legacy = VaultConfig::new(
+            VaultId::new("v1-0-open").unwrap(),
+            b"password",
+            "test",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        legacy.version = VaultVersion { major: 1, minor: 0 };
+        legacy.wrapped_master_key = None;
+        legacy.recovery_wrapped_master_key = None;
+        legacy.recovery_key_verification = None;
+        legacy.encrypted_recovery_key = None;
+        let legacy_bytes = legacy.to_bytes().unwrap();
+        provider
+            .create_dir(&VaultPath::parse(DATA_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        provider
+            .create_dir(&VaultPath::parse(META_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        provider
+            .upload(&config_path(), legacy_bytes.clone())
+            .await
+            .unwrap();
+
+        let error = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("a 1.0 vault must be migrated before it is opened");
+        assert!(error.to_string().contains("must be migrated"));
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        assert_eq!(
+            provider.download(&config_path()).await.unwrap(),
+            legacy_bytes
+        );
+
+        let outcome = MigrationRegistry::with_defaults()
+            .migrate(provider.as_ref(), b"password", &VaultVersion::V1_1)
+            .await
+            .unwrap();
+        assert_eq!(outcome.config.version, VaultVersion::V1_1);
+        assert!(outcome.recovery_words.is_some());
+
+        let session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_1_client_cannot_read_chunked_content_of_a_current_vault() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let creation = manager
+            .create_vault(
+                VaultId::new("chunked-content").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("large.bin");
+        let content: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        std::fs::write(&source, &content).unwrap();
+        let file = VaultPath::parse("/large.bin").unwrap();
+        let ops = VaultOperations::new(&creation.session).unwrap();
+        ops.create_file_from_path(&file, &source).await.unwrap();
+        let metadata = creation
+            .session
+            .tree()
+            .read()
+            .await
+            .get_node(&file)
+            .unwrap()
+            .metadata
+            .clone();
+        // Chunked stream framing v2 (operations::STREAM_CONTENT_VERSION).
+        assert_eq!(metadata.content_version, 2);
+
+        // Version gate: the 1.1 client (b6520ff) accepts only major == 1.
+        let stored = stored_config(provider.as_ref()).await;
+        assert_eq!(stored.version, VaultVersion::CURRENT);
+        assert_ne!(stored.version.major, VaultVersion::V1_1.major);
+
+        // Content: past the gate, the 1.1 client's read_file uses one-shot AEAD
+        // `decrypt`, which rejects the chunked object.
+        let ciphertext = provider
+            .download(
+                &VaultPath::parse(DATA_DIRNAME)
+                    .unwrap()
+                    .join(&metadata.encrypted_name)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let file_key = creation
+            .session
+            .master_key()
+            .unwrap()
+            .derive_file_key(metadata.encrypted_name.as_bytes());
+        assert!(axiomvault_crypto::decrypt(file_key.as_bytes(), &ciphertext).is_err());
+        assert_eq!(ops.read_file(&file).await.unwrap(), content);
     }
 }

@@ -965,6 +965,10 @@ mod tests {
         legacy.recovery_wrapped_master_key = None;
         legacy.recovery_key_verification = None;
         legacy.encrypted_recovery_key = None;
+        // A real vault has its data and metadata directories; the 1.1 -> 2.0
+        // upgrade publishes its first manifest generation under `m/`.
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
         std::fs::write(
             directory.path().join("vault.config"),
             legacy.to_bytes().unwrap(),
@@ -992,6 +996,7 @@ mod tests {
             VaultConfig::from_bytes(&std::fs::read(directory.path().join("vault.config")).unwrap())
                 .unwrap();
         assert_eq!(migrated.version, VaultVersion::CURRENT);
+        assert!(directory.path().join("m/generation.manifest").exists());
         assert!(migrated.wrapped_master_key.is_some());
         assert!(migrated.recovery_wrapped_master_key.is_some());
     }

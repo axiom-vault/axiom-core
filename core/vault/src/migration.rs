@@ -345,7 +345,7 @@ impl MigrationRegistry {
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
-        if config.version == VaultVersion::CURRENT {
+        if config.version >= VaultVersion::V1_1 {
             validate_v1_1_invariants(&config)?;
         }
         Ok(AuthenticatedConfig { config, master_key })
@@ -379,36 +379,30 @@ impl Default for MigrationRegistry {
 }
 
 /// Check whether a vault config requires migration.
+///
+/// 1.0 needs the password-authenticated registry migration to 1.1 first;
+/// 1.1 is upgraded to `CURRENT` by `VaultManager::open_vault`.
 pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
     let current = VaultVersion::CURRENT;
-
-    if config.version == current {
-        if validate_v1_1_invariants(config).is_err() {
-            return MigrationStatus::Incompatible {
-                version: config.version,
-            };
-        }
-        return MigrationStatus::UpToDate;
-    }
-
-    // Different major version means incompatible.
-    if config.version.major != current.major {
-        return MigrationStatus::Incompatible {
-            version: config.version,
-        };
-    }
-
-    // Same major, different minor: needs migration if vault is older.
-    if config.version.minor < current.minor {
-        return MigrationStatus::NeedsMigration {
-            from: config.version,
-            to: current,
-        };
-    }
-
-    // Vault is newer than current software.
-    MigrationStatus::Incompatible {
+    let incompatible = MigrationStatus::Incompatible {
         version: config.version,
+    };
+
+    if config.version == current || config.version == VaultVersion::V1_1 {
+        if validate_v1_1_invariants(config).is_err() {
+            return incompatible;
+        }
+        if config.version == current {
+            return MigrationStatus::UpToDate;
+        }
+    } else if config.version != (VaultVersion { major: 1, minor: 0 }) {
+        // Unknown 1.x, other majors, and vaults newer than this software.
+        return incompatible;
+    }
+
+    MigrationStatus::NeedsMigration {
+        from: config.version,
+        to: current,
     }
 }
 
@@ -417,7 +411,7 @@ pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
 // ---------------------------------------------------------------------------
 
 fn validate_v1_1_invariants(config: &VaultConfig) -> Result<()> {
-    if config.version != VaultVersion::CURRENT
+    if config.version < VaultVersion::V1_1
         || config.wrapped_master_key.is_none()
         || config.recovery_wrapped_master_key.is_none()
         || config.recovery_key_verification.is_none()
@@ -503,14 +497,50 @@ mod tests {
 
     #[test]
     fn test_check_migration_incompatible_major() {
-        let config = make_test_config(VaultVersion { major: 2, minor: 0 });
+        let config = make_test_config(VaultVersion { major: 3, minor: 0 });
         let status = check_migration_needed(&config);
         assert_eq!(
             status,
             MigrationStatus::Incompatible {
-                version: VaultVersion { major: 2, minor: 0 }
+                version: VaultVersion { major: 3, minor: 0 }
             }
         );
+    }
+
+    #[test]
+    fn v1_vaults_are_upgradable_and_newer_formats_are_refused() {
+        assert_eq!(
+            check_migration_needed(&make_test_config(VaultVersion::V1_1)),
+            MigrationStatus::NeedsMigration {
+                from: VaultVersion::V1_1,
+                to: VaultVersion::CURRENT
+            }
+        );
+        let legacy = make_legacy_config();
+        assert_eq!(
+            check_migration_needed(&legacy),
+            MigrationStatus::NeedsMigration {
+                from: VaultVersion { major: 1, minor: 0 },
+                to: VaultVersion::CURRENT
+            }
+        );
+        // A 1.1 label without the key-wrapping fields cannot be upgraded.
+        let mut broken = legacy.clone();
+        broken.version = VaultVersion::V1_1;
+        assert!(matches!(
+            check_migration_needed(&broken),
+            MigrationStatus::Incompatible { .. }
+        ));
+        for version in [
+            VaultVersion { major: 1, minor: 2 },
+            VaultVersion { major: 2, minor: 1 },
+            VaultVersion { major: 3, minor: 0 },
+        ] {
+            assert_eq!(
+                check_migration_needed(&make_test_config(version)),
+                MigrationStatus::Incompatible { version }
+            );
+        }
     }
 
     #[test]
@@ -651,10 +681,10 @@ mod tests {
         let registry = MigrationRegistry::with_defaults();
 
         let outcome = registry
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await
             .unwrap();
-        assert_eq!(outcome.config.version, VaultVersion::CURRENT);
+        assert_eq!(outcome.config.version, VaultVersion::V1_1);
         assert!(provider
             .exists(&VaultPath::parse(CONFIG_FILENAME).unwrap())
             .await
@@ -679,7 +709,7 @@ mod tests {
             .unwrap();
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -707,7 +737,7 @@ mod tests {
         upload_config(&provider, CONFIG_BACKUP_FILENAME, backup.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -736,7 +766,7 @@ mod tests {
         upload_config(&provider, CONFIG_MIGRATION_FILENAME, staged_bytes.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -769,7 +799,7 @@ mod tests {
         upload_config(&provider, CONFIG_BACKUP_FILENAME, backup_bytes).await;
 
         let outcome = MigrationRegistry::with_defaults()
-            .migrate(&provider, password, &VaultVersion::CURRENT)
+            .migrate(&provider, password, &VaultVersion::V1_1)
             .await
             .unwrap();
 
@@ -825,7 +855,7 @@ mod tests {
         upload_config(&provider, CONFIG_MIGRATION_FILENAME, malformed.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await;
 
         assert!(result.is_err());
@@ -849,10 +879,10 @@ mod tests {
             .await
             .unwrap();
         let outcome = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await
             .unwrap();
-        assert_eq!(outcome.config.version, VaultVersion::CURRENT);
+        assert_eq!(outcome.config.version, VaultVersion::V1_1);
         assert!(outcome.recovery_words.is_some());
     }
 
