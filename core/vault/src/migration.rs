@@ -207,8 +207,8 @@ impl MigrationRegistry {
             ));
         }
 
-        // Tagged under the proven master key, so recovery, which refuses an
-        // untagged 1.1 config that no manifest binds, accepts it.
+        // Tagged under the proven master key: every open, upgrade and recovery
+        // path refuses an untagged 1.1 config that no manifest binds.
         provider
             .upload(
                 &temp_path,

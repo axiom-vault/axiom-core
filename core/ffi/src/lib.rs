@@ -1106,8 +1106,12 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
     }
 
+    /// An untagged 1.1 `vault.config` with no manifest: nothing authenticates
+    /// its provider settings, id or hardware-key flag, so open, migrate and
+    /// reset all refuse it before any write. Without an open handle there is
+    /// no `axiom_vault_change_password` call to make.
     #[test]
-    fn ffi_open_refuses_v1_1_without_writes_and_migrate_upgrades_it() {
+    fn ffi_refuses_an_untagged_v1_1_vault_on_every_path_without_writes() {
         use axiomvault_common::VaultId;
         use axiomvault_crypto::KdfParams;
         use axiomvault_vault::{VaultConfig, VaultVersion};
@@ -1135,15 +1139,15 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let mut v1_1 = VaultConfig::new(
+        let creation = VaultConfig::new(
             VaultId::new("ffi-v1-1").unwrap(),
             b"correct password",
             "local",
             serde_json::json!({ "root": directory.path() }),
             KdfParams::moderate(),
         )
-        .unwrap()
-        .config;
+        .unwrap();
+        let mut v1_1 = creation.config;
         v1_1.version = VaultVersion::V1_1;
         std::fs::create_dir(directory.path().join("d")).unwrap();
         std::fs::create_dir(directory.path().join("m")).unwrap();
@@ -1156,29 +1160,102 @@ mod tests {
 
         let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
         let password = CString::new("correct password").unwrap();
+        let unauthenticated = "vault.config is not authenticated: a 1.1 config with no \
+            integrity tag (config_mac) and no snapshot manifest is refused";
         // SAFETY: both pointers are valid NUL-terminated strings for this call.
         let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
-        assert!(handle.is_null(), "open must refuse a 1.1 vault");
+        assert!(handle.is_null(), "open must refuse an untagged 1.1 vault");
         let error = error::take_last_error().unwrap().to_string();
-        assert!(
-            error.contains(
-                "vault version 1.1 must be upgraded with `axiom vault migrate` before it can be opened"
-            ),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
         assert_eq!(snapshot(directory.path()), before);
 
         // SAFETY: both pointers are valid NUL-terminated strings for this call.
         assert_eq!(
             unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
+            -1
+        );
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
+        assert!(axiom_vault_take_migration_recovery_words().is_null());
+        assert_eq!(snapshot(directory.path()), before);
+
+        let words = CString::new(creation.recovery_words.as_str()).unwrap();
+        let new_password = CString::new("new password").unwrap();
+        // SAFETY: all three pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe {
+            axiom_vault_reset_password(path.as_ptr(), words.as_ptr(), new_password.as_ptr())
+        };
+        assert!(handle.is_null(), "reset must refuse an untagged 1.1 vault");
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    /// A 1.0 vault migrates through the registry to a tagged 1.1 config, which
+    /// the same `axiom_vault_migrate` call upgrades to `CURRENT`.
+    #[test]
+    fn ffi_migrate_upgrades_a_v1_0_vault_through_a_tagged_v1_1_config() {
+        use axiomvault_common::VaultId;
+        use axiomvault_crypto::KdfParams;
+        use axiomvault_vault::{VaultConfig, VaultManager, VaultSession, VaultTree, VaultVersion};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = serde_json::json!({ "root": directory.path() });
+        let creation = VaultConfig::new(
+            VaultId::new("ffi-v1-0").unwrap(),
+            b"correct password",
+            "local",
+            root.clone(),
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut legacy = creation.config.clone();
+        legacy.version = VaultVersion { major: 1, minor: 0 };
+        legacy.wrapped_master_key = None;
+        legacy.recovery_wrapped_master_key = None;
+        legacy.recovery_key_verification = None;
+        legacy.encrypted_recovery_key = None;
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
+        // A real 1.0 vault's tree index is under the password-derived key.
+        let legacy_key = legacy
+            .verify_password(b"correct password")
+            .unwrap()
+            .unwrap();
+        let provider = VaultManager::new()
+            .registry()
+            .resolve("local", root)
+            .unwrap();
+        let session =
+            VaultSession::from_master_key(creation.config, legacy_key, provider, VaultTree::new())
+                .unwrap();
+        runtime::get_runtime()
+            .unwrap()
+            .block_on(session.save_tree())
+            .unwrap();
+        drop(session);
+        std::fs::write(
+            directory.path().join("vault.config"),
+            legacy.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+        let password = CString::new("correct password").unwrap();
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        assert_eq!(
+            unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
             0
         );
-        // A 1.1 vault already has recovery material; none is generated.
-        assert!(axiom_vault_take_migration_recovery_words().is_null());
+        let words = axiom_vault_take_migration_recovery_words();
+        assert!(!words.is_null(), "a 1.0 migration generates recovery words");
+        // SAFETY: `words` was just returned by `axiom_vault_take_migration_recovery_words`.
+        unsafe { axiom_recovery_words_free(words) };
         let migrated =
             VaultConfig::from_bytes(&std::fs::read(directory.path().join("vault.config")).unwrap())
                 .unwrap();
         assert_eq!(migrated.version, VaultVersion::CURRENT);
+        assert!(migrated.config_mac.is_some());
         assert!(directory.path().join("m/generation.manifest").exists());
 
         // SAFETY: both pointers are valid NUL-terminated strings for this call.

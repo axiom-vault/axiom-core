@@ -657,16 +657,14 @@ impl VaultConfig {
     ///
     /// The tag is keyed by the master key, so this runs after unlock and before
     /// anything is written or rewrapped. A `CURRENT` config must carry a tag.
-    /// A 1.1 config written before M-1 has none, and nothing tells it from a
-    /// 2.0 config stripped and relabelled, so it is accepted untagged only
-    /// where `authenticated_otherwise`: a sealed manifest binds these bytes,
-    /// or the caller checked the password and the recovery fields against the
-    /// master key. Recovery checks neither and passes `false`. Any tag present
-    /// must verify.
+    /// Nothing tells an untagged 1.1 config from a 2.0 config stripped and
+    /// relabelled, so it is accepted only where `bound_by_manifest`: a sealed
+    /// manifest binds these bytes. Every 1.1 config this code writes (the
+    /// registry's 1.0 -> 1.1 step) is tagged. Any tag present must verify.
     pub(crate) fn verify_integrity(
         &mut self,
         master_key: &MasterKey,
-        authenticated_otherwise: bool,
+        bound_by_manifest: bool,
     ) -> Result<()> {
         let Some(tag) = self.config_mac.take() else {
             if self.version.major >= VaultVersion::CURRENT.major {
@@ -676,11 +674,11 @@ impl VaultConfig {
                     self.version
                 )));
             }
-            if !authenticated_otherwise && self.version >= VaultVersion::V1_1 {
+            if !bound_by_manifest && self.version >= VaultVersion::V1_1 {
                 return Err(Error::Crypto(format!(
                     "{CONFIG_FILENAME} is not authenticated: a {} config with no integrity tag \
-                     (config_mac) and no snapshot manifest is refused; upgrade it with the \
-                     password (`axiom vault migrate`) first",
+                     (config_mac) and no snapshot manifest is refused; it must be written by \
+                     `axiom vault migrate` or recovered from a tagged config",
                     self.version
                 )));
             }
@@ -697,11 +695,11 @@ impl VaultConfig {
     }
 }
 
-/// The refusal of an untagged 1.1 config that nothing else authenticates.
+/// The refusal of an untagged 1.1 config that no manifest binds.
 #[cfg(test)]
 pub(crate) const UNAUTHENTICATED_V1_1: &str = "Cryptographic error: vault.config is not \
     authenticated: a 1.1 config with no integrity tag (config_mac) and no snapshot manifest is \
-    refused; upgrade it with the password (`axiom vault migrate`) first";
+    refused; it must be written by `axiom vault migrate` or recovered from a tagged config";
 
 /// Configuration file name in vault root.
 pub const CONFIG_FILENAME: &str = "vault.config";
@@ -812,20 +810,19 @@ mod tests {
     }
 
     #[test]
-    fn untagged_config_is_refused_unless_a_1_1_config_is_authenticated_otherwise() {
+    fn untagged_config_is_refused_unless_a_manifest_binds_a_1_1_config() {
         let (mut config, master_key) = tagged_config();
-        for authenticated_otherwise in [false, true] {
+        for bound_by_manifest in [false, true] {
             let error = config
                 .clone()
-                .verify_integrity(&master_key, authenticated_otherwise)
+                .verify_integrity(&master_key, bound_by_manifest)
                 .unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "Cryptographic error: vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused"
             );
         }
-        // A 1.1 config may predate the tag: it is accepted only where a
-        // manifest or the password path authenticates it.
+        // An untagged 1.1 config is accepted only where a manifest binds it.
         config.version = VaultVersion::V1_1;
         config.clone().verify_integrity(&master_key, true).unwrap();
         assert_eq!(
