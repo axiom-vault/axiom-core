@@ -7,6 +7,11 @@
 //! The shard map is stored redundantly on every backend at a well-known path
 //! (`.axiomvault/shard_map.json`), versioned with a monotonic counter, and
 //! updated atomically via write-then-rename.
+//!
+//! Each stored copy is `MAP_MAGIC || tag || json`, where `tag` is a keyed
+//! BLAKE2b-256 MAC over the JSON under the [`CompositeKey`]. A backend cannot
+//! compute it, so a copy it forged or edited fails to load and is skipped; the
+//! merge only ever sees maps the key holder wrote (M-16).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
+use crate::composite::auth::{DOMAIN_SHARD_MAP, TAG_LEN};
+use crate::composite::CompositeKey;
 use crate::provider::StorageProvider;
 use axiomvault_common::{Error, Result, VaultPath};
 
@@ -25,6 +32,9 @@ const SHARD_MAP_TMP_PATH: &str = ".axiomvault/shard_map.json.tmp";
 
 /// Directory that must exist before writing the shard map.
 const SHARD_MAP_DIR: &str = ".axiomvault";
+
+/// Leading bytes of an authenticated shard map file.
+const MAP_MAGIC: &[u8; 8] = b"AXSMAP\x00\x02";
 
 /// Encoding parameters for a chunk's erasure coding scheme.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +64,15 @@ pub struct ShardLocation {
 pub struct ChunkEntry {
     /// Original size of the data before encoding.
     pub original_size: u64,
+    /// Random identifier of the write that produced this object's shards.
+    ///
+    /// Every shard tag binds it, so a shard from an earlier write of the same
+    /// path, or from another object, does not verify against this entry.
+    pub object_id: [u8; 16],
+    /// Mirror mode: keyed tag over `object_id`, `original_size` and the
+    /// content every copy must hold. `None` in erasure mode, where each shard
+    /// carries its own tag.
+    pub mirror_tag: Option<[u8; TAG_LEN]>,
     /// Erasure coding parameters (None for mirror mode).
     pub erasure_params: Option<ErasureParams>,
     /// Shard locations keyed by shard index.
@@ -161,8 +180,40 @@ impl ShardMap {
             .map_err(|e| Error::Serialization(format!("Failed to deserialize shard map: {}", e)))
     }
 
+    /// Serialize with the authentication envelope: `MAP_MAGIC || tag || json`.
+    pub(crate) fn to_authenticated(&self, key: &CompositeKey) -> Result<Vec<u8>> {
+        let json = self.to_json()?;
+        let tag = key.tag(DOMAIN_SHARD_MAP, &[&json]);
+        let mut out = Vec::with_capacity(MAP_MAGIC.len() + TAG_LEN + json.len());
+        out.extend_from_slice(MAP_MAGIC);
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&json);
+        Ok(out)
+    }
+
+    /// Check the envelope's tag under `key`, then parse. Untagged, truncated
+    /// or edited bytes are refused.
+    pub(crate) fn from_authenticated(data: &[u8], key: &CompositeKey) -> Result<Self> {
+        let header = MAP_MAGIC.len() + TAG_LEN;
+        if data.len() < header || &data[..MAP_MAGIC.len()] != MAP_MAGIC {
+            return Err(Error::Crypto(
+                "shard map is not authenticated (missing or unknown envelope)".into(),
+            ));
+        }
+        let (tag, json) = (&data[MAP_MAGIC.len()..header], &data[header..]);
+        if !key.verify(DOMAIN_SHARD_MAP, &[json], tag) {
+            return Err(Error::Crypto(
+                "shard map authentication failed: the stored copy was not written with this key"
+                    .into(),
+            ));
+        }
+        Self::from_json(json)
+    }
+
     /// Merge another shard map into this one.
     ///
+    /// Both maps must already be authenticated (see `load_from_all`), so every
+    /// timestamp compared here was written by the key holder, not a backend.
     /// For each chunk entry, the entry with the newer `updated_at` timestamp wins.
     /// Tombstones are merged (newest per path wins) and suppress resurrection of
     /// deleted entries. The resulting version is the maximum of both versions plus one.
@@ -208,8 +259,17 @@ impl ShardMap {
         self.updated_at = Utc::now();
     }
 
-    /// Save the shard map to a single backend atomically (write temp, then rename).
-    pub async fn save_to_backend(&self, backend: &dyn StorageProvider) -> Result<()> {
+    /// Save the shard map, tagged under `key`, to a single backend atomically
+    /// (write temp, then rename).
+    pub async fn save_to_backend(
+        &self,
+        backend: &dyn StorageProvider,
+        key: &CompositeKey,
+    ) -> Result<()> {
+        Self::upload_atomic(backend, self.to_authenticated(key)?).await
+    }
+
+    async fn upload_atomic(backend: &dyn StorageProvider, data: Vec<u8>) -> Result<()> {
         let dir_path = VaultPath::parse(SHARD_MAP_DIR)?;
         let tmp_path = VaultPath::parse(SHARD_MAP_TMP_PATH)?;
         let final_path = VaultPath::parse(SHARD_MAP_PATH)?;
@@ -218,8 +278,6 @@ impl ShardMap {
         if !backend.exists(&dir_path).await.unwrap_or(false) {
             backend.create_dir(&dir_path).await?;
         }
-
-        let data = self.to_json()?;
 
         // Write to temp path first (overwrite any leftover tmp from a previous attempt)
         if backend.exists(&tmp_path).await.unwrap_or(false) {
@@ -245,18 +303,23 @@ impl ShardMap {
     ///
     /// Tolerates partial failures — warns but continues if some backends fail.
     /// Returns error only if ALL backends fail.
-    pub async fn save_to_all(&self, backends: &[Arc<dyn StorageProvider>]) -> Result<()> {
+    pub async fn save_to_all(
+        &self,
+        backends: &[Arc<dyn StorageProvider>],
+        key: &CompositeKey,
+    ) -> Result<()> {
+        let data = self.to_authenticated(key)?;
         let futures: Vec<_> = backends
             .iter()
             .enumerate()
             .map(|(i, backend)| {
                 let backend = Arc::clone(backend);
-                let map = self.clone();
+                let data = data.clone();
                 async move {
                     (
                         i,
                         backend.name().to_string(),
-                        map.save_to_backend(backend.as_ref()).await,
+                        Self::upload_atomic(backend.as_ref(), data).await,
                     )
                 }
             })
@@ -291,13 +354,17 @@ impl ShardMap {
         }
     }
 
-    /// Load shard map from a single backend. Returns `None` if not found.
-    pub async fn load_from_backend(backend: &dyn StorageProvider) -> Result<Option<ShardMap>> {
+    /// Load shard map from a single backend. Returns `None` if not found and
+    /// an error if the stored copy does not authenticate under `key`.
+    pub async fn load_from_backend(
+        backend: &dyn StorageProvider,
+        key: &CompositeKey,
+    ) -> Result<Option<ShardMap>> {
         let path = VaultPath::parse(SHARD_MAP_PATH)?;
 
         match backend.download(&path).await {
             Ok(data) => {
-                let map = Self::from_json(&data)?;
+                let map = Self::from_authenticated(&data, key)?;
                 Ok(Some(map))
             }
             Err(Error::NotFound(_)) => Ok(None),
@@ -309,19 +376,24 @@ impl ShardMap {
     ///
     /// Fetches the shard map from each backend, then merges them using
     /// per-entry latest-timestamp-wins semantics. The resulting version is the
-    /// maximum found across all backends plus one.
+    /// maximum found across all backends plus one. A copy that fails
+    /// authentication counts as an error for its backend and is not merged,
+    /// so a backend cannot redirect lookups by publishing newer timestamps.
     ///
     /// Returns a new empty shard map if no backend has a stored map and none errored.
     /// Returns an error if no actual map was loaded (`Ok(Some(_))`) AND at least one
     /// backend returned an error. `Ok(None)` (not found) does not suppress errors
     /// from other backends.
-    pub async fn load_from_all(backends: &[Arc<dyn StorageProvider>]) -> Result<ShardMap> {
+    pub async fn load_from_all(
+        backends: &[Arc<dyn StorageProvider>],
+        key: &CompositeKey,
+    ) -> Result<ShardMap> {
         let mut merged = ShardMap::new();
         let mut found_any = false;
         let mut last_error: Option<Error> = None;
 
         for (i, backend) in backends.iter().enumerate() {
-            match Self::load_from_backend(backend.as_ref()).await {
+            match Self::load_from_backend(backend.as_ref(), key).await {
                 Ok(Some(map)) => {
                     if !found_any {
                         merged = map;
@@ -364,6 +436,8 @@ impl ShardMap {
     pub fn mirror_entry(
         path: &str,
         original_size: u64,
+        object_id: [u8; 16],
+        mirror_tag: [u8; TAG_LEN],
         backends: &[Arc<dyn StorageProvider>],
         succeeded: Option<&[usize]>,
     ) -> ChunkEntry {
@@ -390,6 +464,8 @@ impl ShardMap {
         }
         ChunkEntry {
             original_size,
+            object_id,
+            mirror_tag: Some(mirror_tag),
             erasure_params: None,
             shards,
             updated_at: Utc::now(),
@@ -404,6 +480,7 @@ impl ShardMap {
     pub fn erasure_entry(
         path: &str,
         original_size: u64,
+        object_id: [u8; 16],
         data_shards: usize,
         parity_shards: usize,
         backends: &[Arc<dyn StorageProvider>],
@@ -433,6 +510,8 @@ impl ShardMap {
         }
         ChunkEntry {
             original_size,
+            object_id,
+            mirror_tag: None,
             erasure_params: Some(ErasureParams {
                 data_shards,
                 parity_shards,
@@ -453,6 +532,10 @@ impl Default for ShardMap {
 mod tests {
     use super::*;
     use crate::memory::MemoryProvider;
+
+    fn key() -> CompositeKey {
+        CompositeKey::from_bytes([7u8; 32])
+    }
 
     fn make_backends(n: usize) -> Vec<Arc<dyn StorageProvider>> {
         (0..n)
@@ -476,6 +559,8 @@ mod tests {
         let mut map = ShardMap::new();
         let entry = ChunkEntry {
             original_size: 1024,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: Some(ErasureParams {
                 data_shards: 3,
                 parity_shards: 2,
@@ -519,7 +604,8 @@ mod tests {
     #[test]
     fn test_mirror_entry_roundtrip() {
         let backends = make_backends(3);
-        let entry = ShardMap::mirror_entry("/data/file.enc", 512, &backends, None);
+        let entry =
+            ShardMap::mirror_entry("/data/file.enc", 512, [0; 16], [0; 32], &backends, None);
 
         assert!(entry.erasure_params.is_none());
         assert_eq!(entry.original_size, 512);
@@ -542,7 +628,7 @@ mod tests {
     #[test]
     fn test_erasure_entry_roundtrip() {
         let backends = make_backends(5);
-        let entry = ShardMap::erasure_entry("/data/file.enc", 2048, 3, 2, &backends, None);
+        let entry = ShardMap::erasure_entry("/data/file.enc", 2048, [0; 16], 3, 2, &backends, None);
 
         assert_eq!(
             entry.erasure_params,
@@ -575,10 +661,16 @@ mod tests {
         assert_eq!(map.version, 0);
 
         let backends = make_backends(2);
-        map.insert("/a", ShardMap::mirror_entry("/a", 100, &backends, None));
+        map.insert(
+            "/a",
+            ShardMap::mirror_entry("/a", 100, [0; 16], [0; 32], &backends, None),
+        );
         assert_eq!(map.version, 1);
 
-        map.insert("/b", ShardMap::mirror_entry("/b", 200, &backends, None));
+        map.insert(
+            "/b",
+            ShardMap::mirror_entry("/b", 200, [0; 16], [0; 32], &backends, None),
+        );
         assert_eq!(map.version, 2);
     }
 
@@ -586,7 +678,10 @@ mod tests {
     fn test_remove_always_records_tombstone() {
         let mut map = ShardMap::new();
         let backends = make_backends(2);
-        map.insert("/a", ShardMap::mirror_entry("/a", 100, &backends, None));
+        map.insert(
+            "/a",
+            ShardMap::mirror_entry("/a", 100, [0; 16], [0; 32], &backends, None),
+        );
         assert_eq!(map.version, 1);
 
         // Remove nonexistent — still bumps version and records tombstone
@@ -607,7 +702,7 @@ mod tests {
         let backends = make_backends(5);
         map.insert(
             "/data/old.enc",
-            ShardMap::erasure_entry("/data/old.enc", 1024, 3, 2, &backends, None),
+            ShardMap::erasure_entry("/data/old.enc", 1024, [0; 16], 3, 2, &backends, None),
         );
 
         let renamed = map.rename("/data/old.enc", "/data/new.enc");
@@ -636,10 +731,16 @@ mod tests {
     fn test_merge_union_of_entries() {
         let backends = make_backends(2);
         let mut map_a = ShardMap::new();
-        map_a.insert("/a", ShardMap::mirror_entry("/a", 100, &backends, None));
+        map_a.insert(
+            "/a",
+            ShardMap::mirror_entry("/a", 100, [0; 16], [0; 32], &backends, None),
+        );
 
         let mut map_b = ShardMap::new();
-        map_b.insert("/b", ShardMap::mirror_entry("/b", 200, &backends, None));
+        map_b.insert(
+            "/b",
+            ShardMap::mirror_entry("/b", 200, [0; 16], [0; 32], &backends, None),
+        );
 
         map_a.merge(&map_b);
 
@@ -655,6 +756,8 @@ mod tests {
         let mut map_a = ShardMap::new();
         let old_entry = ChunkEntry {
             original_size: 100,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: Utc::now() - chrono::Duration::seconds(10),
@@ -663,7 +766,7 @@ mod tests {
         map_a.version = 1;
 
         let mut map_b = ShardMap::new();
-        let new_entry = ShardMap::mirror_entry("/file", 200, &backends, None);
+        let new_entry = ShardMap::mirror_entry("/file", 200, [0; 16], [0; 32], &backends, None);
         map_b.entries.insert("/file".to_string(), new_entry);
         map_b.version = 2;
 
@@ -678,13 +781,15 @@ mod tests {
         let backends = make_backends(2);
 
         let mut map_a = ShardMap::new();
-        let new_entry = ShardMap::mirror_entry("/file", 300, &backends, None);
+        let new_entry = ShardMap::mirror_entry("/file", 300, [0; 16], [0; 32], &backends, None);
         map_a.entries.insert("/file".to_string(), new_entry);
         map_a.version = 5;
 
         let mut map_b = ShardMap::new();
         let old_entry = ChunkEntry {
             original_size: 100,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: Utc::now() - chrono::Duration::seconds(60),
@@ -720,12 +825,12 @@ mod tests {
         let mut map = ShardMap::new();
         map.insert(
             "/test",
-            ShardMap::mirror_entry("/test", 42, &backends, None),
+            ShardMap::mirror_entry("/test", 42, [0; 16], [0; 32], &backends, None),
         );
 
-        map.save_to_backend(backend.as_ref()).await.unwrap();
+        map.save_to_backend(backend.as_ref(), &key()).await.unwrap();
 
-        let loaded = ShardMap::load_from_backend(backend.as_ref())
+        let loaded = ShardMap::load_from_backend(backend.as_ref(), &key())
             .await
             .unwrap()
             .expect("shard map should exist");
@@ -736,7 +841,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_returns_none_when_missing() {
         let backend = Arc::new(MemoryProvider::new());
-        let loaded = ShardMap::load_from_backend(backend.as_ref()).await.unwrap();
+        let loaded = ShardMap::load_from_backend(backend.as_ref(), &key())
+            .await
+            .unwrap();
         assert!(loaded.is_none());
     }
 
@@ -747,14 +854,14 @@ mod tests {
         let mut map = ShardMap::new();
         map.insert(
             "/data/chunk1",
-            ShardMap::mirror_entry("/data/chunk1", 100, &backends, None),
+            ShardMap::mirror_entry("/data/chunk1", 100, [0; 16], [0; 32], &backends, None),
         );
 
-        map.save_to_all(&backends).await.unwrap();
+        map.save_to_all(&backends, &key()).await.unwrap();
 
         // Verify each backend has the shard map
         for backend in &backends {
-            let loaded = ShardMap::load_from_backend(backend.as_ref())
+            let loaded = ShardMap::load_from_backend(backend.as_ref(), &key())
                 .await
                 .unwrap()
                 .expect("shard map should exist on each backend");
@@ -769,17 +876,29 @@ mod tests {
 
         // Backend 0 has entry A
         let mut map_0 = ShardMap::new();
-        map_0.insert("/a", ShardMap::mirror_entry("/a", 100, &backends, None));
-        map_0.save_to_backend(backends[0].as_ref()).await.unwrap();
+        map_0.insert(
+            "/a",
+            ShardMap::mirror_entry("/a", 100, [0; 16], [0; 32], &backends, None),
+        );
+        map_0
+            .save_to_backend(backends[0].as_ref(), &key())
+            .await
+            .unwrap();
 
         // Backend 1 has entry B
         let mut map_1 = ShardMap::new();
-        map_1.insert("/b", ShardMap::mirror_entry("/b", 200, &backends, None));
-        map_1.save_to_backend(backends[1].as_ref()).await.unwrap();
+        map_1.insert(
+            "/b",
+            ShardMap::mirror_entry("/b", 200, [0; 16], [0; 32], &backends, None),
+        );
+        map_1
+            .save_to_backend(backends[1].as_ref(), &key())
+            .await
+            .unwrap();
 
         // Backend 2 has no shard map
 
-        let merged = ShardMap::load_from_all(&backends).await.unwrap();
+        let merged = ShardMap::load_from_all(&backends, &key()).await.unwrap();
 
         // Should have union of entries
         assert!(merged.get("/a").is_some());
@@ -790,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_from_all_with_no_maps() {
         let backends = make_backends(3);
-        let map = ShardMap::load_from_all(&backends).await.unwrap();
+        let map = ShardMap::load_from_all(&backends, &key()).await.unwrap();
         assert_eq!(map.version, 0);
         assert!(map.entries.is_empty());
     }
@@ -802,9 +921,16 @@ mod tests {
         let mut map = ShardMap::new();
         map.insert(
             "/test",
-            ShardMap::mirror_entry("/test", 42, std::slice::from_ref(&backend), None),
+            ShardMap::mirror_entry(
+                "/test",
+                42,
+                [0; 16],
+                [0; 32],
+                std::slice::from_ref(&backend),
+                None,
+            ),
         );
-        map.save_to_backend(backend.as_ref()).await.unwrap();
+        map.save_to_backend(backend.as_ref(), &key()).await.unwrap();
 
         // Temp file should not exist after atomic rename
         let tmp_path = VaultPath::parse(SHARD_MAP_TMP_PATH).unwrap();
@@ -824,27 +950,37 @@ mod tests {
         map_old.version = 4; // will become 5 after insert
         let old_entry = ChunkEntry {
             original_size: 100,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: Utc::now() - chrono::Duration::seconds(30),
         };
         map_old.entries.insert("/x".to_string(), old_entry);
         map_old.version = 5;
-        map_old.save_to_backend(backends[0].as_ref()).await.unwrap();
+        map_old
+            .save_to_backend(backends[0].as_ref(), &key())
+            .await
+            .unwrap();
 
         // Backend 1: version 8, file X with size 200
         let mut map_new = ShardMap::new();
         let new_entry = ChunkEntry {
             original_size: 200,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: Utc::now(),
         };
         map_new.entries.insert("/x".to_string(), new_entry);
         map_new.version = 8;
-        map_new.save_to_backend(backends[1].as_ref()).await.unwrap();
+        map_new
+            .save_to_backend(backends[1].as_ref(), &key())
+            .await
+            .unwrap();
 
-        let merged = ShardMap::load_from_all(&backends).await.unwrap();
+        let merged = ShardMap::load_from_all(&backends, &key()).await.unwrap();
 
         // Newer entry (size 200) should win
         assert_eq!(merged.get("/x").unwrap().original_size, 200);
@@ -859,6 +995,25 @@ mod tests {
         let result = ShardMap::from_json(b"not valid json");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("deserialize"));
+    }
+
+    #[test]
+    fn test_envelope_refuses_edits_wrong_key_and_bare_json() {
+        let backends = make_backends(2);
+        let mut map = ShardMap::new();
+        map.insert(
+            "/a",
+            ShardMap::mirror_entry("/a", 1, [0; 16], [0; 32], &backends, None),
+        );
+        let sealed = map.to_authenticated(&key()).unwrap();
+        assert!(ShardMap::from_authenticated(&sealed, &key()).is_ok());
+
+        let mut edited = sealed.clone();
+        *edited.last_mut().unwrap() ^= 1;
+        assert!(ShardMap::from_authenticated(&edited, &key()).is_err());
+        let other = CompositeKey::from_bytes([8u8; 32]);
+        assert!(ShardMap::from_authenticated(&sealed, &other).is_err());
+        assert!(ShardMap::from_authenticated(&map.to_json().unwrap(), &key()).is_err());
     }
 
     #[test]
@@ -883,7 +1038,7 @@ mod tests {
             .unwrap();
 
         let backends: Vec<Arc<dyn StorageProvider>> = vec![backend];
-        let result = ShardMap::load_from_all(&backends).await;
+        let result = ShardMap::load_from_all(&backends, &key()).await;
         assert!(
             result.is_err(),
             "Expected error when all backends return corrupt data"
@@ -896,7 +1051,10 @@ mod tests {
         // Map B still has X (older timestamp). Merge B into A → X stays deleted.
         let backends = make_backends(2);
         let mut map_a = ShardMap::new();
-        map_a.insert("/x", ShardMap::mirror_entry("/x", 100, &backends, None));
+        map_a.insert(
+            "/x",
+            ShardMap::mirror_entry("/x", 100, [0; 16], [0; 32], &backends, None),
+        );
         map_a.remove("/x");
         assert!(map_a.get("/x").is_none());
         assert!(map_a.tombstones.contains_key("/x"));
@@ -906,6 +1064,8 @@ mod tests {
         let old_ts = Utc::now() - chrono::Duration::seconds(60);
         let old_entry = ChunkEntry {
             original_size: 100,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: old_ts,
@@ -927,7 +1087,10 @@ mod tests {
         // Merge B into A → X is present (newer entry wins over tombstone).
         let backends = make_backends(2);
         let mut map_a = ShardMap::new();
-        map_a.insert("/x", ShardMap::mirror_entry("/x", 100, &backends, None));
+        map_a.insert(
+            "/x",
+            ShardMap::mirror_entry("/x", 100, [0; 16], [0; 32], &backends, None),
+        );
         map_a.remove("/x");
         assert!(map_a.tombstones.contains_key("/x"));
 
@@ -936,6 +1099,8 @@ mod tests {
         let future_ts = Utc::now() + chrono::Duration::seconds(60);
         let new_entry = ChunkEntry {
             original_size: 200,
+            object_id: [0; 16],
+            mirror_tag: None,
             erasure_params: None,
             shards: HashMap::new(),
             updated_at: future_ts,

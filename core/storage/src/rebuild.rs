@@ -5,6 +5,9 @@
 //! whole chunks from a healthy peer; in erasure mode it reconstructs the
 //! specific missing shard from the remaining shards via Reed-Solomon.
 //!
+//! Every source copy or shard is checked against its tag in the authenticated
+//! shard map before it is used; one that fails is skipped, never copied.
+//!
 //! Rebuilds are incremental (existing data is skipped) and resumable
 //! (re-running the rebuild picks up where it left off). A persistent
 //! checkpoint is saved periodically so that a crashed rebuild can resume
@@ -22,6 +25,7 @@ use tracing::{info, warn};
 
 use crate::composite::{CompositeStorageProvider, RaidMode};
 use crate::provider::StorageProvider;
+use crate::shard_map::ChunkEntry;
 use axiomvault_common::{Error, Result, VaultPath};
 
 /// Well-known path for the rebuild checkpoint file on the target backend.
@@ -312,7 +316,7 @@ impl<'a> RaidRebuilder<'a> {
                 .unwrap_or_else(|| RebuildCheckpoint::new(target_index, RaidMode::Mirror));
 
         // Build a list of (path, source_backend_index) for chunks that are missing on target.
-        let mut work_items: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut work_items: Vec<(String, ChunkEntry, Vec<usize>)> = Vec::new();
         let mut skipped = 0usize;
 
         for (path, _) in &entries {
@@ -344,16 +348,19 @@ impl<'a> RaidRebuilder<'a> {
                             }
                         }
                     }
-                    if candidates.is_empty() {
-                        let mut p = progress.write().await;
-                        p.failed += 1;
-                        self.notify_progress().await;
-                        warn!(
-                            path = path.as_str(),
-                            "Mirror rebuild: no source backend available"
-                        );
-                    } else {
-                        work_items.push((path.clone(), candidates));
+                    match shard_map.get(path) {
+                        Some(entry) if !candidates.is_empty() => {
+                            work_items.push((path.clone(), entry.clone(), candidates));
+                        }
+                        _ => {
+                            let mut p = progress.write().await;
+                            p.failed += 1;
+                            self.notify_progress().await;
+                            warn!(
+                                path = path.as_str(),
+                                "Mirror rebuild: no source backend available"
+                            );
+                        }
                     }
                 }
             }
@@ -374,11 +381,11 @@ impl<'a> RaidRebuilder<'a> {
         let items_since_checkpoint = Arc::new(RwLock::new(0usize));
 
         let results: Vec<(String, bool)> = stream::iter(work_items)
-            .map(|(path, candidates)| {
+            .map(|(path, entry, candidates)| {
                 let progress = Arc::clone(&progress);
                 async move {
                     let result =
-                        Self::copy_chunk(composite.backends(), &candidates, target_index, &path)
+                        Self::copy_chunk(composite, &candidates, target_index, &path, &entry)
                             .await;
                     let mut p = progress.write().await;
                     match result {
@@ -494,20 +501,33 @@ impl<'a> RaidRebuilder<'a> {
     }
 
     /// Copy a single chunk from one of the source backends to the target.
-    /// Tries each candidate in order; returns Ok on first successful copy.
+    /// Tries each candidate in order; returns Ok on the first copy that
+    /// verifies against `entry`. A copy that fails its tag is never uploaded.
     async fn copy_chunk(
-        backends: &[Arc<dyn StorageProvider>],
+        composite: &CompositeStorageProvider,
         source_indexes: &[usize],
         target_index: usize,
         path: &str,
+        entry: &ChunkEntry,
     ) -> Result<()> {
+        let backends = composite.backends();
         let vault_path = VaultPath::parse(path)?;
         let mut last_err = None;
         for &src in source_indexes {
             match backends[src].download(&vault_path).await {
-                Ok(data) => {
+                Ok(data) if composite.verify_mirror_copy(entry, &data) => {
                     backends[target_index].upload(&vault_path, data).await?;
                     return Ok(());
+                }
+                Ok(_) => {
+                    warn!(
+                        source = src,
+                        path, "Mirror rebuild: source copy failed authentication, skipping it"
+                    );
+                    last_err = Some(Error::Crypto(format!(
+                        "Mirror rebuild: copy of '{}' on backend {} failed authentication",
+                        path, src
+                    )));
                 }
                 Err(e) => {
                     warn!(source = src, path, error = %e, "Mirror rebuild: download failed, trying next candidate");
@@ -532,7 +552,7 @@ impl<'a> RaidRebuilder<'a> {
         };
 
         // Collect entries where the target backend's shard is missing.
-        let entries: Vec<(String, crate::shard_map::ChunkEntry)> = shard_map
+        let entries: Vec<(String, ChunkEntry)> = shard_map
             .entries
             .iter()
             .map(|(p, e)| (p.clone(), e.clone()))
@@ -564,7 +584,7 @@ impl<'a> RaidRebuilder<'a> {
             .unwrap_or_else(|| RebuildCheckpoint::new(target_index, mode));
 
         // Determine which entries need rebuilding.
-        let mut work_items: Vec<(String, crate::shard_map::ChunkEntry)> = Vec::new();
+        let mut work_items: Vec<(String, ChunkEntry)> = Vec::new();
         let mut skipped = 0usize;
 
         for (path, entry) in &entries {
@@ -607,7 +627,7 @@ impl<'a> RaidRebuilder<'a> {
                         composite,
                         target_index,
                         &path,
-                        entry.original_size,
+                        &entry,
                         data_shards,
                         total_shards,
                     )
@@ -731,13 +751,14 @@ impl<'a> RaidRebuilder<'a> {
 
     /// Reconstruct a single missing shard for an erasure-coded chunk.
     ///
-    /// Downloads available shards from peers, reconstructs via Reed-Solomon,
-    /// and uploads the missing shard (with CRC header) to the target backend.
+    /// Downloads available shards from peers, keeps only those that verify
+    /// against `entry`, reconstructs via Reed-Solomon, and uploads the missing
+    /// shard, tagged for the target's index, to the target backend.
     async fn rebuild_erasure_shard(
         composite: &CompositeStorageProvider,
         target_index: usize,
         path: &str,
-        original_size: u64,
+        entry: &ChunkEntry,
         data_shards: usize,
         total_shards: usize,
     ) -> Result<()> {
@@ -755,20 +776,13 @@ impl<'a> RaidRebuilder<'a> {
             let shard_path = CompositeStorageProvider::shard_path(&vault_path, i)?;
             match backends[i].download(&shard_path).await {
                 Ok(payload) => {
-                    if payload.len() < 12 {
-                        warn!(shard = i, path, "Rebuild: shard too short, skipping");
+                    let Some(shard_data) = composite.open_shard(entry, i, &payload) else {
+                        warn!(
+                            shard = i,
+                            path, "Rebuild: shard failed authentication, skipping it"
+                        );
                         continue;
-                    }
-                    let stored_crc = u32::from_le_bytes(payload[..4].try_into().unwrap());
-                    let shard_data = &payload[12..];
-
-                    // Verify CRC-32 integrity.
-                    let computed_crc = crc32fast::hash(shard_data);
-                    if stored_crc != computed_crc {
-                        warn!(shard = i, path, "Rebuild: CRC mismatch, skipping shard");
-                        continue;
-                    }
-
+                    };
                     shard_opts[i] = Some(shard_data.to_vec());
                     available += 1;
                 }
@@ -798,12 +812,12 @@ impl<'a> RaidRebuilder<'a> {
             ))
         })?;
 
-        // Build the shard payload with CRC header.
-        let crc = crc32fast::hash(rebuilt_shard);
-        let mut payload = Vec::with_capacity(4 + 8 + rebuilt_shard.len());
-        payload.extend_from_slice(&crc.to_le_bytes());
-        payload.extend_from_slice(&original_size.to_le_bytes());
-        payload.extend_from_slice(rebuilt_shard);
+        let payload = composite.seal_shard(
+            &entry.object_id,
+            target_index,
+            entry.original_size,
+            rebuilt_shard,
+        )?;
 
         // Upload to target backend.
         let shard_path = CompositeStorageProvider::shard_path(&vault_path, target_index)?;
@@ -821,7 +835,15 @@ impl<'a> RaidRebuilder<'a> {
 mod tests {
     use super::*;
     use crate::composite::CompositeConfig;
+    use crate::composite::CompositeKey;
     use crate::memory::MemoryProvider;
+
+    fn new_composite(
+        backends: Vec<Arc<dyn StorageProvider>>,
+        config: CompositeConfig,
+    ) -> Result<CompositeStorageProvider> {
+        CompositeStorageProvider::new(backends, config, CompositeKey::from_bytes([0x42; 32]))
+    }
 
     fn make_mirror_composite(
         n: usize,
@@ -833,8 +855,7 @@ mod tests {
             mode: RaidMode::Mirror,
             health: Default::default(),
         };
-        let composite =
-            CompositeStorageProvider::new(backends.clone(), config).expect("mirror composite");
+        let composite = new_composite(backends.clone(), config).expect("mirror composite");
         (composite, backends)
     }
 
@@ -853,8 +874,7 @@ mod tests {
             },
             health: Default::default(),
         };
-        let composite =
-            CompositeStorageProvider::new(backends.clone(), config).expect("erasure composite");
+        let composite = new_composite(backends.clone(), config).expect("erasure composite");
         (composite, backends)
     }
 
@@ -1288,8 +1308,7 @@ mod tests {
             mode: RaidMode::Mirror,
             health: Default::default(),
         };
-        let composite =
-            CompositeStorageProvider::new(backends.clone(), config.clone()).expect("composite");
+        let composite = new_composite(backends.clone(), config.clone()).expect("composite");
 
         // 2. Upload several chunks.
         upload_file(&composite, "/doc1.enc", b"document one").await;
@@ -1308,8 +1327,7 @@ mod tests {
         let new_backend: Arc<dyn StorageProvider> = Arc::new(MemoryProvider::new());
         let mut new_backends = backends.clone();
         new_backends[1] = new_backend.clone();
-        let composite2 =
-            CompositeStorageProvider::new(new_backends.clone(), config).expect("composite2");
+        let composite2 = new_composite(new_backends.clone(), config).expect("composite2");
 
         // Manually load the shard map from the surviving backends.
         composite2.load_shard_map().await.unwrap();

@@ -3,11 +3,13 @@
 //! Wraps N `StorageProvider` backends behind the `StorageProvider` trait,
 //! delegating operations according to the configured RAID mode.
 
+pub(crate) mod auth;
 mod config;
 mod erasure;
 mod fanout;
 mod health;
 
+pub use auth::CompositeKey;
 pub use config::{CompositeConfig, RaidMode};
 
 #[cfg(test)]
@@ -24,7 +26,8 @@ use tracing::warn;
 
 use crate::health::ProviderHealth;
 use crate::provider::{ByteStream, Metadata, StorageProvider};
-use crate::shard_map::ShardMap;
+use crate::shard_map::{ChunkEntry, ShardMap};
+use auth::{DOMAIN_MIRROR, TAG_LEN};
 use axiomvault_common::{Error, Result, VaultPath};
 
 /// A storage provider that distributes operations across multiple backends.
@@ -32,9 +35,15 @@ use axiomvault_common::{Error, Result, VaultPath};
 /// In mirror mode, writes fan out to all backends and reads return the first
 /// successful result. In erasure mode, chunks are sharded via Reed-Solomon
 /// coding across backends.
+///
+/// The backends are not trusted with integrity: the shard map and every
+/// shard or mirror copy are authenticated under a [`CompositeKey`] they do
+/// not hold, and anything that fails its tag is treated as missing.
 pub struct CompositeStorageProvider {
     pub(crate) backends: Vec<Arc<dyn StorageProvider>>,
     pub(crate) config: CompositeConfig,
+    /// Key for the shard map and shard tags; never given to a backend.
+    pub(crate) key: CompositeKey,
     /// Cached Reed-Solomon encoder, created once for erasure mode.
     pub(crate) reed_solomon: Option<ReedSolomon>,
     /// Persistent shard map tracking chunk-to-backend mappings.
@@ -46,12 +55,19 @@ pub struct CompositeStorageProvider {
 }
 
 impl CompositeStorageProvider {
-    /// Create a new composite provider.
+    /// Create a new composite provider authenticated under `key`.
+    ///
+    /// `key` must come from the vault layer (derived from the master key) so
+    /// that no backend can compute it; see [`CompositeKey`].
     ///
     /// # Errors
     /// Returns `InvalidInput` if fewer than 2 backends are provided, or if
     /// erasure mode parameters don't match the backend count.
-    pub fn new(backends: Vec<Arc<dyn StorageProvider>>, config: CompositeConfig) -> Result<Self> {
+    pub fn new(
+        backends: Vec<Arc<dyn StorageProvider>>,
+        config: CompositeConfig,
+        key: CompositeKey,
+    ) -> Result<Self> {
         if backends.len() < 2 {
             return Err(Error::InvalidInput(
                 "CompositeStorageProvider requires at least 2 backends".to_string(),
@@ -105,6 +121,7 @@ impl CompositeStorageProvider {
         Ok(Self {
             backends,
             config,
+            key,
             reed_solomon,
             shard_map: Arc::new(RwLock::new(ShardMap::new())),
             shard_map_init: OnceCell::const_new(),
@@ -117,7 +134,7 @@ impl CompositeStorageProvider {
     /// Call this after construction to hydrate the shard map from persistent
     /// storage. If no backends have a shard map yet, this is a no-op.
     pub async fn load_shard_map(&self) -> Result<()> {
-        let loaded = ShardMap::load_from_all(&self.backends).await?;
+        let loaded = ShardMap::load_from_all(&self.backends, &self.key).await?;
         *self.shard_map.write().await = loaded;
         let _ = self.shard_map_init.set(());
         Ok(())
@@ -132,7 +149,7 @@ impl CompositeStorageProvider {
     async fn ensure_shard_map_loaded(&self) -> Result<()> {
         self.shard_map_init
             .get_or_try_init(|| async {
-                let loaded = ShardMap::load_from_all(&self.backends).await?;
+                let loaded = ShardMap::load_from_all(&self.backends, &self.key).await?;
                 *self.shard_map.write().await = loaded;
                 Ok::<(), Error>(())
             })
@@ -143,7 +160,40 @@ impl CompositeStorageProvider {
     /// Persist the current shard map to all backends.
     pub async fn save_shard_map(&self) -> Result<()> {
         let map = self.shard_map.read().await;
-        map.save_to_all(&self.backends).await
+        map.save_to_all(&self.backends, &self.key).await
+    }
+
+    /// The authenticated shard map entry for `path`, loading the map first.
+    ///
+    /// Reads go through this: the entry names the write (`object_id`) and
+    /// size every shard or copy must verify against.
+    pub(crate) async fn entry_for(&self, path: &VaultPath) -> Result<ChunkEntry> {
+        self.ensure_shard_map_loaded().await?;
+        let path_str = path.to_string_path();
+        self.shard_map
+            .read()
+            .await
+            .get(&path_str)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("{path_str} is not in the shard map")))
+    }
+
+    /// Tag over one mirror copy: binds the write and the exact content.
+    pub(crate) fn mirror_tag(&self, object_id: &[u8; 16], data: &[u8]) -> [u8; TAG_LEN] {
+        let size = (data.len() as u64).to_le_bytes();
+        self.key.tag(DOMAIN_MIRROR, &[object_id, &size, data])
+    }
+
+    /// Whether `data` is the copy `entry` describes.
+    pub(crate) fn verify_mirror_copy(&self, entry: &ChunkEntry, data: &[u8]) -> bool {
+        let Some(tag) = entry.mirror_tag else {
+            return false;
+        };
+        let size = (data.len() as u64).to_le_bytes();
+        data.len() as u64 == entry.original_size
+            && self
+                .key
+                .verify(DOMAIN_MIRROR, &[&entry.object_id, &size, data], &tag)
     }
 
     /// Get a clone of the current shard map (for inspection/testing).
@@ -203,6 +253,8 @@ impl StorageProvider for CompositeStorageProvider {
         match self.config.mode {
             RaidMode::Mirror => {
                 let original_size = data.len() as u64;
+                let object_id = uuid::Uuid::new_v4().into_bytes();
+                let mirror_tag = self.mirror_tag(&object_id, &data);
                 let path = path.clone();
                 let data: Bytes = data.into();
                 let (meta, succeeded) = self
@@ -218,6 +270,8 @@ impl StorageProvider for CompositeStorageProvider {
                 let entry = ShardMap::mirror_entry(
                     &path_str,
                     original_size,
+                    object_id,
+                    mirror_tag,
                     &self.backends,
                     Some(&succeeded),
                 );
@@ -246,10 +300,22 @@ impl StorageProvider for CompositeStorageProvider {
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
         match self.config.mode {
             RaidMode::Mirror => {
+                let entry = self.entry_for(path).await?;
                 let path = path.clone();
                 self.try_first("download", |backend| {
                     let path = path.clone();
-                    async move { backend.download(&path).await }
+                    let entry = &entry;
+                    async move {
+                        let data = backend.download(&path).await?;
+                        if self.verify_mirror_copy(entry, &data) {
+                            Ok(data)
+                        } else {
+                            Err(Error::Crypto(format!(
+                                "mirror copy of {} failed authentication; treating it as missing",
+                                path
+                            )))
+                        }
+                    }
                 })
                 .await
             }
@@ -380,20 +446,8 @@ impl StorageProvider for CompositeStorageProvider {
             RaidMode::Erasure { .. } => {
                 let shard_path = Self::shard_path(path, 0)?;
                 let file_name = path.name().unwrap_or("/").to_string();
-                // Download shard 0 to read the original size from the header
-                let shard_data = self
-                    .try_first("metadata_download", |backend| {
-                        let sp = shard_path.clone();
-                        async move { backend.download(&sp).await }
-                    })
-                    .await?;
-                // Header: [4-byte CRC-32] [8-byte LE original_size] [shard_data]
-                if shard_data.len() < 12 {
-                    return Err(Error::Storage(
-                        "Shard too short to read metadata".to_string(),
-                    ));
-                }
-                let original_size = u64::from_le_bytes(shard_data[4..12].try_into().unwrap());
+                // The size comes from the authenticated shard map, not a shard header.
+                let original_size = self.entry_for(path).await?.original_size;
                 // Get filesystem metadata (timestamps etc) from the backend
                 let shard_meta = self
                     .try_first("metadata", |backend| {

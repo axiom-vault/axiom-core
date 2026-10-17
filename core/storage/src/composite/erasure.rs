@@ -1,8 +1,14 @@
 //! Reed-Solomon erasure coding logic for the composite storage provider.
 //!
 //! Handles encoding, decoding, and per-shard I/O operations for erasure (RAID 5/6) mode.
+//!
+//! Shard file layout: `SHARD_MAGIC || tag || shard_data`. The tag is a keyed
+//! BLAKE2b-256 MAC (see [`super::auth`]) over the write's `object_id`, the
+//! shard index, the coding parameters, the original size and the shard data.
+//! The `object_id` and size are taken from the authenticated shard map entry,
+//! never from the shard, so a backend cannot substitute another object's
+//! shard, an older version of this one, or bytes with a recomputed checksum.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tracing::warn;
@@ -10,11 +16,17 @@ use tracing::warn;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::provider::Metadata;
-use crate::shard_map::ShardMap;
+use crate::shard_map::{ChunkEntry, ShardMap};
 use axiomvault_common::{Error, Result, VaultPath};
 
+use super::auth::{DOMAIN_SHARD, TAG_LEN};
 use super::config::RaidMode;
 use super::CompositeStorageProvider;
+
+/// Leading bytes of an authenticated erasure shard.
+const SHARD_MAGIC: &[u8; 4] = b"AXS2";
+/// Bytes before the shard data: magic and tag.
+const SHARD_HEADER_LEN: usize = SHARD_MAGIC.len() + TAG_LEN;
 
 impl CompositeStorageProvider {
     /// Get erasure mode parameters, or error if in mirror mode.
@@ -126,6 +138,85 @@ impl CompositeStorageProvider {
         })
     }
 
+    /// Length every shard of an object of `original_size` bytes has.
+    pub(crate) fn expected_shard_len(&self, original_size: u64) -> Result<usize> {
+        let (data_shards, _) = self.erasure_params()?;
+        let size = usize::try_from(original_size)
+            .map_err(|_| Error::Storage("Erasure: original_size does not fit".to_string()))?;
+        Ok(if size == 0 {
+            1
+        } else {
+            size.div_ceil(data_shards)
+        })
+    }
+
+    /// Pass the fields a shard tag covers to `f`: the write, the shard's
+    /// index (its position in the set and its backend), the coding
+    /// parameters, the object's size and the shard data.
+    fn with_shard_fields<R>(
+        &self,
+        object_id: &[u8; 16],
+        index: usize,
+        original_size: u64,
+        data: &[u8],
+        f: impl FnOnce(&[&[u8]]) -> R,
+    ) -> Result<R> {
+        let (data_shards, parity_shards) = self.erasure_params()?;
+        Ok(f(&[
+            object_id,
+            &(index as u64).to_le_bytes(),
+            &(data_shards as u64).to_le_bytes(),
+            &(parity_shards as u64).to_le_bytes(),
+            &original_size.to_le_bytes(),
+            data,
+        ]))
+    }
+
+    /// Build the stored payload for shard `index` of the write `object_id`.
+    pub(crate) fn seal_shard(
+        &self,
+        object_id: &[u8; 16],
+        index: usize,
+        original_size: u64,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let tag = self.with_shard_fields(object_id, index, original_size, data, |fields| {
+            self.key.tag(DOMAIN_SHARD, fields)
+        })?;
+        let mut payload = Vec::with_capacity(SHARD_HEADER_LEN + data.len());
+        payload.extend_from_slice(SHARD_MAGIC);
+        payload.extend_from_slice(&tag);
+        payload.extend_from_slice(data);
+        Ok(payload)
+    }
+
+    /// The shard data of `payload` if it is shard `index` of `entry`, else
+    /// `None`. A shard that fails here must be treated as missing.
+    pub(crate) fn open_shard<'p>(
+        &self,
+        entry: &ChunkEntry,
+        index: usize,
+        payload: &'p [u8],
+    ) -> Option<&'p [u8]> {
+        if payload.len() < SHARD_HEADER_LEN || &payload[..SHARD_MAGIC.len()] != SHARD_MAGIC {
+            return None;
+        }
+        let (stored_tag, data) = payload[SHARD_MAGIC.len()..].split_at(TAG_LEN);
+        if data.len() != self.expected_shard_len(entry.original_size).ok()? {
+            return None;
+        }
+        let valid = self
+            .with_shard_fields(
+                &entry.object_id,
+                index,
+                entry.original_size,
+                data,
+                |fields| self.key.verify(DOMAIN_SHARD, fields, stored_tag),
+            )
+            .ok()?;
+        valid.then_some(data)
+    }
+
     /// Build the shard path for a given file path and shard index.
     pub(crate) fn shard_path(path: &VaultPath, shard_index: usize) -> Result<VaultPath> {
         let path_str = path.to_string_path();
@@ -136,28 +227,14 @@ impl CompositeStorageProvider {
     pub(crate) async fn erasure_upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
         let original_size = data.len();
         let shards = self.erasure_encode(&data)?;
+        // Fresh per write: shards of an earlier write of this path stop verifying.
+        let object_id = uuid::Uuid::new_v4().into_bytes();
 
         let mut futures = Vec::with_capacity(shards.len());
         for (i, shard) in shards.into_iter().enumerate() {
             let backend = Arc::clone(&self.backends[i]);
             let shard_path = Self::shard_path(path, i)?;
-            // Header: [4-byte LE CRC-32 of shard_data] [8-byte LE original_size] [shard_data]
-            //
-            // SECURITY NOTE: CRC-32 is a NON-CRYPTOGRAPHIC checksum and is
-            // used here ONLY to detect accidental bit rot or transport
-            // corruption of an erasure shard. It does NOT provide
-            // authenticity: a backend that rewrites a shard can trivially
-            // recompute and replace the CRC. Authenticity / tamper-detection
-            // is provided one layer up by the AEAD (XChaCha20-Poly1305) at
-            // the vault layer — any malicious modification of plaintext or
-            // ciphertext is caught when the AEAD tag fails to verify. CRC
-            // mismatches here just let us treat a shard as missing and
-            // reconstruct it from the remaining Reed-Solomon shards.
-            let crc = crc32fast::hash(&shard);
-            let mut payload = Vec::with_capacity(4 + 8 + shard.len());
-            payload.extend_from_slice(&crc.to_le_bytes());
-            payload.extend_from_slice(&(original_size as u64).to_le_bytes());
-            payload.extend_from_slice(&shard);
+            let payload = self.seal_shard(&object_id, i, original_size as u64, &shard)?;
             futures.push(async move {
                 let start = tokio::time::Instant::now();
                 let result = backend.upload(&shard_path, payload).await;
@@ -229,6 +306,7 @@ impl CompositeStorageProvider {
         let entry = ShardMap::erasure_entry(
             &path_str,
             original_size as u64,
+            object_id,
             ds,
             ps,
             &self.backends,
@@ -244,8 +322,13 @@ impl CompositeStorageProvider {
     }
 
     /// Download data in erasure mode: fetch shards, reconstruct original data.
+    ///
+    /// Only shards that verify against the authenticated shard map entry are
+    /// used; the rest count as missing, so the result is either the data that
+    /// was written or an error.
     pub(crate) async fn erasure_download(&self, path: &VaultPath) -> Result<Vec<u8>> {
         self.probe_if_due().await;
+        let entry = self.entry_for(path).await?;
 
         let RaidMode::Erasure {
             data_shards,
@@ -270,37 +353,21 @@ impl CompositeStorageProvider {
         let results = futures::future::join_all(futures).await;
 
         let mut shard_opts: Vec<Option<Vec<u8>>> = vec![None; total];
-        let mut size_votes: HashMap<usize, usize> = HashMap::new();
         let mut available = 0usize;
 
         for (i, result, latency) in results {
             if let Ok(payload) = result {
-                // Header: [4-byte CRC-32] [8-byte LE original_size] [shard_data]
-                if payload.len() < 12 {
-                    warn!(shard = i, "Erasure download: shard too short, skipping");
-                    self.record_health_failure(i).await;
-                    continue;
-                }
-                let stored_crc = u32::from_le_bytes(payload[..4].try_into().unwrap());
-                let size = u64::from_le_bytes(payload[4..12].try_into().unwrap()) as usize;
-                let shard_data = &payload[12..];
-
-                // Verify CRC-32 integrity
-                let computed_crc = crc32fast::hash(shard_data);
-                if stored_crc != computed_crc {
+                let Some(shard_data) = self.open_shard(&entry, i, &payload) else {
                     warn!(
                         shard = i,
-                        stored_crc,
-                        computed_crc,
-                        "Erasure download: CRC mismatch, treating shard as missing"
+                        "Erasure download: shard failed authentication, treating it as missing"
                     );
                     self.record_health_failure(i).await;
                     continue;
-                }
+                };
 
                 // Only record success after payload validation passes
                 self.record_health_success(i, latency).await;
-                *size_votes.entry(size).or_insert(0) += 1;
                 shard_opts[i] = Some(shard_data.to_vec());
                 available += 1;
             } else {
@@ -315,29 +382,8 @@ impl CompositeStorageProvider {
             )));
         }
 
-        // Cross-validate original_size: use majority vote
-        let original_size = size_votes
-            .into_iter()
-            .max_by_key(|&(_, count)| count)
-            .map(|(size, _)| size)
-            .ok_or_else(|| Error::Storage("Erasure download: no shards available".to_string()))?;
-
-        // Bound check: original_size must be <= data_shards * shard_data_len
-        let shard_data_len = shard_opts
-            .iter()
-            .flatten()
-            .next()
-            .map(|s| s.len())
-            .unwrap_or(0);
-        let max_original_size = data_shards * shard_data_len;
-        if original_size > max_original_size {
-            return Err(Error::Storage(format!(
-                "Erasure download: original_size {} exceeds maximum {} (data_shards * shard_len)",
-                original_size, max_original_size
-            )));
-        }
-
-        self.erasure_decode(shard_opts, original_size)
+        // `open_shard` fixed every shard's length from this authenticated size.
+        self.erasure_decode(shard_opts, entry.original_size as usize)
     }
 
     /// Delete shards across all backends in erasure mode.
