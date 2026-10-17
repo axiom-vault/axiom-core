@@ -509,6 +509,26 @@ impl VaultConfig {
         Ok(RecoveryKey::from_bytes(*bytes))
     }
 
+    /// Check that `encrypted_recovery_key` holds `recovery_key` under `master_key`.
+    ///
+    /// The 1.1 layout keeps the recovery key in three fields:
+    /// `recovery_key_verification` and `recovery_wrapped_master_key`, which
+    /// [`VaultConfig::verify_recovery_key`] checks, and `encrypted_recovery_key`,
+    /// which this checks against the master key that wrap yields.
+    pub(crate) fn verify_recovery_key_binding(
+        &self,
+        recovery_key: &RecoveryKey,
+        master_key: &MasterKey,
+    ) -> Result<()> {
+        let stored = self.decrypt_recovery_key(master_key)?;
+        if !bool::from(stored.as_bytes().ct_eq(recovery_key.as_bytes())) {
+            return Err(Error::Crypto(
+                "stored recovery key does not match the recovery words".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Migrate a legacy v1.0 vault to the v1.1 key-wrapping format.
     ///
     /// For legacy vaults, the Argon2id output was the master key. We keep
