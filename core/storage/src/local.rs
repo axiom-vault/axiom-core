@@ -6,8 +6,26 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::provider::{ByteStream, Metadata, StorageProvider};
+use crate::provider::{check_precondition, ByteStream, Metadata, StorageProvider};
 use axiomvault_common::{Error, Result, VaultPath};
+
+/// Serialises every commit that replaces or removes a file in this process,
+/// so a revision check and the rename or unlink it guards are one step.
+static COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn commit_lock() -> std::sync::MutexGuard<'static, ()> {
+    COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How a synced temporary file is committed to its target path.
+enum Commit<'a> {
+    /// Replace whatever is at the target.
+    Replace,
+    /// Commit only if the target is at this revision; `None` means absent.
+    IfMatch(Option<&'a str>),
+}
 
 /// File mode for vault files (owner read/write only).
 #[cfg(unix)]
@@ -143,6 +161,23 @@ impl LocalProvider {
             .map(|t| t.into())
             .unwrap_or_else(|_| Utc::now());
 
+        // Every write commits a fresh inode by rename or link, so the inode
+        // plus nanosecond mtime and length identifies a revision. The former
+        // whole-second mtime and length matched two same-length writes in
+        // the same second, which defeats conditional writes.
+        let mtime_nanos = fs_meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        #[cfg(unix)]
+        let etag = {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}-{}-{}", mtime_nanos, fs_meta.len(), fs_meta.ino())
+        };
+        #[cfg(not(unix))]
+        let etag = format!("{}-{}", mtime_nanos, fs_meta.len());
+
         Metadata {
             id: Uuid::new_v4().to_string(),
             name: path.name().unwrap_or("/").to_string(),
@@ -153,19 +188,90 @@ impl LocalProvider {
             },
             is_directory: fs_meta.is_dir(),
             modified,
-            etag: Some(format!("{}-{}", modified.timestamp(), fs_meta.len())),
+            etag: Some(etag),
             provider_data: None,
         }
     }
-}
 
-#[async_trait]
-impl StorageProvider for LocalProvider {
-    fn name(&self) -> &str {
-        "local"
+    /// Metadata of the object now at `fs_path`, or `None` when absent.
+    fn current_metadata(&self, path: &VaultPath, fs_path: &Path) -> Result<Option<Metadata>> {
+        match std::fs::symlink_metadata(fs_path) {
+            Ok(fs_meta) => Ok(Some(self.create_metadata(path, fs_meta))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+    /// Move a synced temporary file onto its target, removing the temporary
+    /// file on any failure.
+    ///
+    /// Create-if-absent uses `hard_link`, which refuses an existing target
+    /// atomically, so it is exact even against other processes. A revision
+    /// precondition is checked and committed under `COMMIT_LOCK`, which every
+    /// replacing write and delete in this process also takes, so it is exact
+    /// against writers in this process. Writers in other processes do not take
+    /// the lock and can still replace the file between check and rename.
+    fn commit_temp(
+        &self,
+        path: &VaultPath,
+        fs_path: &Path,
+        tmp_path: &Path,
+        commit: Commit<'_>,
+    ) -> Result<()> {
+        let result = match commit {
+            Commit::IfMatch(None) => match std::fs::hard_link(tmp_path, fs_path) {
+                Ok(()) => std::fs::remove_file(tmp_path).map_err(Error::from),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(Error::Conflict(format!("object already exists: {path}")))
+                }
+                Err(error) => Err(error.into()),
+            },
+            Commit::IfMatch(Some(expected)) => {
+                let _guard = commit_lock();
+                self.current_metadata(path, fs_path)
+                    .and_then(|current| check_precondition(current.as_ref(), Some(expected)))
+                    .and_then(|()| std::fs::rename(tmp_path, fs_path).map_err(Error::from))
+            }
+            Commit::Replace => {
+                let _guard = commit_lock();
+                std::fs::rename(tmp_path, fs_path).map_err(Error::from)
+            }
+        };
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp_path);
+        }
+        result
+    }
+
+    /// Delete a file, optionally only if it is still at `expected` revision.
+    async fn delete_file(&self, path: &VaultPath, expected: Option<Option<&str>>) -> Result<()> {
+        let fs_path = self.checked_fs_path(path)?;
+        {
+            let _guard = commit_lock();
+            let current = self
+                .current_metadata(path, &fs_path)?
+                .ok_or_else(|| Error::NotFound(format!("File not found: {}", path)))?;
+            if current.is_directory {
+                return Err(Error::InvalidInput(
+                    "Use delete_dir for directories".to_string(),
+                ));
+            }
+            if let Some(expected) = expected {
+                check_precondition(Some(&current), expected)?;
+            }
+            std::fs::remove_file(&fs_path)?;
+        }
+        Self::sync_parent(&fs_path).await
+    }
+
+    /// Write `data` to a synced temporary file in the target directory, then
+    /// commit it to `path` as `commit` allows.
+    async fn write_file(
+        &self,
+        path: &VaultPath,
+        data: Vec<u8>,
+        commit: Commit<'_>,
+    ) -> Result<Metadata> {
         let fs_path = self.checked_fs_path(path)?;
 
         // Check parent exists
@@ -237,15 +343,45 @@ impl StorageProvider for LocalProvider {
             }
         }
 
-        if let Err(e) = fs::rename(&tmp_path, &fs_path).await {
-            // Best-effort cleanup; ignore secondary error
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
+        // Take the revision from the synced temp file: rename and link keep
+        // its inode, size and mtime, so the etag returned is the one written
+        // even if another writer replaces the target right after the commit.
+        let metadata = match std::fs::metadata(&tmp_path) {
+            Ok(fs_meta) => self.create_metadata(path, fs_meta),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+        };
+        self.commit_temp(path, &fs_path, &tmp_path, commit)?;
 
         Self::sync_parent(&fs_path).await?;
-        let fs_meta = fs::metadata(&fs_path).await?;
-        Ok(self.create_metadata(path, fs_meta))
+        Ok(metadata)
+    }
+}
+
+#[async_trait]
+impl StorageProvider for LocalProvider {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.write_file(path, data, Commit::Replace).await
+    }
+
+    async fn upload_if_match(
+        &self,
+        path: &VaultPath,
+        data: Vec<u8>,
+        expected_etag: Option<&str>,
+    ) -> Result<Metadata> {
+        self.write_file(path, data, Commit::IfMatch(expected_etag))
+            .await
+    }
+
+    async fn delete_if_match(&self, path: &VaultPath, expected_etag: Option<&str>) -> Result<()> {
+        self.delete_file(path, Some(expected_etag)).await
     }
 
     async fn upload_stream(&self, path: &VaultPath, mut stream: ByteStream) -> Result<Metadata> {
@@ -295,13 +431,16 @@ impl StorageProvider for LocalProvider {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(error);
         }
-        if let Err(error) = fs::rename(&tmp_path, &fs_path).await {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(error.into());
-        }
+        let metadata = match std::fs::metadata(&tmp_path) {
+            Ok(fs_meta) => self.create_metadata(path, fs_meta),
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(error.into());
+            }
+        };
+        self.commit_temp(path, &fs_path, &tmp_path, Commit::Replace)?;
         Self::sync_parent(&fs_path).await?;
-        let fs_meta = fs::metadata(&fs_path).await?;
-        Ok(self.create_metadata(path, fs_meta))
+        Ok(metadata)
     }
 
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
@@ -340,21 +479,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn delete(&self, path: &VaultPath) -> Result<()> {
-        let fs_path = self.checked_fs_path(path)?;
-
-        if !fs_path.exists() {
-            return Err(Error::NotFound(format!("File not found: {}", path)));
-        }
-
-        if fs_path.is_dir() {
-            return Err(Error::InvalidInput(
-                "Use delete_dir for directories".to_string(),
-            ));
-        }
-
-        fs::remove_file(&fs_path).await?;
-        Self::sync_parent(&fs_path).await?;
-        Ok(())
+        self.delete_file(path, None).await
     }
 
     async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
@@ -803,6 +928,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(contents.len(), 2);
+    }
+
+    /// Audit M-17: conditional writes and deletes refuse a stale revision
+    /// and leave the newer one in place; create-if-absent never replaces.
+    #[tokio::test]
+    async fn test_local_conditional_write_and_delete_refuse_stale_revision() {
+        let temp = TempDir::new().unwrap();
+        let provider = LocalProvider::new(temp.path()).unwrap();
+        let path = VaultPath::parse("/test.txt").unwrap();
+
+        let created = provider
+            .upload_if_match(&path, b"a".to_vec(), None)
+            .await
+            .unwrap();
+        assert_eq!(provider.metadata(&path).await.unwrap().etag, created.etag);
+        assert!(matches!(
+            provider.upload_if_match(&path, b"x".to_vec(), None).await,
+            Err(Error::Conflict(_))
+        ));
+        // Same length, written straight away: must still be a new revision.
+        let stale = created.etag.unwrap();
+        let newer = provider
+            .upload_if_match(&path, b"b".to_vec(), Some(&stale))
+            .await
+            .unwrap();
+        assert_ne!(newer.etag.as_deref(), Some(stale.as_str()));
+        assert!(matches!(
+            provider
+                .upload_if_match(&path, b"x".to_vec(), Some(&stale))
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            provider.delete_if_match(&path, Some(&stale)).await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(provider.download(&path).await.unwrap(), b"b");
+
+        provider
+            .delete_if_match(&path, newer.etag.as_deref())
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.delete_if_match(&path, newer.etag.as_deref()).await,
+            Err(Error::NotFound(_))
+        ));
+        // Refused and committed writes leave no temporary files behind.
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    /// Same-length plain uploads in quick succession get distinct etags.
+    #[tokio::test]
+    async fn test_local_same_length_rewrites_get_distinct_etags() {
+        let temp = TempDir::new().unwrap();
+        let provider = LocalProvider::new(temp.path()).unwrap();
+        let path = VaultPath::parse("/test.txt").unwrap();
+        let first = provider.upload(&path, b"one".to_vec()).await.unwrap();
+        let second = provider.upload(&path, b"two".to_vec()).await.unwrap();
+        assert_ne!(first.etag, second.etag);
+        assert_eq!(provider.metadata(&path).await.unwrap().etag, second.etag);
     }
 
     struct BackpressureProbe {

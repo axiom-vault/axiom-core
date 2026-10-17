@@ -50,6 +50,28 @@ pub struct VersionedDownload {
     pub metadata: Metadata,
 }
 
+/// Check a conditional-write precondition against the current object.
+///
+/// `current` is the object now at the path (`None` when absent). `expected`
+/// is the revision the caller last observed (`None` when it observed none).
+/// Fails with `Error::Conflict` unless both are absent, or the object exists
+/// and its etag equals `expected`. An existing object without an etag never
+/// satisfies a precondition, because its revision cannot be proven unchanged.
+pub(crate) fn check_precondition(current: Option<&Metadata>, expected: Option<&str>) -> Result<()> {
+    use axiomvault_common::Error;
+    match (current, expected) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(Error::Conflict(
+            "remote object was removed since it was read".to_string(),
+        )),
+        (Some(_), None) => Err(Error::Conflict("remote object already exists".to_string())),
+        (Some(metadata), Some(expected)) if metadata.etag.as_deref() == Some(expected) => Ok(()),
+        (Some(_), Some(_)) => Err(Error::Conflict(
+            "remote object changed since it was read".to_string(),
+        )),
+    }
+}
+
 /// Storage provider trait for different backends.
 ///
 /// All operations are async and use streams for large data transfers.
@@ -74,6 +96,46 @@ pub trait StorageProvider: Send + Sync {
     /// - Network/I/O errors
     /// - Authentication errors
     async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata>;
+
+    /// Upload only if the object is still the revision the caller observed.
+    ///
+    /// `expected_etag` is `Some(etag)` when the object must exist with that
+    /// etag, and `None` when the object must not exist (create-if-absent).
+    /// On a mismatch nothing is written and `Error::Conflict` is returned.
+    ///
+    /// The default checks `metadata` and then calls `upload`. It refuses every
+    /// mismatch it observes but leaves a time-of-check to time-of-use window
+    /// between the two calls. Providers that can make the check and the write
+    /// one step must override it.
+    async fn upload_if_match(
+        &self,
+        path: &VaultPath,
+        data: Vec<u8>,
+        expected_etag: Option<&str>,
+    ) -> Result<Metadata> {
+        let current = match self.metadata(path).await {
+            Ok(metadata) => Some(metadata),
+            Err(axiomvault_common::Error::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        check_precondition(current.as_ref(), expected_etag)?;
+        self.upload(path, data).await
+    }
+
+    /// Delete only if the object is still the revision the caller observed.
+    ///
+    /// `expected_etag` is the etag the caller last observed; `None` means it
+    /// observed none, so any existing object is a conflict. Returns
+    /// `Error::NotFound` when the object is absent and `Error::Conflict`, with
+    /// nothing deleted, when its revision differs.
+    ///
+    /// The default checks `metadata` and then calls `delete`, with the same
+    /// time-of-check to time-of-use window as [`Self::upload_if_match`].
+    async fn delete_if_match(&self, path: &VaultPath, expected_etag: Option<&str>) -> Result<()> {
+        let current = self.metadata(path).await?;
+        check_precondition(Some(&current), expected_etag)?;
+        self.delete(path).await
+    }
 
     /// Atomically replace a complete local object.
     ///
