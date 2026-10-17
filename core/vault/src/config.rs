@@ -202,7 +202,19 @@ pub struct VaultConfig {
     pub encrypted_recovery_key: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_key: Option<HardwareKeyConfig>,
+
+    // -- 2.0 field (config integrity, M-1) ------------------------------
+    /// Keyed BLAKE2b tag over every other field, under a key derived from
+    /// the master key. Set only on the bytes written to storage
+    /// ([`VaultConfig::to_authenticated_bytes`]) and removed on load by
+    /// [`VaultConfig::verify_integrity`], so an in-memory config never
+    /// carries a tag that its edits would make stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_mac: Option<Vec<u8>>,
 }
+
+/// Domain separation for the `config_mac` key.
+const CONFIG_MAC_CONTEXT: &[u8] = b"vault_config_mac_v1";
 
 /// Result of creating a new vault configuration.
 pub struct VaultConfigCreation {
@@ -275,6 +287,7 @@ impl VaultConfig {
             recovery_key_verification: Some(recovery_key_verification),
             encrypted_recovery_key: Some(encrypted_recovery_key),
             hardware_key: None,
+            config_mac: None,
         };
 
         Ok(VaultConfigCreation {
@@ -614,6 +627,55 @@ impl VaultConfig {
         config.kdf_params.validate()?;
         Ok(config)
     }
+
+    /// `config_mac` over this config with the tag itself left out.
+    fn compute_mac(&self, master_key: &MasterKey) -> Result<Vec<u8>> {
+        use blake2::digest::consts::U32;
+        use blake2::digest::Mac;
+
+        let mut untagged = self.clone();
+        untagged.config_mac = None;
+        let key = master_key.derive_file_key(CONFIG_MAC_CONTEXT);
+        let mut mac = <blake2::Blake2bMac<U32> as Mac>::new_from_slice(key.as_bytes())
+            .map_err(|e| Error::Crypto(format!("config MAC key rejected: {e}")))?;
+        mac.update(&untagged.to_bytes()?);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    /// Serialize for storage with a `config_mac` under `master_key`, the key
+    /// the generation that publishes these bytes is sealed with.
+    pub(crate) fn to_authenticated_bytes(&self, master_key: &MasterKey) -> Result<Vec<u8>> {
+        let mut tagged = self.clone();
+        tagged.config_mac = Some(self.compute_mac(master_key)?);
+        tagged.to_bytes()
+    }
+
+    /// Check `config_mac` against `master_key` and remove it.
+    ///
+    /// The tag is keyed by the master key, so this runs after unlock and before
+    /// anything is written or rewrapped. A `CURRENT` config must carry a tag;
+    /// a 1.x config has none (it is bound by the manifest, if any, and is
+    /// refused unless explicitly upgraded), but any tag present must verify.
+    pub(crate) fn verify_integrity(&mut self, master_key: &MasterKey) -> Result<()> {
+        let Some(tag) = self.config_mac.take() else {
+            if self.version.major >= VaultVersion::CURRENT.major {
+                return Err(Error::Crypto(format!(
+                    "{CONFIG_FILENAME} has no integrity tag (config_mac); a {} vault config \
+                     without one is refused",
+                    self.version
+                )));
+            }
+            return Ok(());
+        };
+        let expected = self.compute_mac(master_key)?;
+        if tag.len() != expected.len() || !bool::from(tag.as_slice().ct_eq(&expected)) {
+            return Err(Error::Crypto(format!(
+                "{CONFIG_FILENAME} integrity check failed (config_mac mismatch): \
+                 the stored config was changed outside this vault"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Configuration file name in vault root.
@@ -653,6 +715,88 @@ mod tests {
             );
             assert!(VaultConfig::from_json(std::str::from_utf8(&bytes).unwrap()).is_err());
         }
+    }
+
+    fn tagged_config() -> (VaultConfig, MasterKey) {
+        let creation = VaultConfig::new(
+            VaultId::new("config-mac").unwrap(),
+            b"password",
+            "local",
+            serde_json::json!({ "root": "/vault" }),
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        (creation.config, creation.master_key)
+    }
+
+    #[test]
+    fn config_mac_round_trips_and_is_removed_on_verify() {
+        let (config, master_key) = tagged_config();
+        let bytes = config.to_authenticated_bytes(&master_key).unwrap();
+        let mut restored = VaultConfig::from_bytes(&bytes).unwrap();
+        assert!(restored.config_mac.is_some());
+        restored.verify_integrity(&master_key).unwrap();
+        assert!(restored.config_mac.is_none());
+        assert_eq!(restored.to_bytes().unwrap(), config.to_bytes().unwrap());
+        // Re-tagging the verified config reproduces the stored bytes.
+        assert_eq!(restored.to_authenticated_bytes(&master_key).unwrap(), bytes);
+    }
+
+    #[test]
+    fn config_mac_covers_every_field_and_the_key() {
+        let (config, master_key) = tagged_config();
+        let bytes = config.to_authenticated_bytes(&master_key).unwrap();
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(&str, Edit); 6] = [
+            ("kdf_params", |json| {
+                json["kdf_params"]["memory_cost"] = 16.into()
+            }),
+            ("hardware_key", |json| {
+                json["hardware_key"] = serde_json::json!({
+                    "metadata": { "kind": "RawSecret", "enrolled_at": "2026-01-01T00:00:00Z" },
+                    "wrapped_master_key": [1, 2, 3],
+                    "key_verification": [4, 5, 6],
+                })
+            }),
+            ("provider_config", |json| {
+                json["provider_config"]["root"] = "/attacker".into()
+            }),
+            ("provider_type", |json| {
+                json["provider_type"] = "gdrive".into()
+            }),
+            ("version", |json| json["version"]["minor"] = 1.into()),
+            ("salt", |json| {
+                let byte = json["salt"][0].as_u64().unwrap();
+                json["salt"][0] = (byte ^ 1).into()
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            edit(&mut json);
+            let mut tampered =
+                VaultConfig::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+            let error = tampered.verify_integrity(&master_key).unwrap_err();
+            assert!(
+                error.to_string().contains("config_mac mismatch"),
+                "{field}: {error}"
+            );
+        }
+        let mut genuine = VaultConfig::from_bytes(&bytes).unwrap();
+        let other_key = generate_master_key();
+        assert!(genuine.verify_integrity(&other_key).is_err());
+    }
+
+    #[test]
+    fn untagged_config_is_refused_at_current_version_only() {
+        let (mut config, master_key) = tagged_config();
+        let error = config.clone().verify_integrity(&master_key).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Cryptographic error: vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused"
+        );
+        // A 1.1 config predates the tag; the explicit upgrade path handles it.
+        config.version = VaultVersion::V1_1;
+        config.verify_integrity(&master_key).unwrap();
     }
 
     #[test]
@@ -925,6 +1069,7 @@ mod tests {
             recovery_key_verification: None,
             encrypted_recovery_key: None,
             hardware_key: None,
+            config_mac: None,
         };
 
         assert!(config.is_legacy_format());
@@ -959,6 +1104,7 @@ mod tests {
             recovery_key_verification: None,
             encrypted_recovery_key: None,
             hardware_key: None,
+            config_mac: None,
         };
 
         let recovery_words = config.migrate_to_v1_1(password).unwrap();

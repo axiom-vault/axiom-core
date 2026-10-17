@@ -630,7 +630,9 @@ impl VaultSession {
         let next_generation = generation
             .checked_add(1)
             .ok_or_else(|| Error::Vault("snapshot generation counter exhausted".to_string()))?;
-        let config_bytes = self.config.to_bytes()?;
+        // Tagged under the key that seals this generation, so a rotation
+        // re-tags the config under the new master key.
+        let config_bytes = self.config.to_authenticated_bytes(sealing_key)?;
         let manifest = GenerationManifest::new(
             self.config.id.clone(),
             next_generation,

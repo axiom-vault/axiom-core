@@ -292,8 +292,11 @@ impl VaultManager {
         }
         let encrypted_tree = provider.download(&tree_path).await?;
         let config_bytes = provider.download(&config_path).await?;
-        let config = VaultConfig::from_bytes(&config_bytes)?;
+        let mut config = VaultConfig::from_bytes(&config_bytes)?;
         manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
+        // The manifest binds these bytes; the tag binds them to the master key
+        // even where no manifest does (see the no-manifest paths).
+        config.verify_integrity(master_key)?;
         let tree = VaultSession::decrypt_tree_bytes(master_key, &encrypted_tree)?;
         Ok((config, config_bytes, tree, manifest))
     }
@@ -328,7 +331,7 @@ impl VaultManager {
             kdf_params,
         )?;
 
-        self.initialize_vault_structure(&provider, &creation.config)
+        self.initialize_vault_structure(&provider, &creation.config, &creation.master_key)
             .await?;
 
         // Use from_master_key to avoid a second Argon2id KDF round.
@@ -355,6 +358,7 @@ impl VaultManager {
         &self,
         provider: &Arc<dyn StorageProvider>,
         config: &VaultConfig,
+        master_key: &MasterKey,
     ) -> Result<()> {
         let data_path = VaultPath::parse(DATA_DIRNAME)?;
         if !provider.exists(&data_path).await? {
@@ -367,7 +371,7 @@ impl VaultManager {
         }
 
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
-        let config_bytes = config.to_bytes()?;
+        let config_bytes = config.to_authenticated_bytes(master_key)?;
         provider.upload(&config_path, config_bytes).await?;
 
         Ok(())
@@ -518,6 +522,9 @@ impl VaultManager {
                 "snapshot manifest missing for a vault with trusted freshness state".to_string(),
             ));
         }
+        // No manifest binds this config, so its tag is the only check of the
+        // fields the password does not cover; refuse before any write.
+        config.verify_integrity(&master_key)?;
         let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
 
         // Legacy bootstrap is allowed only when neither storage nor this device has
@@ -527,7 +534,9 @@ impl VaultManager {
             let safe_config = persisted_provider_config(provider_type, &provider_config)?;
             if config.provider_config != safe_config {
                 config.provider_config = safe_config;
-                provider.upload(&config_path, config.to_bytes()?).await?;
+                provider
+                    .upload(&config_path, config.to_authenticated_bytes(&master_key)?)
+                    .await?;
             }
         }
         // Relabel only after the sanitizing upload above, so the first manifest
@@ -665,6 +674,9 @@ impl VaultManager {
                         .to_string(),
                 ));
             }
+            // Recovery does not use the password, so nothing else checks the KDF
+            // parameters `reset_password` rewraps under: verify the tag first.
+            config.verify_integrity(&master_key)?;
             // No manifest binds a 1.1 config, so check every recovery field and
             // authenticate the tree under the recovered key before any write.
             let upgrade = needs_format_upgrade(&config, true)?;
@@ -1515,10 +1527,13 @@ mod tests {
             KdfParams::moderate(),
         )
         .unwrap();
-        let config_bytes = creation.config.to_bytes().unwrap();
+        let config_bytes = creation
+            .config
+            .to_authenticated_bytes(&creation.master_key)
+            .unwrap();
         let storage: Arc<dyn StorageProvider> = provider.clone();
         manager
-            .initialize_vault_structure(&storage, &creation.config)
+            .initialize_vault_structure(&storage, &creation.config, &creation.master_key)
             .await
             .unwrap();
         let legacy = VaultSession::from_master_key(
@@ -2515,7 +2530,7 @@ mod tests {
         .unwrap();
         let storage: Arc<dyn StorageProvider> = provider.clone();
         manager
-            .initialize_vault_structure(&storage, &creation.config)
+            .initialize_vault_structure(&storage, &creation.config, &creation.master_key)
             .await
             .unwrap();
         let legacy_session = VaultSession::from_master_key(
@@ -2645,7 +2660,7 @@ mod tests {
         .unwrap();
         let storage: Arc<dyn StorageProvider> = legacy_storage.clone();
         manager
-            .initialize_vault_structure(&storage, &creation.config)
+            .initialize_vault_structure(&storage, &creation.config, &creation.master_key)
             .await
             .unwrap();
         VaultSession::from_master_key(
@@ -2876,10 +2891,25 @@ mod tests {
                     .await
                     .unwrap()
             } else {
-                open_manager
+                // A 2.0 client never writes credentials, so a 2.0 config holding
+                // them was rewritten outside the vault and has no valid tag.
+                // Refused before the sanitizing upload (M-1).
+                match open_manager
                     .open_vault("gdrive", safe_config.clone(), b"password")
                     .await
-                    .unwrap()
+                {
+                    Err(Error::Crypto(message)) => {
+                        assert!(message.contains("config_mac"), "{message}")
+                    }
+                    Err(other) => panic!("unexpected error: {other}"),
+                    Ok(_) => panic!("a rewritten 2.0 cloud config must be refused"),
+                }
+                let untouched = storage
+                    .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(untouched, serde_json::to_vec(&legacy).unwrap());
+                continue;
             };
             assert_eq!(session.config().version, VaultVersion::CURRENT);
             assert_eq!(session.config().provider_config, safe_config);
@@ -4526,5 +4556,380 @@ mod tests {
             .derive_file_key(metadata.encrypted_name.as_bytes());
         assert!(axiomvault_crypto::decrypt(file_key.as_bytes(), &ciphertext).is_err());
         assert_eq!(ops.read_file(&file).await.unwrap(), content);
+    }
+
+    // -- M-1: integrity of `vault.config` -----------------------------------
+
+    async fn rewrite_config_object(
+        provider: &MemoryProvider,
+        path: &VaultPath,
+        edit: &dyn Fn(&mut serde_json::Value),
+    ) {
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&provider.download(path).await.unwrap()).unwrap();
+        edit(&mut json);
+        provider
+            .upload(path, serde_json::to_vec(&json).unwrap())
+            .await
+            .unwrap();
+    }
+
+    fn weaken_kdf(json: &mut serde_json::Value) {
+        json["kdf_params"] =
+            serde_json::json!({ "memory_cost": 8, "time_cost": 1, "parallelism": 1 });
+    }
+
+    fn redirect_provider(json: &mut serde_json::Value) {
+        json["provider_config"] = serde_json::json!({ "root": "/attacker" });
+    }
+
+    fn strip_config_mac(json: &mut serde_json::Value) {
+        json.as_object_mut().unwrap().remove("config_mac");
+    }
+
+    fn alter_config_mac(json: &mut serde_json::Value) {
+        let tag = json["config_mac"]
+            .as_array_mut()
+            .expect("stored config carries a config_mac");
+        tag[0] = (tag[0].as_u64().unwrap() ^ 1).into();
+    }
+
+    const OPEN_PATHS: [&str; 3] = ["open_vault", "upgrade_to_current", "recover_vault"];
+
+    /// Run the open path named `path` (one of `OPEN_PATHS`) on `manager`.
+    async fn open_attempt(
+        manager: &VaultManager,
+        path: &str,
+        password: &[u8],
+        words: &str,
+    ) -> Result<VaultSession> {
+        let null = serde_json::Value::Null;
+        match path {
+            "open_vault" => manager.open_vault("test", null, password).await,
+            "upgrade_to_current" => manager.upgrade_to_current("test", null, password).await,
+            "recover_vault" => {
+                manager
+                    .recover_vault("test", null, words, b"reset-password")
+                    .await
+            }
+            _ => unreachable!("unknown open path {path}"),
+        }
+    }
+
+    /// A refusal: which open path, on which device, with or without the
+    /// manifest, and the error it returned.
+    struct Refusal {
+        path: &'static str,
+        new_device: bool,
+        manifest_stripped: bool,
+        message: String,
+    }
+
+    /// Apply `edit` as the provider and assert that every open path refuses
+    /// it, on this device (`anchor`) and on a device that has never seen the
+    /// vault, without writing to storage or to either device's anchor. Runs
+    /// twice: with the manifest in place (the provider rewrites `vault.config`
+    /// and the generation config object the manifest hint names) and with the
+    /// manifest deleted (N-1). The genuine snapshot is put back after each run.
+    async fn assert_rewrite_refused(
+        provider: &Arc<MemoryProvider>,
+        anchor: &Arc<InMemoryFreshnessAnchor>,
+        vault_id: &str,
+        password: &[u8],
+        words: &str,
+        edit: &dyn Fn(&mut serde_json::Value),
+    ) -> Vec<Refusal> {
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let manifest = provider.download(&manifest_path()).await.unwrap();
+        let object = GenerationManifest::config_path_hint(&manifest)
+            .unwrap()
+            .unwrap();
+        let mut originals = Vec::new();
+        for path in [config_path(), object.clone()] {
+            let bytes = provider.download(&path).await.unwrap();
+            originals.push((path, bytes));
+        }
+        let anchor_id = test_anchor_id(&VaultId::new(vault_id).unwrap());
+        let mut refusals = Vec::new();
+        for manifest_stripped in [false, true] {
+            rewrite_config_object(provider, &config_path(), edit).await;
+            if manifest_stripped {
+                provider.delete(&manifest_path()).await.unwrap();
+            } else {
+                rewrite_config_object(provider, &object, edit).await;
+            }
+            let before = storage_objects(provider.as_ref()).await;
+            let anchored = anchor.load_state(&anchor_id).unwrap();
+            let other_anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let other_device = manager_with_storage(provider.clone(), other_anchor.clone());
+
+            for (new_device, manager) in [(false, &manager), (true, &other_device)] {
+                for path in OPEN_PATHS {
+                    let context = format!(
+                        "{path} (new device: {new_device}, manifest stripped: {manifest_stripped})"
+                    );
+                    match open_attempt(manager, path, password, words).await {
+                        Ok(_) => panic!("{context} accepted a rewritten vault.config"),
+                        Err(error) => refusals.push(Refusal {
+                            path,
+                            new_device,
+                            manifest_stripped,
+                            message: error.to_string(),
+                        }),
+                    }
+                    assert_eq!(
+                        storage_objects(provider.as_ref()).await,
+                        before,
+                        "{context} wrote to storage"
+                    );
+                }
+            }
+            assert_eq!(anchor.load_state(&anchor_id).unwrap(), anchored);
+            assert_eq!(other_anchor.load_state(&anchor_id).unwrap(), None);
+            let location_id = other_device
+                .location_freshness_id("test", &serde_json::Value::Null)
+                .unwrap();
+            assert_eq!(other_anchor.load(&location_id).unwrap(), None);
+
+            for (path, bytes) in &originals {
+                provider.upload(path, bytes.clone()).await.unwrap();
+            }
+            provider
+                .upload(&manifest_path(), manifest.clone())
+                .await
+                .unwrap();
+        }
+        refusals
+    }
+
+    /// `assert_rewrite_refused` on a fresh vault holding one file.
+    async fn assert_config_rewrite_refused(
+        vault_id: &str,
+        edit: &dyn Fn(&mut serde_json::Value),
+    ) -> Vec<Refusal> {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let (_, words) = write_current_vault_with_file(&manager, vault_id).await;
+        assert_rewrite_refused(&provider, &anchor, vault_id, b"password", &words, edit).await
+    }
+
+    async fn read_back(session: &VaultSession, file: &VaultPath) -> Vec<u8> {
+        crate::operations::VaultOperations::new(session)
+            .unwrap()
+            .read_file(file)
+            .await
+            .unwrap()
+    }
+
+    /// The genuine snapshot opens and reads `file` on this device and on a
+    /// device that has never seen the vault.
+    async fn assert_genuine_snapshot_opens(
+        provider: &Arc<MemoryProvider>,
+        anchor: &Arc<InMemoryFreshnessAnchor>,
+        password: &[u8],
+        file: &VaultPath,
+    ) {
+        let other_device: Arc<InMemoryFreshnessAnchor> = Arc::new(InMemoryFreshnessAnchor::new());
+        for device in [anchor.clone(), other_device] {
+            let session = manager_with_storage(provider.clone(), device)
+                .open_vault("test", serde_json::Value::Null, password)
+                .await
+                .unwrap();
+            assert_eq!(read_back(&session, file).await, V1_1_CONTENT);
+        }
+    }
+
+    /// M-1 (a): weaker KDF parameters written into `vault.config` are refused
+    /// before any write. A password open already fails on them (the password
+    /// check is keyed by those parameters); recovery does not use the
+    /// password, so without config integrity it rewraps under them.
+    #[tokio::test]
+    async fn rewritten_kdf_parameters_are_refused_before_any_write() {
+        assert_config_rewrite_refused("weak-kdf", &weaken_kdf).await;
+    }
+
+    /// M-1 (b): a changed hardware-key enrollment or provider setting is
+    /// refused before any write.
+    #[tokio::test]
+    async fn rewritten_hardware_key_or_provider_settings_are_refused_before_any_write() {
+        let fake_enrollment = |json: &mut serde_json::Value| {
+            json["hardware_key"] = serde_json::json!({
+                "metadata": { "kind": "RawSecret", "enrolled_at": "2026-01-01T00:00:00Z" },
+                "wrapped_master_key": vec![7u8; 72],
+                "key_verification": vec![7u8; 58],
+            });
+        };
+        assert_config_rewrite_refused("hardware-key-added", &fake_enrollment).await;
+        assert_config_rewrite_refused("provider-config", &redirect_provider).await;
+        assert_config_rewrite_refused("provider-type", &|json: &mut serde_json::Value| {
+            json["provider_type"] = serde_json::json!("attacker");
+        })
+        .await;
+
+        // An enrolled hardware key removed by the provider.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let (file, words) = write_current_vault_with_file(&manager, "hardware-key-removed").await;
+        let mut session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        let master_key = session.master_key().unwrap().clone();
+        session
+            .config_mut()
+            .enroll_hardware_key(
+                &master_key,
+                b"simulated-yubikey-hmac-response",
+                crate::config::HardwareKeyMetadata::new(
+                    crate::config::HardwareKeyKind::YubiKeyHmacSha1,
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        manager.save_config(&mut session).await.unwrap();
+        drop(session);
+        assert_genuine_snapshot_opens(&provider, &anchor, b"password", &file).await;
+        assert_rewrite_refused(
+            &provider,
+            &anchor,
+            "hardware-key-removed",
+            b"password",
+            &words,
+            &|json: &mut serde_json::Value| {
+                json.as_object_mut().unwrap().remove("hardware_key");
+            },
+        )
+        .await;
+    }
+
+    /// M-1 (c) and (e): the genuine config reopens and reads data after a
+    /// password change and after a recovery, and a tampered copy of each new
+    /// config is refused.
+    #[tokio::test]
+    async fn rotated_configs_reopen_and_their_tampered_copies_are_refused() {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let vault_id = "m1-rotation";
+        let (file, words) = write_current_vault_with_file(&manager, vault_id).await;
+
+        let mut session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        session
+            .change_password(b"password", b"changed-password")
+            .unwrap();
+        manager.save_config(&mut session).await.unwrap();
+        assert_eq!(read_back(&session, &file).await, V1_1_CONTENT);
+        drop(session);
+        assert_genuine_snapshot_opens(&provider, &anchor, b"changed-password", &file).await;
+        for edit in [
+            weaken_kdf as fn(&mut serde_json::Value),
+            redirect_provider,
+            alter_config_mac,
+        ] {
+            assert_rewrite_refused(
+                &provider,
+                &anchor,
+                vault_id,
+                b"changed-password",
+                &words,
+                &edit,
+            )
+            .await;
+        }
+
+        let recovered = manager
+            .recover_vault(
+                "test",
+                serde_json::Value::Null,
+                &words,
+                b"recovered-password",
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_back(&recovered, &file).await, V1_1_CONTENT);
+        drop(recovered);
+        assert_genuine_snapshot_opens(&provider, &anchor, b"recovered-password", &file).await;
+        for edit in [
+            weaken_kdf as fn(&mut serde_json::Value),
+            redirect_provider,
+            alter_config_mac,
+        ] {
+            assert_rewrite_refused(
+                &provider,
+                &anchor,
+                vault_id,
+                b"recovered-password",
+                &words,
+                &edit,
+            )
+            .await;
+        }
+    }
+
+    /// M-1 (d): a config whose tag was removed or altered is refused, and where
+    /// no manifest binds the config the refusal names the tag.
+    #[tokio::test]
+    async fn removed_or_altered_config_mac_is_refused_with_a_clear_message() {
+        for (edit, expected) in [
+            (
+                strip_config_mac as fn(&mut serde_json::Value),
+                "vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused",
+            ),
+            (
+                alter_config_mac,
+                "vault.config integrity check failed (config_mac mismatch): the stored config was changed outside this vault",
+            ),
+        ] {
+            let refusals = assert_config_rewrite_refused("mac-edit", &edit).await;
+            let unbound: Vec<_> = refusals
+                .iter()
+                .filter(|refusal| refusal.new_device && refusal.manifest_stripped)
+                .collect();
+            assert_eq!(unbound.len(), OPEN_PATHS.len());
+            for refusal in unbound {
+                assert_eq!(
+                    refusal.message,
+                    format!("Cryptographic error: {expected}"),
+                    "{}",
+                    refusal.path
+                );
+            }
+        }
+    }
+
+    /// M-1 (f): a vault made by `create_vault` stores a tagged config, opens
+    /// and reads back on this device and a new one, and its genuine config
+    /// also bootstraps where the manifest is missing.
+    #[tokio::test]
+    async fn created_vault_stores_a_tagged_config_and_reads_back() {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let (file, _) = write_current_vault_with_file(&manager, "m1-fresh").await;
+
+        let stored = provider.download(&config_path()).await.unwrap();
+        let manifest = provider.download(&manifest_path()).await.unwrap();
+        let object = GenerationManifest::config_path_hint(&manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.download(&object).await.unwrap(), stored);
+        let json: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(json["config_mac"].as_array().map(Vec::len), Some(32));
+
+        assert_genuine_snapshot_opens(&provider, &anchor, b"password", &file).await;
+
+        provider.delete(&manifest_path()).await.unwrap();
+        let session =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()))
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await
+                .unwrap();
+        assert_eq!(read_back(&session, &file).await, V1_1_CONTENT);
     }
 }
