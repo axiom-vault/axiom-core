@@ -277,6 +277,55 @@ impl CompositeStorageProvider {
         futures::future::join_all(futures).await;
     }
 
+    /// Rename or copy (`op`) a mirror object on every backend: the copy at
+    /// `from` and, where it was never renamed into place, its staged copy.
+    /// A backend succeeds if either moved.
+    async fn mirror_transfer(
+        &self,
+        op: &str,
+        from: &VaultPath,
+        to: &VaultPath,
+    ) -> Result<(Metadata, Vec<usize>)> {
+        self.ensure_shard_map_loaded().await?;
+        let entry = self
+            .shard_map
+            .read()
+            .await
+            .get(&from.to_string_path())
+            .cloned();
+        let staged = match &entry {
+            Some(e) => Some((Self::mirror_staging(from, e)?, Self::mirror_staging(to, e)?)),
+            None => None,
+        };
+        let is_copy = op == "copy";
+        let (staged, name) = (&staged, to.name().unwrap_or("/").to_string());
+        let (meta, succeeded) = self
+            .fan_out(op, |backend| async move {
+                let transfer = |a: &VaultPath, b: &VaultPath| {
+                    let backend = Arc::clone(&backend);
+                    let (a, b) = (a.clone(), b.clone());
+                    async move {
+                        if is_copy {
+                            backend.copy(&a, &b).await
+                        } else {
+                            backend.rename(&a, &b).await
+                        }
+                    }
+                };
+                let main = transfer(from, to).await;
+                let side = match staged {
+                    Some((sf, st)) => Some(transfer(sf, st).await),
+                    None => None,
+                };
+                match (main, side) {
+                    (Ok(meta), _) | (Err(_), Some(Ok(meta))) => Ok(meta),
+                    (Err(e), _) => Err(e),
+                }
+            })
+            .await?;
+        Ok((Metadata { name, ..meta }, succeeded))
+    }
+
     /// Get a clone of the current shard map (for inspection/testing).
     pub async fn get_shard_map(&self) -> ShardMap {
         self.shard_map.read().await.clone()
@@ -588,15 +637,8 @@ impl StorageProvider for CompositeStorageProvider {
         self.ensure_shard_map_loaded().await?;
         match self.config.mode {
             RaidMode::Mirror => {
-                let from = from.clone();
-                let to = to.clone();
-                let (meta, succeeded) = self
-                    .fan_out("rename", |backend| {
-                        let from = from.clone();
-                        let to = to.clone();
-                        async move { backend.rename(&from, &to).await }
-                    })
-                    .await?;
+                let (meta, succeeded) = self.mirror_transfer("rename", from, to).await?;
+                let (from, to) = (from.clone(), to.clone());
 
                 // Update shard map: rename entry, then remove shards for failed backends
                 let from_str = from.to_string_path();
@@ -649,15 +691,8 @@ impl StorageProvider for CompositeStorageProvider {
         self.ensure_shard_map_loaded().await?;
         match self.config.mode {
             RaidMode::Mirror => {
-                let from = from.clone();
-                let to = to.clone();
-                let (meta, succeeded) = self
-                    .fan_out("copy", |backend| {
-                        let from = from.clone();
-                        let to = to.clone();
-                        async move { backend.copy(&from, &to).await }
-                    })
-                    .await?;
+                let (meta, succeeded) = self.mirror_transfer("copy", from, to).await?;
+                let (from, to) = (from.clone(), to.clone());
 
                 // Copy shard map entry for the new path, retaining only succeeded backends
                 let from_str = from.to_string_path();

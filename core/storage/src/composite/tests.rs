@@ -1829,4 +1829,13 @@ async fn test_m16_unpromoted_mirror_copy_stays_usable() {
         .map(|m| m.name)
         .collect();
     assert_eq!(names, vec!["file.bin"]);
+
+    // Rename and copy carry the staged copy along.
+    let renamed = VaultPath::parse("/data/renamed.bin").unwrap();
+    let copied = VaultPath::parse("/data/copied.bin").unwrap();
+    provider.rename(&path, &renamed).await.unwrap();
+    provider.copy(&renamed, &copied).await.unwrap();
+    assert!(!provider.exists(&path).await.unwrap());
+    assert_eq!(provider.download(&renamed).await.unwrap(), b"staged");
+    assert_eq!(provider.download(&copied).await.unwrap(), b"staged");
 }
