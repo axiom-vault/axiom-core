@@ -47,15 +47,26 @@ fn persisted_provider_config(
     }))
 }
 
-/// Whether an authenticated 1.1 config must be upgraded to `CURRENT` on open.
+/// Whether an authenticated 1.1 config must be upgraded to `CURRENT`.
+///
+/// Only `upgrade_to_current` passes `allow_upgrade`; every open path refuses a
+/// 1.1 vault, and callers check this before any write.
 ///
 /// Callers relabel only their in-memory copy and publish it as a new manifest
 /// generation; `vault.config` is a cache written after the manifest commit, so
 /// it never reads 2.0 while the authoritative snapshot is still 1.1.
-fn needs_format_upgrade(config: &VaultConfig) -> Result<bool> {
+fn needs_format_upgrade(config: &VaultConfig, allow_upgrade: bool) -> Result<bool> {
     match check_migration_needed(config) {
         MigrationStatus::UpToDate => Ok(false),
-        MigrationStatus::NeedsMigration { from, .. } if from == VaultVersion::V1_1 => Ok(true),
+        MigrationStatus::NeedsMigration { from, .. } if from == VaultVersion::V1_1 => {
+            if allow_upgrade {
+                Ok(true)
+            } else {
+                Err(Error::Vault(format!(
+                    "vault version {from} must be upgraded with `axiom vault migrate` before it can be opened"
+                )))
+            }
+        }
         MigrationStatus::NeedsMigration { from, .. } => Err(Error::Vault(format!(
             "vault version {from} must be migrated to {} before it can be opened",
             VaultVersion::V1_1
@@ -362,11 +373,42 @@ impl VaultManager {
     }
 
     /// Open an existing vault.
+    ///
+    /// A 1.1 vault is refused before anything is written; upgrade it with
+    /// [`VaultManager::upgrade_to_current`].
     pub async fn open_vault(
         &self,
         provider_type: &str,
         provider_config: serde_json::Value,
         password: &[u8],
+    ) -> Result<VaultSession> {
+        self.open_with_upgrade_policy(provider_type, provider_config, password, false)
+            .await
+    }
+
+    /// Upgrade a 1.1 vault to `CURRENT` and return the open session.
+    ///
+    /// The upgrade is published as a new manifest generation; `vault.config`
+    /// reads `CURRENT` only after that commit, so an interrupted upgrade leaves
+    /// a 1.1 vault that can be upgraded again. A vault already at `CURRENT` is
+    /// opened exactly as by [`VaultManager::open_vault`], without a new
+    /// generation. A 1.0 vault is refused until the registry migrates it to 1.1.
+    pub async fn upgrade_to_current(
+        &self,
+        provider_type: &str,
+        provider_config: serde_json::Value,
+        password: &[u8],
+    ) -> Result<VaultSession> {
+        self.open_with_upgrade_policy(provider_type, provider_config, password, true)
+            .await
+    }
+
+    async fn open_with_upgrade_policy(
+        &self,
+        provider_type: &str,
+        provider_config: serde_json::Value,
+        password: &[u8],
+        allow_upgrade: bool,
     ) -> Result<VaultSession> {
         let runtime_config = self.runtime_provider_config(provider_type, &provider_config)?;
         let provider = self.registry.resolve(provider_type, runtime_config)?;
@@ -407,7 +449,7 @@ impl VaultManager {
                 ));
             }
             let mut config = snapshot_config;
-            let upgrade = needs_format_upgrade(&config)?;
+            let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
             let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
             let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if let Some(accepted) = &anchored_state {
@@ -475,7 +517,7 @@ impl VaultManager {
                 "snapshot manifest missing for a vault with trusted freshness state".to_string(),
             ));
         }
-        let upgrade = needs_format_upgrade(&config)?;
+        let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
 
         // Legacy bootstrap is allowed only when neither storage nor this device has
         // freshness state. Authenticate and decrypt before sanitizing a legacy config.
@@ -569,6 +611,8 @@ impl VaultManager {
                 ));
             }
             config = snapshot_config;
+            // Refuse 1.0 and 1.1 before the anchor and cache writes below.
+            needs_format_upgrade(&config, false)?;
             let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
             let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
             if let Some(accepted) = &anchored_state {
@@ -608,16 +652,12 @@ impl VaultManager {
                         .to_string(),
                 ));
             }
+            needs_format_upgrade(&config, false)?;
             (
                 VaultSession::load_and_decrypt_tree(&provider, &master_key).await?,
                 0,
             )
         };
-
-        // A 1.1 vault is published as 2.0 by the `save_tree` below.
-        if needs_format_upgrade(&config)? {
-            config.version = VaultVersion::CURRENT;
-        }
 
         // Reset password in config. The master key itself doesn't change.
         config.reset_password(&recovery_key, new_password)?;
@@ -1857,6 +1897,12 @@ mod tests {
             .expect("open must refuse a manifest-less vault at an anchored location");
         assert!(matches!(error, Error::Conflict(_)));
         let error = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("upgrade must refuse a manifest-less vault at an anchored location");
+        assert!(matches!(error, Error::Conflict(_)));
+        let error = manager
             .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
             .await
             .err()
@@ -2045,99 +2091,122 @@ mod tests {
 
     #[tokio::test]
     async fn opening_legacy_cloud_config_migrates_and_strips_embedded_credentials() {
-        let storage = Arc::new(axiomvault_storage::MemoryProvider::new());
-        let runtime_config = serde_json::json!({
-            "folder_id": "legacy-folder",
-            "credential_ref": "local:gdrive:resolved",
-            "tokens": {
-                "access_token": "initial-local-access",
-                "refresh_token": "initial-local-refresh",
-                "expires_at": "2099-01-01T00:00:00Z"
-            }
-        });
-        let mut create_registry = ProviderRegistry::new();
-        let create_storage = storage.clone();
-        create_registry
-            .register("gdrive", Box::new(move |_| Ok(create_storage.clone())))
-            .unwrap();
-        let create_manager = VaultManager::with_registry_and_anchor(
-            create_registry,
-            Arc::new(InMemoryFreshnessAnchor::new()),
-        );
-        let creation = create_manager
-            .create_vault(
-                VaultId::new("legacy-cloud").unwrap(),
-                b"password",
-                "gdrive",
-                runtime_config,
-                KdfParams::moderate(),
-            )
-            .await
-            .unwrap();
+        for version in [VaultVersion::CURRENT, VaultVersion::V1_1] {
+            let storage = Arc::new(axiomvault_storage::MemoryProvider::new());
+            let runtime_config = serde_json::json!({
+                "folder_id": "legacy-folder",
+                "credential_ref": "local:gdrive:resolved",
+                "tokens": {
+                    "access_token": "initial-local-access",
+                    "refresh_token": "initial-local-refresh",
+                    "expires_at": "2099-01-01T00:00:00Z"
+                }
+            });
+            let mut create_registry = ProviderRegistry::new();
+            let create_storage = storage.clone();
+            create_registry
+                .register("gdrive", Box::new(move |_| Ok(create_storage.clone())))
+                .unwrap();
+            let create_manager = VaultManager::with_registry_and_anchor(
+                create_registry,
+                Arc::new(InMemoryFreshnessAnchor::new()),
+            );
+            let creation = create_manager
+                .create_vault(
+                    VaultId::new("legacy-cloud").unwrap(),
+                    b"password",
+                    "gdrive",
+                    runtime_config,
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
 
-        let mut legacy: serde_json::Value =
-            serde_json::from_slice(&creation.session.config().to_bytes().unwrap()).unwrap();
-        legacy["provider_config"] = serde_json::json!({
-            "folder_id": "legacy-folder",
-            "tokens": {
-                "access_token": "legacy-uploaded-access-secret",
-                "refresh_token": "legacy-uploaded-refresh-secret",
-                "expires_at": "2099-01-01T00:00:00Z"
-            },
-            "auth_config": {
-                "client_id": "legacy-client-id",
-                "client_secret": "legacy-uploaded-client-secret",
-                "redirect_url": "http://localhost/callback"
-            }
-        });
-        storage
-            .upload(
-                &VaultPath::parse(CONFIG_FILENAME).unwrap(),
-                serde_json::to_vec(&legacy).unwrap(),
-            )
-            .await
-            .unwrap();
-        storage
-            .delete(
-                &VaultPath::parse(META_DIRNAME)
+            let mut labelled = creation.session.config().clone();
+            labelled.version = version;
+            let mut legacy: serde_json::Value =
+                serde_json::from_slice(&labelled.to_bytes().unwrap()).unwrap();
+            legacy["provider_config"] = serde_json::json!({
+                "folder_id": "legacy-folder",
+                "tokens": {
+                    "access_token": "legacy-uploaded-access-secret",
+                    "refresh_token": "legacy-uploaded-refresh-secret",
+                    "expires_at": "2099-01-01T00:00:00Z"
+                },
+                "auth_config": {
+                    "client_id": "legacy-client-id",
+                    "client_secret": "legacy-uploaded-client-secret",
+                    "redirect_url": "http://localhost/callback"
+                }
+            });
+            storage
+                .upload(
+                    &VaultPath::parse(CONFIG_FILENAME).unwrap(),
+                    serde_json::to_vec(&legacy).unwrap(),
+                )
+                .await
+                .unwrap();
+            storage
+                .delete(
+                    &VaultPath::parse(META_DIRNAME)
+                        .unwrap()
+                        .join(MANIFEST_FILENAME)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(creation);
+
+            let mut open_registry = ProviderRegistry::new();
+            let open_storage = storage.clone();
+            open_registry
+                .register("gdrive", Box::new(move |_| Ok(open_storage.clone())))
+                .unwrap();
+            let open_manager = VaultManager::with_registry_credential_resolver_and_anchor(
+                open_registry,
+                Arc::new(TestCredentialResolver),
+                Arc::new(InMemoryFreshnessAnchor::new()),
+            );
+            let safe_config = serde_json::json!({
+                "credential_schema": 1,
+                "credential_ref": "local:gdrive:resolved",
+                "folder_id": "legacy-folder"
+            });
+
+            let session = if version == VaultVersion::V1_1 {
+                // Refused before the sanitizing upload; the explicit upgrade sanitizes.
+                assert_v1_1_refusal(
+                    open_manager
+                        .open_vault("gdrive", safe_config.clone(), b"password")
+                        .await,
+                );
+                let untouched = storage
+                    .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(untouched, serde_json::to_vec(&legacy).unwrap());
+                open_manager
+                    .upgrade_to_current("gdrive", safe_config.clone(), b"password")
+                    .await
                     .unwrap()
-                    .join(MANIFEST_FILENAME)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        drop(creation);
-
-        let mut open_registry = ProviderRegistry::new();
-        let open_storage = storage.clone();
-        open_registry
-            .register("gdrive", Box::new(move |_| Ok(open_storage.clone())))
-            .unwrap();
-        let open_manager = VaultManager::with_registry_credential_resolver_and_anchor(
-            open_registry,
-            Arc::new(TestCredentialResolver),
-            Arc::new(InMemoryFreshnessAnchor::new()),
-        );
-        let safe_config = serde_json::json!({
-            "credential_schema": 1,
-            "credential_ref": "local:gdrive:resolved",
-            "folder_id": "legacy-folder"
-        });
-
-        let session = open_manager
-            .open_vault("gdrive", safe_config.clone(), b"password")
-            .await
-            .unwrap();
-        assert_eq!(session.config().provider_config, safe_config);
-        let migrated = storage
-            .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
-            .await
-            .unwrap();
-        let migrated = String::from_utf8(migrated).unwrap();
-        assert!(!migrated.contains("legacy-uploaded-access-secret"));
-        assert!(!migrated.contains("legacy-uploaded-refresh-secret"));
-        assert!(!migrated.contains("legacy-uploaded-client-secret"));
-        assert!(migrated.contains("local:gdrive:resolved"));
+            } else {
+                open_manager
+                    .open_vault("gdrive", safe_config.clone(), b"password")
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(session.config().version, VaultVersion::CURRENT);
+            assert_eq!(session.config().provider_config, safe_config);
+            let migrated = storage
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap();
+            let migrated = String::from_utf8(migrated).unwrap();
+            assert!(!migrated.contains("legacy-uploaded-access-secret"));
+            assert!(!migrated.contains("legacy-uploaded-refresh-secret"));
+            assert!(!migrated.contains("legacy-uploaded-client-secret"));
+            assert!(migrated.contains("local:gdrive:resolved"));
+        }
     }
 
     #[tokio::test]
@@ -2445,74 +2514,68 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn v1_1_vault_without_manifest_upgrades_on_open_and_survives_interruption() {
-        use crate::operations::VaultOperations;
+    const V1_1_REFUSAL: &str =
+        "vault version 1.1 must be upgraded with `axiom vault migrate` before it can be opened";
 
-        let provider = Arc::new(ManifestFailProvider::new());
-        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
-        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
-        let vault_id = VaultId::new("v1-1-bootstrap").unwrap();
-        let (file, _) =
-            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
-        let v1_1_bytes = provider.download(&config_path()).await.unwrap();
-
-        // Interrupted before the first manifest commit: storage is still 1.1.
-        provider.fail_next_manifest();
-        assert!(manager
-            .open_vault("test", serde_json::Value::Null, b"password")
-            .await
-            .is_err());
-        assert!(!provider.exists(&manifest_path()).await.unwrap());
-        assert_eq!(provider.download(&config_path()).await.unwrap(), v1_1_bytes);
-
-        let session = manager
-            .open_vault("test", serde_json::Value::Null, b"password")
-            .await
-            .unwrap();
-        assert_eq!(session.config().version, VaultVersion::CURRENT);
-        let (generation, committed) =
-            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
-        assert_eq!(generation, 1);
-        assert_eq!(committed.version, VaultVersion::CURRENT);
-        assert_eq!(
-            stored_config(provider.as_ref()).await.version,
-            VaultVersion::CURRENT
-        );
-        assert_eq!(
-            VaultOperations::new(&session)
-                .unwrap()
-                .read_file(&file)
-                .await
-                .unwrap(),
-            V1_1_CONTENT
-        );
-        drop(session);
-
-        // A 2.0 vault reopens without another upgrade generation.
-        let reopened = manager
-            .open_vault("test", serde_json::Value::Null, b"password")
-            .await
-            .unwrap();
-        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(1));
-        assert_eq!(
-            VaultOperations::new(&reopened)
-                .unwrap()
-                .read_file(&file)
-                .await
-                .unwrap(),
-            V1_1_CONTENT
-        );
+    fn assert_v1_1_refusal(result: Result<VaultSession>) {
+        match result {
+            Err(Error::Vault(message)) => assert_eq!(message, V1_1_REFUSAL),
+            Err(other) => panic!("unexpected error for a 1.1 vault: {other}"),
+            Ok(_) => panic!("a 1.1 vault must not open without an explicit upgrade"),
+        }
     }
 
-    #[tokio::test]
-    async fn v1_1_vault_with_manifest_upgrades_on_open_and_survives_interruption() {
+    /// Every stored object keyed by path, with its content digest and etag.
+    /// `MemoryProvider` issues a fresh etag on every upload, so equal maps mean
+    /// no object was written at all.
+    async fn storage_objects<P: StorageProvider + ?Sized>(
+        provider: &P,
+    ) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+        let mut objects = std::collections::BTreeMap::new();
+        let mut pending = vec![VaultPath::root()];
+        while let Some(directory) = pending.pop() {
+            for entry in provider.list(&directory).await.unwrap() {
+                let path = directory.join(&entry.name).unwrap();
+                if entry.is_directory {
+                    objects.insert(path.to_string(), ("directory".to_string(), entry.etag));
+                    pending.push(path);
+                } else {
+                    let bytes = provider.download(&path).await.unwrap();
+                    objects.insert(path.to_string(), (digest(&bytes), entry.etag));
+                }
+            }
+        }
+        objects
+    }
+
+    async fn storage_digests<P: StorageProvider + ?Sized>(
+        provider: &P,
+    ) -> std::collections::BTreeMap<String, String> {
+        storage_objects(provider)
+            .await
+            .into_iter()
+            .map(|(path, (content, _))| (path, content))
+            .collect()
+    }
+
+    struct V1_1ManifestVault {
+        file: VaultPath,
+        generation: u64,
+        manifest_bytes: Vec<u8>,
+        config_bytes: Vec<u8>,
+        recovery_words: Zeroizing<String>,
+    }
+
+    /// A vault whose current manifest generation is labelled 1.1, as a pre-bump
+    /// client on this device published it, with a 1.1 `vault.config` cache.
+    async fn write_v1_1_vault_with_manifest<P: StorageProvider + ?Sized>(
+        manager: &VaultManager,
+        provider: &P,
+        anchor: &dyn FreshnessAnchor,
+        vault_id: &VaultId,
+    ) -> V1_1ManifestVault {
         use crate::operations::VaultOperations;
 
-        let provider = Arc::new(ManifestFailProvider::new());
-        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
-        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
-        let vault_id = VaultId::new("v1-1-manifest").unwrap();
         let creation = manager
             .create_vault(
                 vault_id.clone(),
@@ -2569,33 +2632,323 @@ mod tests {
             .unwrap();
         anchor
             .store_state(
-                &test_anchor_id(&vault_id),
+                &test_anchor_id(vault_id),
                 FreshnessState {
                     generation: labelled.generation,
                     manifest_digest: Some(digest(&labelled_bytes)),
                 },
             )
             .unwrap();
-        let v1_1_generation = labelled.generation;
+        V1_1ManifestVault {
+            file,
+            generation: labelled.generation,
+            manifest_bytes: labelled_bytes,
+            config_bytes: v1_1_bytes,
+            recovery_words: creation.recovery_words.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_a_v1_1_vault_is_refused_before_any_write() {
+        // Without a manifest: no cache, sanitize, manifest or anchor write.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-refused").unwrap();
+        let (_, words) =
+            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+        let before = storage_objects(provider.as_ref()).await;
+
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+        assert_v1_1_refusal(
+            manager
+                .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                .await,
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(anchor.load_state(&test_anchor_id(&vault_id)).unwrap(), None);
+        let location_id = manager
+            .location_freshness_id("test", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(anchor.load(&location_id).unwrap(), None);
+
+        // With a 1.1 manifest generation: the anchor state is left as it was.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-manifest-refused").unwrap();
+        let vault =
+            write_v1_1_vault_with_manifest(&manager, provider.as_ref(), anchor.as_ref(), &vault_id)
+                .await;
+        let before = storage_objects(provider.as_ref()).await;
+        let anchored = anchor.load_state(&test_anchor_id(&vault_id)).unwrap();
+
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+        assert_v1_1_refusal(
+            manager
+                .recover_vault(
+                    "test",
+                    serde_json::Value::Null,
+                    &vault.recovery_words,
+                    b"new-password",
+                )
+                .await,
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(
+            anchor.load_state(&test_anchor_id(&vault_id)).unwrap(),
+            anchored
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_to_current_makes_a_v1_1_vault_readable_at_current() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let (file, _) = write_v1_1_vault_without_manifest(provider.clone(), "v1-1-upgrade").await;
+
+        let session = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        let (generation, committed) =
+            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
+        assert_eq!(generation, 1);
+        assert_eq!(committed.version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+        drop(session);
+
+        // The upgraded vault now opens through the ordinary path.
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(
+            VaultOperations::new(&reopened)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_to_current_on_a_current_vault_writes_nothing() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("already-current").unwrap();
+        let creation = manager
+            .create_vault(
+                vault_id.clone(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let file = VaultPath::parse("/notes.txt").unwrap();
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&file, V1_1_CONTENT)
+            .await
+            .unwrap();
         drop(creation);
+        let before = storage_digests(provider.as_ref()).await;
+        let generation = anchor.load(&test_anchor_id(&vault_id)).unwrap();
+
+        let session = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        // Same bytes everywhere and no new generation: at most the open path's
+        // identical `vault.config` cache refresh.
+        assert_eq!(storage_digests(provider.as_ref()).await, before);
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), generation);
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_1_vault_without_manifest_upgrades_explicitly_and_survives_interruption() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-bootstrap").unwrap();
+        let (file, _) =
+            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+        let v1_1_bytes = provider.download(&config_path()).await.unwrap();
+
+        // Interrupted before the first manifest commit: storage is still 1.1.
+        provider.fail_next_manifest();
+        assert!(manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .is_err());
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        assert_eq!(provider.download(&config_path()).await.unwrap(), v1_1_bytes);
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+
+        let session = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        let (generation, committed) =
+            committed_config(provider.as_ref(), session.master_key().unwrap()).await;
+        assert_eq!(generation, 1);
+        assert_eq!(committed.version, VaultVersion::CURRENT);
+        assert_eq!(
+            stored_config(provider.as_ref()).await.version,
+            VaultVersion::CURRENT
+        );
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+        drop(session);
+
+        // A 2.0 vault reopens without another upgrade generation.
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(anchor.load(&test_anchor_id(&vault_id)).unwrap(), Some(1));
+        assert_eq!(
+            VaultOperations::new(&reopened)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_upgrade_leaves_a_v1_1_vault_refused_and_upgradable() {
+        use crate::operations::VaultOperations;
+        use std::time::Duration;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-cancelled-upgrade").unwrap();
+        let (file, _) =
+            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+        let v1_1_bytes = provider.download(&config_path()).await.unwrap();
+
+        // Cancelled after the generation tree upload, before the manifest commit.
+        provider.pause_next_tree_after_commit();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            manager.upgrade_to_current("test", serde_json::Value::Null, b"password"),
+        )
+        .await;
+        assert!(result.is_err(), "upgrade future must be cancelled");
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        assert_eq!(provider.download(&config_path()).await.unwrap(), v1_1_bytes);
+        assert_eq!(anchor.load_state(&test_anchor_id(&vault_id)).unwrap(), None);
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+
+        let session = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        assert_eq!(
+            VaultOperations::new(&session)
+                .unwrap()
+                .read_file(&file)
+                .await
+                .unwrap(),
+            V1_1_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_1_vault_with_manifest_upgrades_explicitly_and_survives_interruption() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(ManifestFailProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("v1-1-manifest").unwrap();
+        let vault =
+            write_v1_1_vault_with_manifest(&manager, provider.as_ref(), anchor.as_ref(), &vault_id)
+                .await;
+        let file = vault.file;
+        let v1_1_generation = vault.generation;
 
         // Interrupted before the 2.0 manifest commit: still a 1.1 vault.
         provider.fail_next_manifest();
         assert!(manager
-            .open_vault("test", serde_json::Value::Null, b"password")
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
             .await
             .is_err());
         assert_eq!(
             provider.download(&manifest_path()).await.unwrap(),
-            labelled_bytes
+            vault.manifest_bytes
         );
         assert_eq!(
             stored_config(provider.as_ref()).await.version,
             VaultVersion::V1_1
         );
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
 
         let session = manager
-            .open_vault("test", serde_json::Value::Null, b"password")
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
             .await
             .unwrap();
         assert_eq!(session.config().version, VaultVersion::CURRENT);
@@ -2619,7 +2972,10 @@ mod tests {
 
         // Committed, but the `vault.config` cache write was lost: the manifest is
         // authoritative, so the vault opens at 2.0 and the cache is rewritten.
-        provider.upload(&config_path(), v1_1_bytes).await.unwrap();
+        provider
+            .upload(&config_path(), vault.config_bytes)
+            .await
+            .unwrap();
         let reopened = manager
             .open_vault("test", serde_json::Value::Null, b"password")
             .await
@@ -2644,7 +3000,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovering_a_v1_1_vault_publishes_it_as_current() {
+    async fn upgrade_cannot_bypass_the_location_marker() {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        write_v1_1_vault_without_manifest(provider.clone(), "v1-1-marked").await;
+        manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        let location_id = manager
+            .location_freshness_id("test", &serde_json::Value::Null)
+            .unwrap();
+        assert!(anchor.load(&location_id).unwrap().is_some());
+
+        // N-1 after the upgrade, relabelled 1.1 so only the upgrade path would
+        // accept it: the location marker still refuses the no-manifest path.
+        strip_manifest_and_rename_vault(&provider).await;
+        let mut relabelled = stored_config(provider.as_ref()).await;
+        relabelled.version = VaultVersion::V1_1;
+        provider
+            .upload(&config_path(), relabelled.to_bytes().unwrap())
+            .await
+            .unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+
+        assert!(matches!(
+            manager
+                .upgrade_to_current("test", serde_json::Value::Null, b"password")
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(
+            anchor
+                .load(&test_anchor_id(&VaultId::new("attacker-renamed").unwrap()))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn recovering_a_v1_1_vault_is_refused_until_upgraded() {
         use crate::operations::VaultOperations;
 
         let provider = Arc::new(MemoryProvider::new());
@@ -2652,7 +3055,21 @@ mod tests {
             manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
         let (file, words) =
             write_v1_1_vault_without_manifest(provider.clone(), "v1-1-recover").await;
+        let before = storage_objects(provider.as_ref()).await;
 
+        assert_v1_1_refusal(
+            manager
+                .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                .await,
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+
+        drop(
+            manager
+                .upgrade_to_current("test", serde_json::Value::Null, b"password")
+                .await
+                .unwrap(),
+        );
         let session = manager
             .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
             .await
@@ -2676,7 +3093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v1_0_vault_is_refused_on_open_until_migrated_then_upgrades() {
+    async fn v1_0_vault_is_refused_until_migrated_then_upgraded_explicitly() {
         use crate::migration::MigrationRegistry;
 
         let provider = Arc::new(MemoryProvider::new());
@@ -2709,13 +3126,22 @@ mod tests {
             .upload(&config_path(), legacy_bytes.clone())
             .await
             .unwrap();
+        let before = storage_objects(provider.as_ref()).await;
 
+        let v1_0_refusal = "vault version 1.0 must be migrated to 1.1 before it can be opened";
         let error = manager
             .open_vault("test", serde_json::Value::Null, b"password")
             .await
             .err()
             .expect("a 1.0 vault must be migrated before it is opened");
-        assert!(error.to_string().contains("must be migrated"));
+        assert!(matches!(&error, Error::Vault(message) if message == v1_0_refusal));
+        let error = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("a 1.0 vault must be migrated before it is upgraded");
+        assert!(matches!(&error, Error::Vault(message) if message == v1_0_refusal));
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
         assert!(!provider.exists(&manifest_path()).await.unwrap());
         assert_eq!(
             provider.download(&config_path()).await.unwrap(),
@@ -2728,9 +3154,14 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.config.version, VaultVersion::V1_1);
         assert!(outcome.recovery_words.is_some());
+        assert_v1_1_refusal(
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
 
         let session = manager
-            .open_vault("test", serde_json::Value::Null, b"password")
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
             .await
             .unwrap();
         assert_eq!(session.config().version, VaultVersion::CURRENT);

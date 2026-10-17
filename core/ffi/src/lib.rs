@@ -1000,4 +1000,86 @@ mod tests {
         assert!(migrated.wrapped_master_key.is_some());
         assert!(migrated.recovery_wrapped_master_key.is_some());
     }
+
+    #[test]
+    fn ffi_open_refuses_v1_1_without_writes_and_migrate_upgrades_it() {
+        use axiomvault_common::VaultId;
+        use axiomvault_crypto::KdfParams;
+        use axiomvault_vault::{VaultConfig, VaultVersion};
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use std::time::SystemTime;
+
+        /// Every file and directory with its bytes and modification time.
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+            let mut objects = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    if path.is_dir() {
+                        objects.insert(path.clone(), (Vec::new(), modified));
+                        pending.push(path);
+                    } else {
+                        objects.insert(path.clone(), (std::fs::read(&path).unwrap(), modified));
+                    }
+                }
+            }
+            objects
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut v1_1 = VaultConfig::new(
+            VaultId::new("ffi-v1-1").unwrap(),
+            b"correct password",
+            "local",
+            serde_json::json!({ "root": directory.path() }),
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        v1_1.version = VaultVersion::V1_1;
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
+        std::fs::write(
+            directory.path().join("vault.config"),
+            v1_1.to_bytes().unwrap(),
+        )
+        .unwrap();
+        let before = snapshot(directory.path());
+
+        let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+        let password = CString::new("correct password").unwrap();
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
+        assert!(handle.is_null(), "open must refuse a 1.1 vault");
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(
+            error.contains(
+                "vault version 1.1 must be upgraded with `axiom vault migrate` before it can be opened"
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(snapshot(directory.path()), before);
+
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        assert_eq!(
+            unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
+            0
+        );
+        // A 1.1 vault already has recovery material; none is generated.
+        assert!(axiom_vault_take_migration_recovery_words().is_null());
+        let migrated =
+            VaultConfig::from_bytes(&std::fs::read(directory.path().join("vault.config")).unwrap())
+                .unwrap();
+        assert_eq!(migrated.version, VaultVersion::CURRENT);
+        assert!(directory.path().join("m/generation.manifest").exists());
+
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
+        assert!(!handle.is_null(), "an upgraded vault must open");
+        // SAFETY: `handle` was just returned by `axiom_vault_open`.
+        assert_eq!(unsafe { axiom_vault_close(handle) }, 0);
+    }
 }

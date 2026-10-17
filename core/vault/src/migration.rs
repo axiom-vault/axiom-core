@@ -381,7 +381,7 @@ impl Default for MigrationRegistry {
 /// Check whether a vault config requires migration.
 ///
 /// 1.0 needs the password-authenticated registry migration to 1.1 first;
-/// 1.1 is upgraded to `CURRENT` by `VaultManager::open_vault`.
+/// 1.1 is upgraded to `CURRENT` by `VaultManager::upgrade_to_current`.
 pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
     let current = VaultVersion::CURRENT;
     let incompatible = MigrationStatus::Incompatible {

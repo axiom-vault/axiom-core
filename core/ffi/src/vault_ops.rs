@@ -295,17 +295,19 @@ pub async fn run_migration(
         return Ok(None);
     }
     // Registry steps rewrite only `vault.config` and end at 1.1; the 1.1 -> 2.0
-    // format upgrade is published through a manifest generation by open_vault.
+    // format upgrade is published through a manifest generation by
+    // upgrade_to_current. open_vault refuses 1.1 and never upgrades.
     let outcome = MigrationRegistry::default()
         .migrate(provider.as_ref(), password.as_bytes(), &VaultVersion::V1_1)
         .await
         .map_err(|e| FFIError::VaultError(e.to_string()))?;
     if let Err(error) = manager
-        .open_vault("local", provider_config, password.as_bytes())
+        .upgrade_to_current("local", provider_config, password.as_bytes())
         .await
     {
         // New recovery words are already committed; losing them is worse than
-        // leaving the format upgrade to the next open, which retries it.
+        // leaving the vault at 1.1, which open refuses and a rerun of the
+        // migration upgrades (the registry step is then a no-op).
         if outcome.recovery_words.is_none() {
             return Err(FFIError::VaultError(error.to_string()));
         }
