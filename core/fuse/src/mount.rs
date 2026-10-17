@@ -37,6 +37,23 @@ impl Default for MountOptions {
     }
 }
 
+impl MountOptions {
+    /// Refuse option combinations that expose decrypted data to other local users.
+    ///
+    /// `allow_other` without kernel `default_permissions` lets every local user read
+    /// the plaintext, because the filesystem does not enforce mode bits itself.
+    pub fn validate(&self) -> Result<()> {
+        if self.allow_other && !self.default_permissions {
+            return Err(Error::InvalidInput(
+                "allow_other requires default_permissions: without it every local user \
+                 could read the decrypted vault contents"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Handle to a mounted FUSE filesystem.
 ///
 /// The mount is automatically unmounted when this handle is dropped.
@@ -98,6 +115,7 @@ pub fn mount(
     options: MountOptions,
     runtime: Handle,
 ) -> Result<MountHandle> {
+    options.validate()?;
     let mount_point = mount_point.as_ref().to_path_buf();
 
     // Verify mount point exists
@@ -225,6 +243,32 @@ mod tests {
         assert!(opts.auto_unmount);
         assert!(!opts.read_only);
         assert!(opts.default_permissions);
+    }
+
+    #[test]
+    fn test_validate_refuses_allow_other_without_default_permissions() {
+        let opts = MountOptions {
+            allow_other: true,
+            default_permissions: false,
+            ..Default::default()
+        };
+        let err = opts.validate().unwrap_err().to_string();
+        assert!(err.contains("allow_other requires default_permissions"));
+    }
+
+    #[test]
+    fn test_validate_accepts_safe_combinations() {
+        assert!(MountOptions::default().validate().is_ok());
+        let allow_other = MountOptions {
+            allow_other: true,
+            ..Default::default()
+        };
+        assert!(allow_other.validate().is_ok());
+        let no_perms = MountOptions {
+            default_permissions: false,
+            ..Default::default()
+        };
+        assert!(no_perms.validate().is_ok());
     }
 
     #[test]
