@@ -1,7 +1,9 @@
 //! Vault file operations with encryption/decryption.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use blake2::Digest;
@@ -12,9 +14,10 @@ use zeroize::Zeroizing;
 use crate::config::DATA_DIRNAME;
 use crate::manifest::{digest, finish_digest, DigestHasher};
 use crate::session::VaultSession;
+use crate::tree::{TreeNode, VaultTree};
 use axiomvault_common::{Error, Result, VaultPath};
-use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream};
-use axiomvault_storage::ByteStream;
+use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream, MasterKey};
+use axiomvault_storage::{ByteStream, StorageProvider};
 
 const STREAM_CONTENT_VERSION: u8 = 2;
 /// Ciphertext is handed to the provider in chunks of about this size.
@@ -79,6 +82,231 @@ impl Read for ChunkReceiver {
     }
 }
 
+/// `Write` adapter that hands decrypted chunks to the re-encryption task.
+struct PlaintextSender(tokio::sync::mpsc::Sender<Vec<u8>>);
+
+impl Write for PlaintextSender {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.blocking_send(bytes.to_vec()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "re-encryption stopped consuming plaintext",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encrypt a filename under `master_key`.
+fn encrypt_name_with(master_key: &MasterKey, name: &str) -> Result<String> {
+    let dir_key = master_key.derive_directory_key(b"names");
+    let encrypted = encrypt(dir_key.as_bytes(), name.as_bytes())?;
+    Ok(URL_SAFE_NO_PAD.encode(encrypted))
+}
+
+/// Encrypted names of every file object `tree` references.
+pub(crate) fn file_object_names(tree: &VaultTree) -> HashSet<String> {
+    fn collect(node: &TreeNode, names: &mut HashSet<String>) {
+        if node.is_file() {
+            names.insert(node.metadata.encrypted_name.clone());
+        }
+        for child in node.children.values() {
+            collect(child, names);
+        }
+    }
+    let mut names = HashSet::new();
+    collect(tree.root(), &mut names);
+    names
+}
+
+/// Re-encrypt every node of `tree` from `old_key` to `new_key`.
+///
+/// Each node gets a fresh encrypted name under the new key, so every file
+/// object is written to a new path and the objects the current generation
+/// references stay untouched. Every path written, complete or not, is pushed
+/// to `written` before its upload starts. Returns the re-keyed tree; nothing
+/// is published.
+pub(crate) async fn reencrypt_tree(
+    provider: &Arc<dyn StorageProvider>,
+    old_key: &MasterKey,
+    new_key: &MasterKey,
+    tree: &VaultTree,
+    written: &mut Vec<VaultPath>,
+) -> Result<VaultTree> {
+    fn collect(node: &TreeNode, path: &VaultPath, paths: &mut Vec<VaultPath>) -> Result<()> {
+        for (name, child) in &node.children {
+            let child_path = path.join(name)?;
+            collect(child, &child_path, paths)?;
+            paths.push(child_path);
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    collect(tree.root(), &VaultPath::parse("/")?, &mut paths)?;
+
+    let data_dir = VaultPath::parse(DATA_DIRNAME)?;
+    let mut rotated = tree.clone();
+    for path in paths {
+        let node = rotated.get_node_mut(&path)?;
+        let new_name = encrypt_name_with(new_key, &node.metadata.name)?;
+        if !node.is_file() {
+            node.metadata.encrypted_name = new_name;
+            continue;
+        }
+        let old_name = node.metadata.encrypted_name.clone();
+        let expected_digest = node.metadata.content_digest.clone();
+        let content_version = node.metadata.content_version;
+        let size = node.metadata.size.unwrap_or(0);
+        let old_path = data_dir.join(&old_name)?;
+        let new_path = data_dir.join(&new_name)?;
+        let old_file_key = Zeroizing::new(
+            old_key
+                .derive_file_key(old_name.as_bytes())
+                .as_bytes()
+                .to_vec(),
+        );
+        let new_file_key = Zeroizing::new(
+            new_key
+                .derive_file_key(new_name.as_bytes())
+                .as_bytes()
+                .to_vec(),
+        );
+
+        written.push(new_path.clone());
+        let new_digest = match content_version {
+            0 => {
+                let ciphertext = provider.download(&old_path).await?;
+                if expected_digest.is_some_and(|expected| expected != digest(&ciphertext)) {
+                    return Err(Error::Crypto(
+                        "encrypted file does not match the authenticated snapshot".to_string(),
+                    ));
+                }
+                let plaintext = Zeroizing::new(decrypt(&old_file_key, &ciphertext)?);
+                let ciphertext = encrypt(&new_file_key, &plaintext)?;
+                let new_digest = digest(&ciphertext);
+                provider.upload(&new_path, ciphertext).await?;
+                new_digest
+            }
+            STREAM_CONTENT_VERSION => {
+                reencrypt_stream(
+                    provider,
+                    &old_path,
+                    &new_path,
+                    old_file_key,
+                    new_file_key,
+                    expected_digest,
+                    size,
+                )
+                .await?
+            }
+            other => {
+                return Err(Error::Crypto(format!(
+                    "Unsupported file content version: {other}"
+                )))
+            }
+        };
+
+        let node = rotated.get_node_mut(&path)?;
+        node.metadata.encrypted_name = new_name;
+        node.metadata.content_digest = Some(new_digest);
+    }
+    Ok(rotated)
+}
+
+/// Stream one framed object from `from` (under `old_key`) to `to` (under
+/// `new_key`) with bounded memory. Returns the new ciphertext digest.
+async fn reencrypt_stream(
+    provider: &Arc<dyn StorageProvider>,
+    from: &VaultPath,
+    to: &VaultPath,
+    old_key: Zeroizing<Vec<u8>>,
+    new_key: Zeroizing<Vec<u8>>,
+    expected_digest: Option<String>,
+    plaintext_size: u64,
+) -> Result<String> {
+    let encrypted_size = EncryptingStream::new(&new_key)?.encrypted_len(plaintext_size);
+    let mut download = provider.download_stream(from).await?;
+    let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+    let (plain_sender, plain_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+    let (upload_sender, mut upload_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+
+    let decrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        let input = ChunkReceiver {
+            receiver: cipher_receiver,
+            pending: Vec::new(),
+            offset: 0,
+        };
+        DecryptingStream::new(&old_key)?.decrypt_stream(input, PlaintextSender(plain_sender))?;
+        Ok(())
+    });
+    let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+        let input = ChunkReceiver {
+            receiver: plain_receiver,
+            pending: Vec::new(),
+            offset: 0,
+        };
+        let mut output = ChunkSender {
+            sender: upload_sender,
+            buffer: Vec::new(),
+            hasher: DigestHasher::new(),
+        };
+        let result = EncryptingStream::new(&new_key)
+            .and_then(|stream| stream.encrypt_stream(input, &mut output))
+            .and_then(|_| {
+                output.flush()?;
+                Ok(finish_digest(std::mem::take(&mut output.hasher)))
+            });
+        if let Err(error) = &result {
+            // Abort the upload so the provider discards its partial object.
+            let _ = output
+                .sender
+                .blocking_send(Err(Error::Storage(error.to_string())));
+        }
+        result
+    });
+
+    let feed = async move {
+        let mut hasher = DigestHasher::new();
+        while let Some(chunk) = download.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            // The decryptor stops consuming once it hits an invalid frame.
+            if cipher_sender.send(chunk).await.is_err() {
+                break;
+            }
+        }
+        Ok::<_, Error>(finish_digest(hasher))
+    };
+    let encrypted_stream: ByteStream = Box::pin(futures::stream::poll_fn(move |cx| {
+        upload_receiver.poll_recv(cx)
+    }));
+    let (read_digest, upload_result) = tokio::join!(
+        feed,
+        provider.upload_sized_stream(to, encrypted_stream, encrypted_size)
+    );
+    let decryption_result = decrypt_task
+        .await
+        .map_err(|error| Error::Storage(format!("decryption task failed: {error}")))?;
+    let encryption_result = encrypt_task
+        .await
+        .map_err(|error| Error::Storage(format!("encryption task failed: {error}")))?;
+    let read_digest = read_digest?;
+    // A failed decryption ends the plaintext early, so the upload may still
+    // succeed with a truncated object; it is rejected here before any commit.
+    decryption_result?;
+    if expected_digest.is_some_and(|expected| expected != read_digest) {
+        return Err(Error::Crypto(
+            "encrypted file does not match the authenticated snapshot".to_string(),
+        ));
+    }
+    upload_result?;
+    encryption_result
+}
+
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
     let parent = destination
         .parent()
@@ -124,10 +352,7 @@ impl<'a> VaultOperations<'a> {
 
     /// Encrypt a filename.
     fn encrypt_name(&self, name: &str) -> Result<String> {
-        let master_key = self.session.master_key()?;
-        let dir_key = master_key.derive_directory_key(b"names");
-        let encrypted = encrypt(dir_key.as_bytes(), name.as_bytes())?;
-        Ok(URL_SAFE_NO_PAD.encode(encrypted))
+        encrypt_name_with(self.session.master_key()?, name)
     }
 
     /// Create a new file with encrypted content.

@@ -659,14 +659,15 @@ impl VaultManager {
             )
         };
 
-        // Reset password in config. The master key itself doesn't change.
-        config.reset_password(&recovery_key, new_password)?;
+        // Reset password in config under a new master key; the vault is
+        // re-encrypted under it and committed as a new generation below.
+        let new_master_key = config.reset_password(&recovery_key, new_password)?;
         if is_oauth_cloud_provider(provider_type) {
             config.provider_config = persisted_provider_config(provider_type, &provider_config)?;
         }
 
         let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-        let session = VaultSession::from_master_key_with_freshness(
+        let mut session = VaultSession::from_master_key_with_freshness(
             config,
             master_key,
             provider.clone(),
@@ -675,7 +676,8 @@ impl VaultManager {
             anchor_id,
             generation,
         )?;
-        session.save_tree().await?;
+        session.stage_master_key_rotation(new_master_key);
+        session.commit_master_key_rotation().await?;
         self.mark_location_anchored(provider_type, &provider_config)?;
         Ok(session)
     }
@@ -724,11 +726,15 @@ mod tests {
     use crate::manifest::MANIFEST_FILENAME;
     use async_trait::async_trait;
     use axiomvault_storage::{ByteStream, MemoryProvider, Metadata};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct ManifestFailProvider {
         inner: MemoryProvider,
         fail_next_manifest: AtomicBool,
+        fail_next_config_object: AtomicBool,
+        fail_next_tree_object: AtomicBool,
+        fail_next_data_object: AtomicBool,
+        fail_deletes: AtomicBool,
         pause_next_tree_after_commit: AtomicBool,
         pause_next_canonical_tree_after_commit: AtomicBool,
     }
@@ -738,6 +744,10 @@ mod tests {
             Self {
                 inner: MemoryProvider::new(),
                 fail_next_manifest: AtomicBool::new(false),
+                fail_next_config_object: AtomicBool::new(false),
+                fail_next_tree_object: AtomicBool::new(false),
+                fail_next_data_object: AtomicBool::new(false),
+                fail_deletes: AtomicBool::new(false),
                 pause_next_tree_after_commit: AtomicBool::new(false),
                 pause_next_canonical_tree_after_commit: AtomicBool::new(false),
             }
@@ -745,6 +755,47 @@ mod tests {
 
         fn fail_next_manifest(&self) {
             self.fail_next_manifest.store(true, Ordering::SeqCst);
+        }
+
+        /// Fail the next upload of a generation config object (`m/config.*`).
+        fn fail_next_config_object(&self) {
+            self.fail_next_config_object.store(true, Ordering::SeqCst);
+        }
+
+        /// Fail the next upload of a generation tree object (`m/tree.<g>.*`).
+        fn fail_next_tree_object(&self) {
+            self.fail_next_tree_object.store(true, Ordering::SeqCst);
+        }
+
+        /// Fail the next upload of a data object (`d/*`).
+        fn fail_next_data_object(&self) {
+            self.fail_next_data_object.store(true, Ordering::SeqCst);
+        }
+
+        /// Fail every delete until reset.
+        fn fail_deletes(&self, fail: bool) {
+            self.fail_deletes.store(fail, Ordering::SeqCst);
+        }
+
+        fn injected_upload_failure(&self, path: &VaultPath) -> Result<()> {
+            let name = path.name().unwrap_or_default();
+            let components = path.components();
+            let in_meta = components.len() == 2 && components[0] == META_DIRNAME;
+            let in_data = components.len() == 2 && components[0] == DATA_DIRNAME;
+            let failed = (in_meta
+                && name.starts_with("config.")
+                && self.fail_next_config_object.swap(false, Ordering::SeqCst))
+                || (in_meta
+                    && name.starts_with("tree.")
+                    && name.ends_with(".enc")
+                    && self.fail_next_tree_object.swap(false, Ordering::SeqCst))
+                || (in_data && self.fail_next_data_object.swap(false, Ordering::SeqCst));
+            if failed {
+                return Err(Error::Storage(format!(
+                    "injected upload failure for {name}"
+                )));
+            }
+            Ok(())
         }
 
         fn pause_next_tree_after_commit(&self) {
@@ -768,6 +819,7 @@ mod tests {
             if path == &manifest_path() && self.fail_next_manifest.swap(false, Ordering::SeqCst) {
                 return Err(Error::Storage("injected manifest failure".to_string()));
             }
+            self.injected_upload_failure(path)?;
             let metadata = self.inner.upload(path, data).await?;
             let name = path.name().unwrap_or_default();
             if (path == &tree_path() || name.starts_with("tree."))
@@ -788,6 +840,7 @@ mod tests {
         }
 
         async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+            self.injected_upload_failure(path)?;
             self.inner.upload_stream(path, stream).await
         }
 
@@ -804,6 +857,9 @@ mod tests {
         }
 
         async fn delete(&self, path: &VaultPath) -> Result<()> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(Error::Storage("injected delete failure".to_string()));
+            }
             self.inner.delete(path).await
         }
 
@@ -834,19 +890,23 @@ mod tests {
 
     struct ToggleStoreFailureAnchor {
         inner: InMemoryFreshnessAnchor,
-        fail_next_store: AtomicBool,
+        failing_stores: AtomicUsize,
     }
 
     impl ToggleStoreFailureAnchor {
         fn new() -> Self {
             Self {
                 inner: InMemoryFreshnessAnchor::new(),
-                fail_next_store: AtomicBool::new(false),
+                failing_stores: AtomicUsize::new(0),
             }
         }
 
         fn fail_next_store(&self) {
-            self.fail_next_store.store(true, Ordering::SeqCst);
+            self.fail_next_stores(1);
+        }
+
+        fn fail_next_stores(&self, count: usize) {
+            self.failing_stores.store(count, Ordering::SeqCst);
         }
     }
 
@@ -864,7 +924,9 @@ mod tests {
         }
 
         fn store_state(&self, vault_id: &VaultId, state: FreshnessState) -> Result<()> {
-            if self.fail_next_store.swap(false, Ordering::SeqCst) {
+            let left = self.failing_stores.load(Ordering::SeqCst);
+            if left > 0 {
+                self.failing_stores.store(left - 1, Ordering::SeqCst);
                 return Err(Error::Vault("injected anchor failure".to_string()));
             }
             self.inner.store_state(vault_id, state)
@@ -1782,6 +1844,606 @@ mod tests {
             .open_vault("test", serde_json::Value::Null, b"new-password")
             .await
             .is_ok());
+    }
+
+    /// M-3: an old `vault.config` copy plus the old password must not decrypt
+    /// anything written after a password change.
+    #[tokio::test]
+    async fn old_config_and_old_password_cannot_decrypt_data_written_after_password_change() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("m3-old-config").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let before = VaultPath::parse("/before.txt").unwrap();
+        let before_content = b"written before the change";
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&before, before_content)
+            .await
+            .unwrap();
+        let old_config = VaultConfig::from_bytes(
+            &provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        manager.save_config(&mut creation.session).await.unwrap();
+        let after = VaultPath::parse("/after.txt").unwrap();
+        let after_content = b"written after the change";
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&after, after_content)
+            .await
+            .unwrap();
+        drop(creation);
+
+        // The attacker holds the old config and the old password, and can read
+        // every object in storage.
+        let old_key = old_config
+            .verify_password(b"old-password")
+            .unwrap()
+            .expect("the old config still accepts the old password");
+        let data_dir = VaultPath::parse(DATA_DIRNAME).unwrap();
+        let mut recovered = Vec::new();
+        for entry in provider.list(&data_dir).await.unwrap() {
+            let bytes = provider
+                .download(&data_dir.join(&entry.name).unwrap())
+                .await
+                .unwrap();
+            let file_key = old_key.derive_file_key(entry.name.as_bytes());
+            if let Ok(plaintext) = axiomvault_crypto::decrypt(file_key.as_bytes(), &bytes) {
+                recovered.push(plaintext);
+            }
+        }
+        assert!(
+            !recovered.iter().any(|p| p == after_content),
+            "old config + old password decrypted a file written after the password change"
+        );
+        // Pre-change files were re-encrypted under the new key and their old
+        // ciphertext deleted, so the old key opens nothing in current storage.
+        assert!(recovered.is_empty(), "old key still opens a stored object");
+        assert!(VaultSession::decrypt_tree_bytes(
+            &old_key,
+            &provider.download(&tree_path()).await.unwrap()
+        )
+        .is_err());
+        assert!(GenerationManifest::open(
+            &old_key,
+            &provider.download(&manifest_path()).await.unwrap()
+        )
+        .is_err());
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .unwrap();
+        let ops = VaultOperations::new(&reopened).unwrap();
+        assert_eq!(ops.read_file(&after).await.unwrap(), after_content);
+        assert_eq!(ops.read_file(&before).await.unwrap(), before_content);
+    }
+
+    /// Two root-level and nested one-shot files, a streamed file two
+    /// directories deep, and an empty directory.
+    async fn write_rotation_fixture(session: &VaultSession) -> Vec<(VaultPath, Vec<u8>)> {
+        use crate::operations::VaultOperations;
+
+        let ops = VaultOperations::new(session).unwrap();
+        for dir in ["/dir", "/dir/sub", "/empty"] {
+            ops.create_directory(&VaultPath::parse(dir).unwrap())
+                .await
+                .unwrap();
+        }
+        let mut files = vec![
+            (VaultPath::parse("/a.txt").unwrap(), b"root file".to_vec()),
+            (VaultPath::parse("/dir/c.txt").unwrap(), b"nested".to_vec()),
+        ];
+        for (path, content) in &files {
+            ops.create_file(path, content).await.unwrap();
+        }
+        let streamed = VaultPath::parse("/dir/sub/b.bin").unwrap();
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("b.bin");
+        std::fs::write(&source, &content).unwrap();
+        ops.create_file_from_path(&streamed, &source).await.unwrap();
+        files.push((streamed, content));
+        files
+    }
+
+    async fn assert_fixture(session: &VaultSession, files: &[(VaultPath, Vec<u8>)]) {
+        use crate::operations::VaultOperations;
+
+        let ops = VaultOperations::new(session).unwrap();
+        for (path, content) in files {
+            assert_eq!(&ops.read_file(path).await.unwrap(), content, "{path}");
+        }
+        assert!(ops.exists(&VaultPath::parse("/empty").unwrap()).await);
+    }
+
+    async fn object_names<P: StorageProvider + ?Sized>(
+        provider: &P,
+        dir: &str,
+    ) -> std::collections::BTreeSet<String> {
+        provider
+            .list(&VaultPath::parse(dir).unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    async fn all_objects<P: StorageProvider + ?Sized>(
+        provider: &P,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut objects = std::collections::BTreeMap::new();
+        for dir in [DATA_DIRNAME, META_DIRNAME] {
+            for name in object_names(provider, dir).await {
+                let path = VaultPath::parse(dir).unwrap().join(&name).unwrap();
+                objects.insert(path.to_string(), provider.download(&path).await.unwrap());
+            }
+        }
+        let config = VaultPath::parse(CONFIG_FILENAME).unwrap();
+        objects.insert(
+            config.to_string(),
+            provider.download(&config).await.unwrap(),
+        );
+        objects
+    }
+
+    /// Whether `key` decrypts any one-shot data object in storage.
+    async fn key_opens_any_data_object<P: StorageProvider + ?Sized>(
+        provider: &P,
+        key: &MasterKey,
+    ) -> bool {
+        let data_dir = VaultPath::parse(DATA_DIRNAME).unwrap();
+        for name in object_names(provider, DATA_DIRNAME).await {
+            let bytes = provider
+                .download(&data_dir.join(&name).unwrap())
+                .await
+                .unwrap();
+            let file_key = key.derive_file_key(name.as_bytes());
+            if axiomvault_crypto::decrypt(file_key.as_bytes(), &bytes).is_ok()
+                || axiomvault_crypto::DecryptingStream::new(file_key.as_bytes())
+                    .unwrap()
+                    .decrypt_stream(bytes.as_slice(), std::io::sink())
+                    .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn recovery_words_from_before_rotation_open_the_rotated_vault() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("rotation-recovery").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let words = creation.recovery_words.clone();
+        let mut files = write_rotation_fixture(&creation.session).await;
+        let old_config = VaultConfig::from_bytes(
+            &provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        manager.save_config(&mut creation.session).await.unwrap();
+        let after = (VaultPath::parse("/after.txt").unwrap(), b"after".to_vec());
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&after.0, &after.1)
+            .await
+            .unwrap();
+        files.push(after);
+        drop(creation);
+
+        // The old config's recovery wrap yields the old key, which opens
+        // nothing written after the rotation.
+        let rk = RecoveryKey::from_mnemonic(&words).unwrap();
+        let old_recovered = old_config.verify_recovery_key(&rk).unwrap().unwrap();
+        assert!(GenerationManifest::open(
+            &old_recovered,
+            &provider.download(&manifest_path()).await.unwrap()
+        )
+        .is_err());
+        assert!(!key_opens_any_data_object(provider.as_ref(), &old_recovered).await);
+
+        // The same words recover the vault and read the current data.
+        let recovered = manager
+            .recover_vault("test", serde_json::Value::Null, &words, b"third-password")
+            .await
+            .unwrap();
+        assert_fixture(&recovered, &files).await;
+        drop(recovered);
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"third-password")
+            .await
+            .unwrap();
+        assert_fixture(&reopened, &files).await;
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RotationFailure {
+        DataObject,
+        ConfigObject,
+        TreeObject,
+        Manifest,
+    }
+
+    #[tokio::test]
+    async fn interrupted_rotation_before_commit_keeps_old_password_and_data() {
+        for failure in [
+            RotationFailure::DataObject,
+            RotationFailure::ConfigObject,
+            RotationFailure::TreeObject,
+            RotationFailure::Manifest,
+        ] {
+            let provider = Arc::new(ManifestFailProvider::new());
+            let manager = manager_with_manifest_failure_storage(
+                provider.clone(),
+                Arc::new(InMemoryFreshnessAnchor::new()),
+            );
+            let mut creation = manager
+                .create_vault(
+                    VaultId::new("interrupted-rotation").unwrap(),
+                    b"old-password",
+                    "test",
+                    serde_json::Value::Null,
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
+            let files = write_rotation_fixture(&creation.session).await;
+            let data_before = object_names(provider.as_ref(), DATA_DIRNAME).await;
+            let manifest_before = provider.download(&manifest_path()).await.unwrap();
+
+            creation
+                .session
+                .change_password(b"old-password", b"new-password")
+                .unwrap();
+            match failure {
+                RotationFailure::DataObject => provider.fail_next_data_object(),
+                RotationFailure::ConfigObject => provider.fail_next_config_object(),
+                RotationFailure::TreeObject => provider.fail_next_tree_object(),
+                RotationFailure::Manifest => provider.fail_next_manifest(),
+            }
+            assert!(
+                manager.save_config(&mut creation.session).await.is_err(),
+                "{failure:?}"
+            );
+            assert!(creation
+                .session
+                .config()
+                .verify_password(b"old-password")
+                .unwrap()
+                .is_some());
+            // The live session still reads its data under the old key.
+            assert_fixture(&creation.session, &files).await;
+            drop(creation);
+
+            assert_eq!(
+                provider.download(&manifest_path()).await.unwrap(),
+                manifest_before,
+                "{failure:?}"
+            );
+            assert_eq!(
+                object_names(provider.as_ref(), DATA_DIRNAME).await,
+                data_before,
+                "{failure:?}: uncommitted re-encrypted objects must be removed"
+            );
+            let reopened = manager
+                .open_vault("test", serde_json::Value::Null, b"old-password")
+                .await
+                .unwrap_or_else(|error| panic!("{failure:?}: {error}"));
+            assert_fixture(&reopened, &files).await;
+            drop(reopened);
+            assert!(manager
+                .open_vault("test", serde_json::Value::Null, b"new-password")
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn anchor_failure_after_rotation_commit_keeps_new_password_and_data() {
+        // One failure is retried within the commit; two fail the call after
+        // the manifest has already committed.
+        for failures in [1, 2] {
+            let provider = Arc::new(MemoryProvider::new());
+            let anchor = Arc::new(ToggleStoreFailureAnchor::new());
+            let manager = manager_with_storage(provider.clone(), anchor.clone());
+            let mut creation = manager
+                .create_vault(
+                    VaultId::new("anchor-rotation").unwrap(),
+                    b"old-password",
+                    "test",
+                    serde_json::Value::Null,
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
+            let files = write_rotation_fixture(&creation.session).await;
+            creation
+                .session
+                .change_password(b"old-password", b"new-password")
+                .unwrap();
+            anchor.fail_next_stores(failures);
+            let result = manager.save_config(&mut creation.session).await;
+            assert_eq!(result.is_ok(), failures == 1, "{failures}: {result:?}");
+            drop(creation);
+
+            let reopened = manager
+                .open_vault("test", serde_json::Value::Null, b"new-password")
+                .await
+                .unwrap_or_else(|error| panic!("{failures}: {error}"));
+            assert_fixture(&reopened, &files).await;
+            drop(reopened);
+            assert!(manager
+                .open_vault("test", serde_json::Value::Null, b"old-password")
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_reset_rotates_master_key_and_refuses_bad_words_without_writing() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let vault_id = VaultId::new("reset-rotation").unwrap();
+        let creation = manager
+            .create_vault(
+                vault_id.clone(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let words = creation.recovery_words.clone();
+        let mut files = write_rotation_fixture(&creation.session).await;
+        drop(creation);
+        let old_config = VaultConfig::from_bytes(
+            &provider
+                .download(&VaultPath::parse(CONFIG_FILENAME).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let old_key = old_config
+            .verify_password(b"old-password")
+            .unwrap()
+            .unwrap();
+
+        // Valid words of another vault are refused before any write.
+        let objects_before = all_objects(provider.as_ref()).await;
+        let anchor_before = anchor.load_state(&test_anchor_id(&vault_id)).unwrap();
+        let wrong_words = RecoveryKey::generate().to_mnemonic().unwrap();
+        let error = manager
+            .recover_vault("test", serde_json::Value::Null, &wrong_words, b"reset")
+            .await
+            .err()
+            .expect("a wrong recovery key must be refused");
+        assert!(matches!(error, Error::NotPermitted(_)), "{error}");
+        assert_eq!(all_objects(provider.as_ref()).await, objects_before);
+        assert_eq!(
+            anchor.load_state(&test_anchor_id(&vault_id)).unwrap(),
+            anchor_before
+        );
+
+        let reset = manager
+            .recover_vault("test", serde_json::Value::Null, &words, b"reset-password")
+            .await
+            .unwrap();
+        assert_ne!(reset.master_key().unwrap().as_bytes(), old_key.as_bytes());
+        let after = (VaultPath::parse("/after.txt").unwrap(), b"after".to_vec());
+        VaultOperations::new(&reset)
+            .unwrap()
+            .create_file(&after.0, &after.1)
+            .await
+            .unwrap();
+        files.push(after);
+        drop(reset);
+
+        assert!(!key_opens_any_data_object(provider.as_ref(), &old_key).await);
+        assert!(GenerationManifest::open(
+            &old_key,
+            &provider.download(&manifest_path()).await.unwrap()
+        )
+        .is_err());
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"reset-password")
+            .await
+            .unwrap();
+        assert_fixture(&reopened, &files).await;
+        drop(reopened);
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"old-password")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn rotation_handles_an_empty_vault() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("empty-rotation").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        assert_eq!(
+            creation.session.commit_master_key_rotation().await.unwrap(),
+            0
+        );
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .unwrap();
+        assert_eq!(reopened.tree().read().await.count_files(), 0);
+        assert!(object_names(provider.as_ref(), DATA_DIRNAME)
+            .await
+            .is_empty());
+        drop(reopened);
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"old-password")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn rotation_rewrites_nested_files_and_deletes_old_master_objects() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("nested-rotation").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let files = write_rotation_fixture(&creation.session).await;
+        let old_data = object_names(provider.as_ref(), DATA_DIRNAME).await;
+        let old_meta = object_names(provider.as_ref(), META_DIRNAME).await;
+        let old_key = creation.session.master_key().unwrap().clone();
+
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        assert_eq!(
+            creation.session.commit_master_key_rotation().await.unwrap(),
+            0
+        );
+        assert_fixture(&creation.session, &files).await;
+
+        let new_data = object_names(provider.as_ref(), DATA_DIRNAME).await;
+        assert_eq!(new_data.len(), files.len());
+        assert!(new_data.is_disjoint(&old_data));
+        assert_eq!(
+            new_data,
+            crate::operations::file_object_names(&*creation.session.tree().read().await)
+                .into_iter()
+                .collect()
+        );
+        let new_meta = object_names(provider.as_ref(), META_DIRNAME).await;
+        let generation_objects: Vec<_> = new_meta
+            .iter()
+            .filter(|name| {
+                (name.starts_with("tree.") && name.ends_with(".enc")) || name.starts_with("config.")
+            })
+            .collect();
+        assert_eq!(generation_objects.len(), 2, "{new_meta:?}");
+        assert!(generation_objects
+            .iter()
+            .all(|name| !old_meta.contains(*name)));
+        assert!(!key_opens_any_data_object(provider.as_ref(), &old_key).await);
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .unwrap();
+        assert_fixture(&reopened, &files).await;
+    }
+
+    #[tokio::test]
+    async fn failed_old_object_delete_does_not_fail_the_rotation() {
+        let provider = Arc::new(ManifestFailProvider::new());
+        let manager = manager_with_manifest_failure_storage(
+            provider.clone(),
+            Arc::new(InMemoryFreshnessAnchor::new()),
+        );
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("delete-failure-rotation").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let files = write_rotation_fixture(&creation.session).await;
+        let old_data = object_names(provider.as_ref(), DATA_DIRNAME).await;
+
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        provider.fail_deletes(true);
+        let remaining = creation.session.commit_master_key_rotation().await.unwrap();
+        provider.fail_deletes(false);
+        assert!(remaining >= old_data.len(), "{remaining}");
+        assert!(old_data.is_subset(&object_names(provider.as_ref(), DATA_DIRNAME).await));
+        assert_fixture(&creation.session, &files).await;
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .unwrap();
+        assert_fixture(&reopened, &files).await;
+        drop(reopened);
+        assert!(manager
+            .open_vault("test", serde_json::Value::Null, b"old-password")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

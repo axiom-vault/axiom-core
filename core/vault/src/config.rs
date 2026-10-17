@@ -359,11 +359,6 @@ impl VaultConfig {
         Ok(Some(master_key))
     }
 
-    /// Reset the password using a recovery key.
-    ///
-    /// This re-wraps the master key with a new password-derived KEK and
-    /// updates the password verification data. The recovery key data
-    /// remains unchanged.
     pub fn verify_hardware_key(&self, secret: &[u8]) -> Result<Option<MasterKey>> {
         let hardware_key = self
             .hardware_key
@@ -413,11 +408,42 @@ impl VaultConfig {
         }
     }
 
+    /// Reset the password using a recovery key.
+    ///
+    /// Generates a new master key, wraps it under the new password and under
+    /// the same recovery key (so the existing recovery words keep working),
+    /// and returns it. Nothing in storage is encrypted under the returned key
+    /// yet: persisting this config alone strands the vault, so the vault must
+    /// be re-encrypted and published under it first (`recover_vault` does).
     pub fn reset_password(
         &mut self,
         recovery_key: &RecoveryKey,
         new_password: &[u8],
-    ) -> Result<()> {
+    ) -> Result<MasterKey> {
+        if new_password.is_empty() {
+            return Err(Error::InvalidInput(
+                "New password cannot be empty".to_string(),
+            ));
+        }
+
+        // Verify the recovery key before touching any field.
+        self.verify_recovery_key(recovery_key)?
+            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
+
+        self.rotate_master_key(recovery_key, new_password)
+    }
+
+    /// Replace the master key with a fresh one wrapped under `new_password`
+    /// and under `recovery_key`, the vault's existing recovery key.
+    ///
+    /// The stored recovery key is re-encrypted under the new master key. A
+    /// hardware-key wrap holds the old master key and cannot be re-wrapped
+    /// without the hardware secret, so the enrollment is removed.
+    pub(crate) fn rotate_master_key(
+        &mut self,
+        recovery_key: &RecoveryKey,
+        new_password: &[u8],
+    ) -> Result<MasterKey> {
         use axiomvault_crypto::{derive_key, encrypt};
 
         if new_password.is_empty() {
@@ -426,29 +452,33 @@ impl VaultConfig {
             ));
         }
 
-        // Verify recovery key and get master key.
-        let master_key = self
-            .verify_recovery_key(recovery_key)?
-            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
-
-        // Derive new password KEK.
+        let master_key = generate_master_key();
         let new_salt = Salt::generate();
         let new_kek = derive_key(new_password, &new_salt, &self.kdf_params)?;
-
-        // Re-wrap master key.
         let new_wrapped = wrap_key(&master_key, new_kek.as_bytes())?;
+        let recovery_kek = recovery_key.derive_kek();
+        let recovery_wrapped = wrap_key(&master_key, &recovery_kek)?;
 
-        // Re-create password verification.
+        // Self-verify both wraps before anything can be persisted.
+        if unwrap_key(&new_wrapped, new_kek.as_bytes())?.as_bytes() != master_key.as_bytes()
+            || unwrap_key(&recovery_wrapped, &recovery_kek)?.as_bytes() != master_key.as_bytes()
+        {
+            return Err(Error::Crypto(
+                "master key verification failed after wrapping; aborting rotation".to_string(),
+            ));
+        }
+
         let verification_plaintext = b"AXIOMVAULT_KEY_VERIFICATION_V1";
-        let new_verification = encrypt(new_kek.as_bytes(), verification_plaintext)?;
-
-        // Update config.
+        self.key_verification = encrypt(new_kek.as_bytes(), verification_plaintext)?;
         self.salt = new_salt;
-        self.key_verification = new_verification;
         self.wrapped_master_key = Some(new_wrapped);
+        self.recovery_wrapped_master_key = Some(recovery_wrapped);
+        self.encrypted_recovery_key =
+            Some(encrypt(master_key.as_bytes(), recovery_key.as_bytes())?);
+        self.hardware_key = None;
         self.modified_at = Utc::now();
 
-        Ok(())
+        Ok(master_key)
     }
 
     /// Retrieve the stored recovery key by decrypting with the master key.
@@ -677,12 +707,32 @@ mod tests {
         let rk = RecoveryKey::from_mnemonic(&recovery_words).unwrap();
         assert!(config.verify_recovery_key(&rk).unwrap().is_some());
 
+        let old_key = config.verify_password(password).unwrap().unwrap();
         let new_password = b"new-password";
-        config.reset_password(&rk, new_password).unwrap();
+        let new_key = config.reset_password(&rk, new_password).unwrap();
+        assert_ne!(old_key.as_bytes(), new_key.as_bytes());
 
         assert!(config.verify_password(password).unwrap().is_none());
-        assert!(config.verify_password(new_password).unwrap().is_some());
-        assert!(config.verify_recovery_key(&rk).unwrap().is_some());
+        assert_eq!(
+            config
+                .verify_password(new_password)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            new_key.as_bytes()
+        );
+        assert_eq!(
+            config.verify_recovery_key(&rk).unwrap().unwrap().as_bytes(),
+            new_key.as_bytes()
+        );
+
+        // A wrong recovery key is refused without changing the config.
+        let before = config.to_bytes().unwrap();
+        assert!(matches!(
+            config.reset_password(&RecoveryKey::generate(), b"other"),
+            Err(Error::NotPermitted(_))
+        ));
+        assert_eq!(config.to_bytes().unwrap(), before);
     }
 
     #[test]
