@@ -944,8 +944,12 @@ mod tests {
         drop(bytes);
     }
 
+    /// A current config stripped of its wrapped key and relabelled 1.0, with no
+    /// tree index or manifest, is what a provider serves to swap the master key:
+    /// the password-derived key would be wrapped as if it were the master key.
+    /// Nothing authenticates that key as the master key, so it must be refused.
     #[test]
-    fn ffi_migration_consumes_password_and_returns_recovery_words_once() {
+    fn ffi_migration_refuses_a_stripped_config_without_writes() {
         use axiomvault_common::VaultId;
         use axiomvault_crypto::KdfParams;
         use axiomvault_vault::{VaultConfig, VaultVersion};
@@ -980,25 +984,24 @@ mod tests {
         // SAFETY: both pointers are valid NUL-terminated strings for this call.
         assert_eq!(
             unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
-            0
+            -1
         );
-
-        let words = axiom_vault_take_migration_recovery_words();
-        assert!(!words.is_null());
-        // SAFETY: the migration getter returned this live C string.
-        let mnemonic = unsafe { CStr::from_ptr(words) }.to_str().unwrap();
-        assert_eq!(mnemonic.split_whitespace().count(), 24);
-        // SAFETY: `words` came from the migration recovery getter.
-        unsafe { axiom_recovery_words_free(words) };
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(
+            error.contains("not proven to be the vault master key"),
+            "unexpected error: {error}"
+        );
         assert!(axiom_vault_take_migration_recovery_words().is_null());
 
-        let migrated =
-            VaultConfig::from_bytes(&std::fs::read(directory.path().join("vault.config")).unwrap())
-                .unwrap();
-        assert_eq!(migrated.version, VaultVersion::CURRENT);
-        assert!(directory.path().join("m/generation.manifest").exists());
-        assert!(migrated.wrapped_master_key.is_some());
-        assert!(migrated.recovery_wrapped_master_key.is_some());
+        assert_eq!(
+            std::fs::read(directory.path().join("vault.config")).unwrap(),
+            legacy.to_bytes().unwrap()
+        );
+        assert!(std::fs::read_dir(directory.path().join("m"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
     }
 
     #[test]

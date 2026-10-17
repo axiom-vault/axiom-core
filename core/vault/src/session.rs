@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::config::{VaultConfig, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
+use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME};
 use crate::freshness::{publication_lock, FreshnessAnchor, FreshnessState as AnchorFreshnessState};
 use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::tree::VaultTree;
@@ -17,7 +17,7 @@ use axiomvault_crypto::{decrypt, derive_key, encrypt, MasterKey};
 use axiomvault_storage::StorageProvider;
 
 /// Context tag for tree index key derivation. Changing this invalidates all existing vaults.
-const TREE_KEY_CONTEXT: &[u8] = b"vault_tree_index_v1";
+pub(crate) const TREE_KEY_CONTEXT: &[u8] = b"vault_tree_index_v1";
 
 /// Session handle for tracking active sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -162,6 +162,12 @@ impl VaultSession {
     }
 
     /// Load and decrypt the vault tree index from storage.
+    ///
+    /// A missing tree index yields an empty tree only when the vault holds
+    /// nothing else: no object under `d/` and none under `m/` (which includes
+    /// the snapshot manifest and generation objects). Otherwise the index was
+    /// lost or withheld, and opening it as empty would let the next save
+    /// publish an empty tree over the real one, orphaning every object.
     pub async fn load_and_decrypt_tree(
         provider: &Arc<dyn StorageProvider>,
         master_key: &MasterKey,
@@ -169,6 +175,15 @@ impl VaultSession {
         let tree_path = VaultPath::parse(META_DIRNAME)?.join(TREE_FILENAME)?;
 
         if !provider.exists(&tree_path).await? {
+            for dirname in [DATA_DIRNAME, META_DIRNAME] {
+                let dir = VaultPath::parse(dirname)?;
+                if provider.exists(&dir).await? && !provider.list(&dir).await?.is_empty() {
+                    return Err(Error::Vault(format!(
+                        "tree index {META_DIRNAME}/{TREE_FILENAME} is missing but {dirname}/ is not empty; \
+                         refusing to open the vault as empty"
+                    )));
+                }
+            }
             return Ok(VaultTree::new());
         }
 
@@ -711,6 +726,53 @@ mod tests {
             .unwrap()
             .expect("recovery key should still work after password change");
         assert_eq!(mk_before, mk_from_recovery.as_bytes().to_owned());
+    }
+
+    #[tokio::test]
+    async fn missing_tree_is_empty_only_when_the_vault_holds_nothing() {
+        let (creation, provider) = create_test_config();
+        let storage: Arc<dyn StorageProvider> = provider.clone();
+        let key = creation.master_key;
+
+        // No `d/` or `m/` at all, then both present but empty.
+        assert_eq!(
+            VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .unwrap()
+                .count_files(),
+            0
+        );
+        for dir in [DATA_DIRNAME, META_DIRNAME] {
+            provider
+                .create_dir(&VaultPath::parse(dir).unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .unwrap()
+                .count_files(),
+            0
+        );
+
+        for (dir, object) in [
+            (DATA_DIRNAME, "object"),
+            (META_DIRNAME, "generation.manifest"),
+        ] {
+            let path = VaultPath::parse(dir).unwrap().join(object).unwrap();
+            provider.upload(&path, b"x".to_vec()).await.unwrap();
+            let error = VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .expect_err("a missing tree beside stored objects must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("but {dir}/ is not empty")),
+                "unexpected error: {error}"
+            );
+            provider.delete(&path).await.unwrap();
+        }
     }
 
     #[tokio::test]

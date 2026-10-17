@@ -8,7 +8,9 @@ use std::fmt;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME};
+use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
+use crate::manifest::{GenerationManifest, MANIFEST_FILENAME};
+use crate::session::VaultSession;
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::{recovery::RecoveryKey, MasterKey};
 use axiomvault_storage::StorageProvider;
@@ -170,6 +172,9 @@ impl MigrationRegistry {
         let original_master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
+        if config.is_legacy_format() {
+            prove_legacy_master_key(provider, &original_master_key).await?;
+        }
         let mut recovery_words = None;
         for migration in path {
             recovery_words = migration.migrate(&mut config, password)?;
@@ -290,6 +295,15 @@ impl MigrationRegistry {
         } else {
             None
         };
+        // Valid pairs share one master key, so one legacy candidate's proof covers
+        // the restore below, which would otherwise discard a committed 1.1 config.
+        if let Some(legacy) = [&config, &backup, &temporary]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.config.is_legacy_format())
+        {
+            prove_legacy_master_key(provider, &legacy.master_key).await?;
+        }
 
         match (&config, &backup, &temporary) {
             (Some(previous), None, Some(next)) => {
@@ -406,6 +420,44 @@ pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
     }
 }
 
+/// Prove that the key a legacy config yields is the vault master key.
+///
+/// A legacy config has no `wrapped_master_key`, so `verify_password` returns the
+/// password-derived key itself. `key_verification` is encrypted under that same
+/// key, so it proves only the password. A newer config stripped of its wrapped
+/// key looks identical, and there the derived key is just the password KEK:
+/// wrapping it would issue recovery words for the wrong key and drop the only
+/// wrap of the real one. So the key must authenticate an object written under
+/// the master key: the snapshot manifest or the tree index, whichever exist.
+async fn prove_legacy_master_key(
+    provider: &dyn StorageProvider,
+    master_key: &MasterKey,
+) -> Result<()> {
+    let refused = |reason: &str| {
+        Error::Crypto(format!(
+            "legacy migration refused: {reason}; the password-derived key is not proven to be the vault master key"
+        ))
+    };
+    let meta = VaultPath::parse(META_DIRNAME)?;
+    let manifest_path = meta.join(MANIFEST_FILENAME)?;
+    let tree_path = meta.join(TREE_FILENAME)?;
+    let mut proven = false;
+    if provider.exists(&manifest_path).await? {
+        GenerationManifest::open(master_key, &provider.download(&manifest_path).await?)
+            .map_err(|_| refused("the snapshot manifest does not authenticate"))?;
+        proven = true;
+    }
+    if provider.exists(&tree_path).await? {
+        VaultSession::decrypt_tree_bytes(master_key, &provider.download(&tree_path).await?)
+            .map_err(|_| refused("the tree index does not authenticate"))?;
+        proven = true;
+    }
+    if !proven {
+        return Err(refused("no tree index or snapshot manifest exists"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Built-in migrations
 // ---------------------------------------------------------------------------
@@ -487,6 +539,157 @@ mod tests {
             .upload(&VaultPath::parse(filename).unwrap(), bytes)
             .await
             .unwrap();
+    }
+
+    /// Write `m/tree.json` encrypted under `key`, as every real vault has.
+    async fn upload_tree(provider: &dyn StorageProvider, key: &MasterKey) {
+        let meta = VaultPath::parse(META_DIRNAME).unwrap();
+        if !provider.exists(&meta).await.unwrap() {
+            provider.create_dir(&meta).await.unwrap();
+        }
+        let tree_key = key.derive_file_key(crate::session::TREE_KEY_CONTEXT);
+        let tree_json = crate::tree::VaultTree::new().to_json().unwrap();
+        let encrypted =
+            axiomvault_crypto::encrypt(tree_key.as_bytes(), tree_json.as_bytes()).unwrap();
+        provider
+            .upload(&meta.join(TREE_FILENAME).unwrap(), encrypted)
+            .await
+            .unwrap();
+    }
+
+    /// A genuine 1.0 vault: its tree is encrypted under the password-derived key.
+    async fn upload_legacy_tree(
+        provider: &dyn StorageProvider,
+        legacy: &VaultConfig,
+        password: &[u8],
+    ) {
+        let key = legacy.verify_password(password).unwrap().unwrap();
+        upload_tree(provider, &key).await;
+    }
+
+    /// Every stored path with its bytes (directories map to `None`).
+    async fn storage_snapshot(
+        provider: &dyn StorageProvider,
+    ) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+        let mut objects = std::collections::BTreeMap::new();
+        let mut pending = vec![VaultPath::root()];
+        while let Some(directory) = pending.pop() {
+            for entry in provider.list(&directory).await.unwrap() {
+                let path = directory.join(&entry.name).unwrap();
+                if entry.is_directory {
+                    objects.insert(path.to_string(), None);
+                    pending.push(path);
+                } else {
+                    objects.insert(
+                        path.to_string(),
+                        Some(provider.download(&path).await.unwrap()),
+                    );
+                }
+            }
+        }
+        objects
+    }
+
+    /// A 2.0 config with its wrapped key and recovery material stripped and
+    /// relabelled 1.0: what a provider can serve in place of a real config.
+    fn stripped_config() -> (VaultConfig, MasterKey) {
+        let creation = VaultConfig::new(
+            VaultId::new("stripped").unwrap(),
+            b"test",
+            "local",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut config = creation.config;
+        config.version = VaultVersion { major: 1, minor: 0 };
+        config.wrapped_master_key = None;
+        config.recovery_wrapped_master_key = None;
+        config.recovery_key_verification = None;
+        config.encrypted_recovery_key = None;
+        (config, creation.master_key)
+    }
+
+    #[tokio::test]
+    async fn stripped_wrapped_key_without_tree_is_refused_without_writes() {
+        let (stripped, _) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        provider
+            .create_dir(&VaultPath::parse("d").unwrap())
+            .await
+            .unwrap();
+        provider
+            .create_dir(&VaultPath::parse(META_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        upload_config(&provider, CONFIG_FILENAME, stripped.to_bytes().unwrap()).await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        match result {
+            Err(Error::Crypto(message)) => assert!(
+                message.contains("no tree index or snapshot manifest exists"),
+                "unexpected refusal: {message}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a stripped config must not be migrated"),
+        }
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[tokio::test]
+    async fn stripped_wrapped_key_with_real_tree_is_refused_without_writes() {
+        let (stripped, master_key) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &master_key).await;
+        upload_config(&provider, CONFIG_FILENAME, stripped.to_bytes().unwrap()).await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        match result {
+            Err(Error::Crypto(message)) => assert!(
+                message.contains("the tree index does not authenticate"),
+                "unexpected refusal: {message}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a stripped config must not be migrated"),
+        }
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[tokio::test]
+    async fn interrupted_restore_of_a_stripped_backup_is_refused_without_writes() {
+        let (stripped, _) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(
+            &provider,
+            CONFIG_BACKUP_FILENAME,
+            stripped.to_bytes().unwrap(),
+        )
+        .await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        assert!(matches!(result, Err(Error::Crypto(_))));
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[test]
+    fn partially_stripped_config_is_refused_by_migrate_to_v1_1() {
+        let mut config = make_test_config(VaultVersion { major: 1, minor: 0 });
+        config.wrapped_master_key = None;
+        let before = config.to_bytes().unwrap();
+        assert!(config.migrate_to_v1_1(b"test").is_err());
+        assert_eq!(config.to_bytes().unwrap(), before);
     }
 
     #[test]
@@ -583,6 +786,7 @@ mod tests {
         legacy.encrypted_recovery_key = None;
         let original_master_key = legacy.verify_password(password).unwrap().unwrap();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &original_master_key).await;
         provider
             .upload(
                 &axiomvault_common::VaultPath::parse(CONFIG_FILENAME).unwrap(),
@@ -671,6 +875,7 @@ mod tests {
         config.recovery_key_verification = None;
         config.encrypted_recovery_key = None;
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_legacy_tree(&provider, &config, b"test").await;
         provider
             .upload(
                 &VaultPath::parse(CONFIG_BACKUP_FILENAME).unwrap(),
@@ -795,6 +1000,7 @@ mod tests {
         let mut committed = legacy.clone();
         committed.migrate_to_v1_1(password).unwrap();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &original_master_key).await;
         upload_config(&provider, CONFIG_FILENAME, committed.to_bytes().unwrap()).await;
         upload_config(&provider, CONFIG_BACKUP_FILENAME, backup_bytes).await;
 
@@ -851,6 +1057,7 @@ mod tests {
         let config_bytes = legacy.to_bytes().unwrap();
         let malformed = b"not a vault config".to_vec();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_legacy_tree(&provider, &legacy, b"test").await;
         upload_config(&provider, CONFIG_FILENAME, config_bytes.clone()).await;
         upload_config(&provider, CONFIG_MIGRATION_FILENAME, malformed.clone()).await;
 

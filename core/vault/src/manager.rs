@@ -3126,6 +3126,20 @@ mod tests {
             .upload(&config_path(), legacy_bytes.clone())
             .await
             .unwrap();
+        // A real 1.0 vault's tree is encrypted under the password-derived key.
+        let legacy_key = legacy.verify_password(b"password").unwrap().unwrap();
+        let tree_key = legacy_key.derive_file_key(crate::session::TREE_KEY_CONTEXT);
+        provider
+            .upload(
+                &tree_path(),
+                axiomvault_crypto::encrypt(
+                    tree_key.as_bytes(),
+                    VaultTree::new().to_json().unwrap().as_bytes(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
         let before = storage_objects(provider.as_ref()).await;
 
         let v1_0_refusal = "vault version 1.0 must be migrated to 1.1 before it can be opened";
@@ -3168,6 +3182,286 @@ mod tests {
         assert_eq!(
             stored_config(provider.as_ref()).await.version,
             VaultVersion::CURRENT
+        );
+    }
+
+    /// A current vault holding one file, created through `create_vault`.
+    async fn write_current_vault_with_file(
+        manager: &VaultManager,
+        vault_id: &str,
+    ) -> (VaultPath, Zeroizing<String>) {
+        use crate::operations::VaultOperations;
+
+        let creation = manager
+            .create_vault(
+                VaultId::new(vault_id).unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let file = VaultPath::parse("/notes.txt").unwrap();
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&file, V1_1_CONTENT)
+            .await
+            .unwrap();
+        (file, creation.recovery_words.clone())
+    }
+
+    #[tokio::test]
+    async fn manifest_referencing_a_missing_tree_object_is_refused_without_writes() {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let (_, words) = write_current_vault_with_file(&manager, "missing-tree-object").await;
+        let master_key = stored_config(provider.as_ref())
+            .await
+            .verify_password(b"password")
+            .unwrap()
+            .unwrap();
+        let manifest = GenerationManifest::open(
+            &master_key,
+            &provider.download(&manifest_path()).await.unwrap(),
+        )
+        .unwrap();
+        let (tree_object, _) = manifest.object_paths().unwrap();
+        provider.delete(&tree_object).await.unwrap();
+        provider.delete(&tree_path()).await.unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+        let anchored = anchor
+            .load_state(&test_anchor_id(
+                &VaultId::new("missing-tree-object").unwrap(),
+            ))
+            .unwrap();
+        let other_device = Arc::new(InMemoryFreshnessAnchor::new());
+        let opener = manager_with_storage(provider.clone(), other_device.clone());
+
+        for manager in [&manager, &opener] {
+            for result in [
+                manager
+                    .open_vault("test", serde_json::Value::Null, b"password")
+                    .await,
+                manager
+                    .upgrade_to_current("test", serde_json::Value::Null, b"password")
+                    .await,
+                manager
+                    .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                    .await,
+            ] {
+                match result {
+                    Err(Error::Crypto(message)) => assert_eq!(
+                        message,
+                        "snapshot manifest references a missing generation object"
+                    ),
+                    Err(other) => panic!("unexpected error: {other}"),
+                    Ok(_) => panic!("a manifest whose tree is missing must not open"),
+                }
+            }
+        }
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(
+            anchor
+                .load_state(&test_anchor_id(
+                    &VaultId::new("missing-tree-object").unwrap()
+                ))
+                .unwrap(),
+            anchored
+        );
+        assert_eq!(
+            other_device
+                .load_state(&test_anchor_id(
+                    &VaultId::new("missing-tree-object").unwrap()
+                ))
+                .unwrap(),
+            None
+        );
+    }
+
+    fn assert_missing_tree_refusal(result: Result<VaultSession>) {
+        match result {
+            Err(Error::Vault(message)) => assert!(
+                message.starts_with("tree index m/tree.json is missing but"),
+                "unexpected refusal: {message}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a vault with data but no tree index must not open as empty"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_tree_index_with_data_is_refused_without_writes() {
+        // No manifest, no tree, one object in `d/`: a 1.1 vault being upgraded.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        write_v1_1_vault_without_manifest(provider.clone(), "tree-less-v1-1").await;
+        provider.delete(&tree_path()).await.unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+
+        assert_missing_tree_refusal(
+            manager
+                .upgrade_to_current("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(
+            anchor
+                .load_state(&test_anchor_id(&VaultId::new("tree-less-v1-1").unwrap()))
+                .unwrap(),
+            None
+        );
+
+        // A current vault whose manifest and tree index are withheld, opened on a
+        // device with no freshness state for it.
+        let provider = Arc::new(MemoryProvider::new());
+        let creator =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let (_, words) = write_current_vault_with_file(&creator, "tree-less-current").await;
+        provider.delete(&manifest_path()).await.unwrap();
+        provider.delete(&tree_path()).await.unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let opener = manager_with_storage(provider.clone(), anchor.clone());
+
+        assert_missing_tree_refusal(
+            opener
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+        );
+        assert_missing_tree_refusal(
+            opener
+                .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                .await,
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        assert_eq!(
+            anchor
+                .load_state(&test_anchor_id(&VaultId::new("tree-less-current").unwrap()))
+                .unwrap(),
+            None
+        );
+        let location_id = opener
+            .location_freshness_id("test", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(anchor.load(&location_id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn freshly_created_vault_reopens_and_keeps_its_files() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let creation = manager
+            .create_vault(
+                VaultId::new("fresh-reopen").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        assert!(creation
+            .session
+            .tree()
+            .read()
+            .await
+            .list(&VaultPath::root())
+            .unwrap()
+            .is_empty());
+        drop(creation);
+
+        let file = VaultPath::parse("/fresh.txt").unwrap();
+        let session = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        VaultOperations::new(&session)
+            .unwrap()
+            .create_file(&file, b"fresh content")
+            .await
+            .unwrap();
+        drop(session);
+
+        for manager in [
+            &manager,
+            &manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new())),
+        ] {
+            let session = manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await
+                .unwrap();
+            assert_eq!(
+                VaultOperations::new(&session)
+                    .unwrap()
+                    .read_file(&file)
+                    .await
+                    .unwrap(),
+                b"fresh content"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stripped_wrapped_key_and_tree_cannot_be_migrated_or_opened() {
+        use crate::migration::MigrationRegistry;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        write_current_vault_with_file(&manager, "stripped-key").await;
+        let real_master_key = stored_config(provider.as_ref())
+            .await
+            .verify_password(b"password")
+            .unwrap()
+            .unwrap();
+        // The provider strips the wrapped key and recovery material, labels the
+        // config 1.0, and withholds every object that would expose the swap.
+        let mut stripped = stored_config(provider.as_ref()).await;
+        stripped.version = VaultVersion { major: 1, minor: 0 };
+        stripped.wrapped_master_key = None;
+        stripped.recovery_wrapped_master_key = None;
+        stripped.recovery_key_verification = None;
+        stripped.encrypted_recovery_key = None;
+        provider
+            .upload(&config_path(), stripped.to_bytes().unwrap())
+            .await
+            .unwrap();
+        provider.delete(&tree_path()).await.unwrap();
+        provider.delete(&manifest_path()).await.unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+
+        let error = MigrationRegistry::with_defaults()
+            .migrate(provider.as_ref(), b"password", &VaultVersion::V1_1)
+            .await
+            .err()
+            .expect("a stripped config must not be migrated");
+        assert!(matches!(&error, Error::Crypto(message)
+            if message.contains("not proven to be the vault master key")));
+        for result in [
+            manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await,
+            manager
+                .upgrade_to_current("test", serde_json::Value::Null, b"password")
+                .await,
+        ] {
+            assert!(result.is_err());
+        }
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+        // The real master key is still the one the data is under.
+        assert_ne!(
+            stripped
+                .verify_password(b"password")
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            real_master_key.as_bytes()
         );
     }
 

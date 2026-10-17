@@ -485,6 +485,12 @@ impl VaultConfig {
     /// that as the master key and simply wrap it under both the password
     /// KEK and a new recovery KEK.
     ///
+    /// The password proves only the derived key, not that it is the master
+    /// key: a newer config stripped of `wrapped_master_key` looks legacy too.
+    /// This touches no storage, so callers must first prove the key against an
+    /// object encrypted under the master key, as `MigrationRegistry::migrate`
+    /// does, before persisting the result.
+    ///
     /// # Returns
     /// The recovery words to show to the user.
     pub fn migrate_to_v1_1(&mut self, password: &[u8]) -> Result<Zeroizing<String>> {
@@ -492,6 +498,17 @@ impl VaultConfig {
 
         if !self.is_legacy_format() {
             return Err(Error::Vault("Vault is already in v1.1 format".to_string()));
+        }
+        // A real 1.0 config has no recovery material; its presence means the
+        // wrapped key was stripped from a newer config.
+        if self.recovery_wrapped_master_key.is_some()
+            || self.recovery_key_verification.is_some()
+            || self.encrypted_recovery_key.is_some()
+        {
+            return Err(Error::Vault(
+                "legacy migration refused: config has recovery fields of a newer format but no wrapped master key"
+                    .to_string(),
+            ));
         }
 
         // In legacy mode, verify_password returns the Argon2id output which
