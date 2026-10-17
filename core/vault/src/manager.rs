@@ -158,7 +158,7 @@ impl VaultManager {
     fn freshness_id_from(
         provider_type: &str,
         provider_config: &serde_json::Value,
-        vault_id: &VaultId,
+        vault_id: Option<&VaultId>,
         ephemeral_namespace: Option<&str>,
     ) -> Result<VaultId> {
         let stable_identity = match provider_type {
@@ -175,7 +175,7 @@ impl VaultManager {
         };
         let material = serde_json::to_vec(&serde_json::json!({
             "provider": provider_type,
-            "vault_id": vault_id.as_str(),
+            "vault_id": vault_id.map(VaultId::as_str),
             "identity": stable_identity,
         }))
         .map_err(|error| Error::Serialization(error.to_string()))?;
@@ -191,9 +191,37 @@ impl VaultManager {
         Self::freshness_id_from(
             provider_type,
             provider_config,
-            vault_id,
+            Some(vault_id),
             Some(&self.ephemeral_namespace),
         )
+    }
+
+    /// Anchor key for the provider location alone. `config.id` comes from the
+    /// unauthenticated `vault.config`, so a location marker is what lets the
+    /// no-manifest path detect a vault this device has already anchored.
+    fn location_freshness_id(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+    ) -> Result<VaultId> {
+        Self::freshness_id_from(
+            provider_type,
+            provider_config,
+            None,
+            Some(&self.ephemeral_namespace),
+        )
+    }
+
+    fn mark_location_anchored(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+    ) -> Result<()> {
+        let location_id = self.location_freshness_id(provider_type, provider_config)?;
+        if self.freshness_anchor.load(&location_id)?.is_none() {
+            self.freshness_anchor.store(&location_id, 0)?;
+        }
+        Ok(())
     }
 
     /// Get the provider registry.
@@ -302,6 +330,7 @@ impl VaultManager {
             0,
         )?;
         session.save_tree().await?;
+        self.mark_location_anchored(provider_type, &provider_config)?;
 
         Ok(VaultCreation {
             session,
@@ -406,6 +435,7 @@ impl VaultManager {
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
+            self.mark_location_anchored(provider_type, &provider_config)?;
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             if upgrade {
                 config.version = VaultVersion::CURRENT;
@@ -434,11 +464,13 @@ impl VaultManager {
 
         let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
         let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
+        let location_id = self.location_freshness_id(provider_type, &provider_config)?;
+        let location_anchored = self.freshness_anchor.load(&location_id)?.is_some();
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
 
-        if anchored_state.is_some() {
+        if anchored_state.is_some() || location_anchored {
             return Err(Error::Conflict(
                 "snapshot manifest missing for a vault with trusted freshness state".to_string(),
             ));
@@ -471,6 +503,8 @@ impl VaultManager {
             0,
         )?;
         session.save_tree().await?;
+        // Marked only after the first manifest commit, so a failed bootstrap can retry.
+        self.mark_location_anchored(provider_type, &provider_config)?;
         Ok(session)
     }
 
@@ -561,12 +595,14 @@ impl VaultManager {
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
+            self.mark_location_anchored(provider_type, &provider_config)?;
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             (tree, manifest.generation)
         } else {
             let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
             let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
-            if anchored_state.is_some() {
+            let location_id = self.location_freshness_id(provider_type, &provider_config)?;
+            if anchored_state.is_some() || self.freshness_anchor.load(&location_id)?.is_some() {
                 return Err(Error::Conflict(
                     "snapshot manifest missing for a vault with trusted freshness state"
                         .to_string(),
@@ -600,6 +636,7 @@ impl VaultManager {
             generation,
         )?;
         session.save_tree().await?;
+        self.mark_location_anchored(provider_type, &provider_config)?;
         Ok(session)
     }
 
@@ -795,7 +832,8 @@ mod tests {
     }
 
     fn test_anchor_id(vault_id: &VaultId) -> VaultId {
-        VaultManager::freshness_id_from("test", &serde_json::Value::Null, vault_id, None).unwrap()
+        VaultManager::freshness_id_from("test", &serde_json::Value::Null, Some(vault_id), None)
+            .unwrap()
     }
 
     #[test]
@@ -804,14 +842,14 @@ mod tests {
         let local_a = VaultManager::freshness_id_from(
             "local",
             &serde_json::json!({"root": "/tmp/a"}),
-            &id,
+            Some(&id),
             None,
         )
         .unwrap();
         let local_b = VaultManager::freshness_id_from(
             "local",
             &serde_json::json!({"root": "/tmp/b"}),
-            &id,
+            Some(&id),
             None,
         )
         .unwrap();
@@ -820,14 +858,14 @@ mod tests {
         let cloud_a = VaultManager::freshness_id_from(
             "gdrive",
             &serde_json::json!({"folder_id": "stable", "tokens": {"access_token": "a"}}),
-            &id,
+            Some(&id),
             None,
         )
         .unwrap();
         let cloud_b = VaultManager::freshness_id_from(
             "gdrive",
             &serde_json::json!({"folder_id": "stable", "tokens": {"access_token": "b"}}),
-            &id,
+            Some(&id),
             None,
         )
         .unwrap();
@@ -836,14 +874,14 @@ mod tests {
         let memory_a = VaultManager::freshness_id_from(
             "memory",
             &serde_json::Value::Null,
-            &id,
+            Some(&id),
             Some("instance-a"),
         )
         .unwrap();
         let memory_b = VaultManager::freshness_id_from(
             "memory",
             &serde_json::Value::Null,
-            &id,
+            Some(&id),
             Some("instance-b"),
         )
         .unwrap();
@@ -1775,6 +1813,134 @@ mod tests {
                 .unwrap(),
             Some(1)
         );
+    }
+
+    /// N-1: the provider deletes the manifest and rewrites the unauthenticated
+    /// `id` in `vault.config` so the id-derived anchor lookup misses.
+    async fn strip_manifest_and_rename_vault(provider: &MemoryProvider) {
+        let config_path = VaultPath::parse(CONFIG_FILENAME).unwrap();
+        let mut config =
+            VaultConfig::from_bytes(&provider.download(&config_path).await.unwrap()).unwrap();
+        config.id = VaultId::new("attacker-renamed").unwrap();
+        provider
+            .upload(&config_path, config.to_bytes().unwrap())
+            .await
+            .unwrap();
+        provider.delete(&manifest_path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renamed_vault_without_manifest_cannot_bypass_device_anchor() {
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let creation = manager
+            .create_vault(
+                VaultId::new("anchored").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        creation.session.save_tree().await.unwrap();
+        let words = creation.recovery_words.clone();
+        drop(creation);
+
+        strip_manifest_and_rename_vault(&provider).await;
+
+        let error = manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("open must refuse a manifest-less vault at an anchored location");
+        assert!(matches!(error, Error::Conflict(_)));
+        let error = manager
+            .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+            .await
+            .err()
+            .expect("recovery must refuse a manifest-less vault at an anchored location");
+        assert!(matches!(error, Error::Conflict(_)));
+        assert!(!provider.exists(&manifest_path()).await.unwrap());
+        assert_eq!(
+            anchor
+                .load(&test_anchor_id(&VaultId::new("attacker-renamed").unwrap()))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            anchor
+                .load(&test_anchor_id(&VaultId::new("anchored").unwrap()))
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_vault_bootstraps_beside_an_anchor_for_another_location() {
+        let anchored_storage = Arc::new(MemoryProvider::new());
+        let legacy_storage = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let mut registry = ProviderRegistry::new();
+        let anchored = anchored_storage.clone();
+        registry
+            .register("test", Box::new(move |_| Ok(anchored.clone())))
+            .unwrap();
+        let legacy = legacy_storage.clone();
+        registry
+            .register("legacy", Box::new(move |_| Ok(legacy.clone())))
+            .unwrap();
+        let manager = VaultManager::with_registry_and_anchor(registry, anchor.clone());
+        manager
+            .create_vault(
+                VaultId::new("anchored").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+
+        let creation = VaultConfig::new(
+            VaultId::new("legacy-elsewhere").unwrap(),
+            b"password",
+            "legacy",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let storage: Arc<dyn StorageProvider> = legacy_storage.clone();
+        manager
+            .initialize_vault_structure(&storage, &creation.config)
+            .await
+            .unwrap();
+        VaultSession::from_master_key(
+            creation.config,
+            creation.master_key,
+            legacy_storage.clone(),
+            VaultTree::new(),
+        )
+        .unwrap()
+        .save_tree()
+        .await
+        .unwrap();
+        assert!(!legacy_storage.exists(&manifest_path()).await.unwrap());
+
+        manager
+            .open_vault("legacy", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert!(legacy_storage.exists(&manifest_path()).await.unwrap());
+        // The bootstrapped location is now marked, so the bypass is closed for it too.
+        strip_manifest_and_rename_vault(&legacy_storage).await;
+        assert!(matches!(
+            manager
+                .open_vault("legacy", serde_json::Value::Null, b"password")
+                .await,
+            Err(Error::Conflict(_))
+        ));
     }
 
     #[tokio::test]
