@@ -464,6 +464,9 @@ impl VaultConfig {
                 "New password cannot be empty".to_string(),
             ));
         }
+        // Every rewrap (password change and both recovery paths) comes through
+        // here, under parameters read from storage.
+        self.kdf_params.validate_minimum()?;
 
         let master_key = generate_master_key();
         let new_salt = Salt::generate();
@@ -653,15 +656,31 @@ impl VaultConfig {
     /// Check `config_mac` against `master_key` and remove it.
     ///
     /// The tag is keyed by the master key, so this runs after unlock and before
-    /// anything is written or rewrapped. A `CURRENT` config must carry a tag;
-    /// a 1.x config has none (it is bound by the manifest, if any, and is
-    /// refused unless explicitly upgraded), but any tag present must verify.
-    pub(crate) fn verify_integrity(&mut self, master_key: &MasterKey) -> Result<()> {
+    /// anything is written or rewrapped. A `CURRENT` config must carry a tag.
+    /// A 1.1 config written before M-1 has none, and nothing tells it from a
+    /// 2.0 config stripped and relabelled, so it is accepted untagged only
+    /// where `authenticated_otherwise`: a sealed manifest binds these bytes,
+    /// or the caller checked the password and the recovery fields against the
+    /// master key. Recovery checks neither and passes `false`. Any tag present
+    /// must verify.
+    pub(crate) fn verify_integrity(
+        &mut self,
+        master_key: &MasterKey,
+        authenticated_otherwise: bool,
+    ) -> Result<()> {
         let Some(tag) = self.config_mac.take() else {
             if self.version.major >= VaultVersion::CURRENT.major {
                 return Err(Error::Crypto(format!(
                     "{CONFIG_FILENAME} has no integrity tag (config_mac); a {} vault config \
                      without one is refused",
+                    self.version
+                )));
+            }
+            if !authenticated_otherwise && self.version >= VaultVersion::V1_1 {
+                return Err(Error::Crypto(format!(
+                    "{CONFIG_FILENAME} is not authenticated: a {} config with no integrity tag \
+                     (config_mac) and no snapshot manifest is refused; upgrade it with the \
+                     password (`axiom vault migrate`) first",
                     self.version
                 )));
             }
@@ -677,6 +696,12 @@ impl VaultConfig {
         Ok(())
     }
 }
+
+/// The refusal of an untagged 1.1 config that nothing else authenticates.
+#[cfg(test)]
+pub(crate) const UNAUTHENTICATED_V1_1: &str = "Cryptographic error: vault.config is not \
+    authenticated: a 1.1 config with no integrity tag (config_mac) and no snapshot manifest is \
+    refused; upgrade it with the password (`axiom vault migrate`) first";
 
 /// Configuration file name in vault root.
 pub const CONFIG_FILENAME: &str = "vault.config";
@@ -735,7 +760,7 @@ mod tests {
         let bytes = config.to_authenticated_bytes(&master_key).unwrap();
         let mut restored = VaultConfig::from_bytes(&bytes).unwrap();
         assert!(restored.config_mac.is_some());
-        restored.verify_integrity(&master_key).unwrap();
+        restored.verify_integrity(&master_key, false).unwrap();
         assert!(restored.config_mac.is_none());
         assert_eq!(restored.to_bytes().unwrap(), config.to_bytes().unwrap());
         // Re-tagging the verified config reproduces the stored bytes.
@@ -775,7 +800,7 @@ mod tests {
             edit(&mut json);
             let mut tampered =
                 VaultConfig::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
-            let error = tampered.verify_integrity(&master_key).unwrap_err();
+            let error = tampered.verify_integrity(&master_key, true).unwrap_err();
             assert!(
                 error.to_string().contains("config_mac mismatch"),
                 "{field}: {error}"
@@ -783,20 +808,33 @@ mod tests {
         }
         let mut genuine = VaultConfig::from_bytes(&bytes).unwrap();
         let other_key = generate_master_key();
-        assert!(genuine.verify_integrity(&other_key).is_err());
+        assert!(genuine.verify_integrity(&other_key, true).is_err());
     }
 
     #[test]
-    fn untagged_config_is_refused_at_current_version_only() {
+    fn untagged_config_is_refused_unless_a_1_1_config_is_authenticated_otherwise() {
         let (mut config, master_key) = tagged_config();
-        let error = config.clone().verify_integrity(&master_key).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Cryptographic error: vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused"
-        );
-        // A 1.1 config predates the tag; the explicit upgrade path handles it.
+        for authenticated_otherwise in [false, true] {
+            let error = config
+                .clone()
+                .verify_integrity(&master_key, authenticated_otherwise)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Cryptographic error: vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused"
+            );
+        }
+        // A 1.1 config may predate the tag: it is accepted only where a
+        // manifest or the password path authenticates it.
         config.version = VaultVersion::V1_1;
-        config.verify_integrity(&master_key).unwrap();
+        config.clone().verify_integrity(&master_key, true).unwrap();
+        assert_eq!(
+            config
+                .verify_integrity(&master_key, false)
+                .unwrap_err()
+                .to_string(),
+            UNAUTHENTICATED_V1_1
+        );
     }
 
     #[test]

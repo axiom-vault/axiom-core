@@ -296,7 +296,7 @@ impl VaultManager {
         manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
         // The manifest binds these bytes; the tag binds them to the master key
         // even where no manifest does (see the no-manifest paths).
-        config.verify_integrity(master_key)?;
+        config.verify_integrity(master_key, true)?;
         let tree = VaultSession::decrypt_tree_bytes(master_key, &encrypted_tree)?;
         Ok((config, config_bytes, tree, manifest))
     }
@@ -523,9 +523,28 @@ impl VaultManager {
             ));
         }
         // No manifest binds this config, so its tag is the only check of the
-        // fields the password does not cover; refuse before any write.
-        config.verify_integrity(&master_key)?;
+        // fields the password does not cover; refuse before any write. The
+        // version gate runs first so that `open_vault` names the 1.1 upgrade.
         let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
+        // A 1.1 config written before M-1 has no tag. On this path the password
+        // has authenticated its KDF parameters, salt and password wrap (the
+        // password check is keyed by them); its recovery fields must also bind
+        // to the master key, since recovery trusts them without the password.
+        // Its provider settings, id and timestamps stay unauthenticated, as a
+        // 1.1 client left them, and are tagged by the upgrade commit.
+        if upgrade && config.config_mac.is_none() {
+            let recovery_key = config.decrypt_recovery_key(&master_key)?;
+            if config
+                .verify_recovery_key(&recovery_key)?
+                .is_none_or(|key| key.as_bytes() != master_key.as_bytes())
+            {
+                return Err(Error::Crypto(
+                    "untagged 1.1 config: its recovery fields do not bind to the master key"
+                        .to_string(),
+                ));
+            }
+        }
+        config.verify_integrity(&master_key, upgrade)?;
 
         // Legacy bootstrap is allowed only when neither storage nor this device has
         // freshness state. Authenticate and decrypt before sanitizing a legacy config.
@@ -612,6 +631,9 @@ impl VaultManager {
         let credential_config = VaultConfig::from_bytes(&credential_config_bytes)?;
         // Refuse 1.0 before key work; it has no recovery key until migrated.
         needs_format_upgrade(&credential_config, true)?;
+        // The reset rewraps under these parameters; refuse weak ones before
+        // either branch writes. The snapshot config is checked again below.
+        credential_config.kdf_params.validate_minimum()?;
         let mut config = credential_config.clone();
         let master_key = credential_config
             .verify_recovery_key(&recovery_key)?
@@ -629,8 +651,9 @@ impl VaultManager {
                 ));
             }
             config = snapshot_config;
-            // Refuse 1.0 before the anchor and cache writes below; a 1.1
-            // snapshot is upgraded by the recovery commit.
+            // Refuse 1.0 and weak KDF parameters before the anchor and cache
+            // writes below; a 1.1 snapshot is upgraded by the recovery commit.
+            config.kdf_params.validate_minimum()?;
             let upgrade = needs_format_upgrade(&config, true)?;
             if upgrade {
                 config.verify_recovery_key_binding(&recovery_key, &master_key)?;
@@ -676,7 +699,8 @@ impl VaultManager {
             }
             // Recovery does not use the password, so nothing else checks the KDF
             // parameters `reset_password` rewraps under: verify the tag first.
-            config.verify_integrity(&master_key)?;
+            // An untagged 1.1 config is refused here (see `verify_integrity`).
+            config.verify_integrity(&master_key, false)?;
             // No manifest binds a 1.1 config, so check every recovery field and
             // authenticate the tree under the recovered key before any write.
             let upgrade = needs_format_upgrade(&config, true)?;
@@ -3201,6 +3225,26 @@ mod tests {
         (file, creation.recovery_words)
     }
 
+    /// `write_v1_1_vault_without_manifest` with a tagged `vault.config`, as
+    /// the registry's 1.0 -> 1.1 migration writes it. Recovery refuses the
+    /// untagged one.
+    async fn write_tagged_v1_1_vault_without_manifest(
+        provider: Arc<dyn StorageProvider>,
+        vault_id: &str,
+    ) -> (VaultPath, Zeroizing<String>) {
+        let written = write_v1_1_vault_without_manifest(provider.clone(), vault_id).await;
+        let config = stored_config(provider.as_ref()).await;
+        let master_key = config.verify_password(b"password").unwrap().unwrap();
+        provider
+            .upload(
+                &config_path(),
+                config.to_authenticated_bytes(&master_key).unwrap(),
+            )
+            .await
+            .unwrap();
+        written
+    }
+
     #[tokio::test]
     async fn fresh_vault_opens_at_current_version() {
         let provider = Arc::new(MemoryProvider::new());
@@ -3760,7 +3804,7 @@ mod tests {
         let manager = manager_with_storage(provider.clone(), anchor.clone());
         let vault_id = VaultId::new("v1-1-recover").unwrap();
         let (file, words) =
-            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+            write_tagged_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
         let old_key = stored_config(provider.as_ref())
             .await
             .verify_password(b"password")
@@ -3871,7 +3915,7 @@ mod tests {
         let manager = manager_with_storage(provider.clone(), anchor.clone());
         let vault_id = VaultId::new("v1-1-wrong-words").unwrap();
         let (file, words) =
-            write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+            write_tagged_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
         let before = storage_objects(provider.as_ref()).await;
         let location_id = manager
             .location_freshness_id("test", &serde_json::Value::Null)
@@ -3940,15 +3984,22 @@ mod tests {
         let manager =
             manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
         let (_, words) =
-            write_v1_1_vault_without_manifest(provider.clone(), "v1-1-mismatched-recovery").await;
+            write_tagged_v1_1_vault_without_manifest(provider.clone(), "v1-1-mismatched-recovery")
+                .await;
         let mut config = stored_config(provider.as_ref()).await;
         let master_key = config.verify_password(b"password").unwrap().unwrap();
+        config.config_mac = None;
         config.encrypted_recovery_key = Some(
             axiomvault_crypto::encrypt(master_key.as_bytes(), RecoveryKey::generate().as_bytes())
                 .unwrap(),
         );
+        // Tagged, so recovery reaches the binding check rather than refusing
+        // an untagged config.
         provider
-            .upload(&config_path(), config.to_bytes().unwrap())
+            .upload(
+                &config_path(),
+                config.to_authenticated_bytes(&master_key).unwrap(),
+            )
             .await
             .unwrap();
         let before = storage_objects(provider.as_ref()).await;
@@ -3958,7 +4009,28 @@ mod tests {
             .await
             .err()
             .expect("a recovery key that disagrees with its stored copy must be refused");
-        assert!(matches!(error, Error::Crypto(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Cryptographic error: stored recovery key does not match the recovery words"
+        );
+        assert_eq!(storage_objects(provider.as_ref()).await, before);
+
+        // Untagged, the password upgrade checks the same binding before it
+        // would tag the config.
+        provider
+            .upload(&config_path(), config.to_bytes().unwrap())
+            .await
+            .unwrap();
+        let before = storage_objects(provider.as_ref()).await;
+        let error = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .err()
+            .expect("an untagged config with unbound recovery fields must not be upgraded");
+        assert_eq!(
+            error.to_string(),
+            "Cryptographic error: untagged 1.1 config: its recovery fields do not bind to the master key"
+        );
         assert_eq!(storage_objects(provider.as_ref()).await, before);
     }
 
@@ -4028,7 +4100,7 @@ mod tests {
             let manager = manager_with_manifest_failure_storage(provider.clone(), anchor.clone());
             let vault_id = VaultId::new("v1-1-interrupted-recovery").unwrap();
             let (file, words) =
-                write_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
+                write_tagged_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
             let v1_1_bytes = provider.download(&config_path()).await.unwrap();
             let tree_before = provider.download(&tree_path()).await.unwrap();
             let data_before = object_names(provider.as_ref(), DATA_DIRNAME).await;
@@ -4101,7 +4173,8 @@ mod tests {
             let anchor = Arc::new(ToggleStoreFailureAnchor::new());
             let manager = manager_with_storage(provider.clone(), anchor.clone());
             let (file, words) =
-                write_v1_1_vault_without_manifest(provider.clone(), "v1-1-anchor-recovery").await;
+                write_tagged_v1_1_vault_without_manifest(provider.clone(), "v1-1-anchor-recovery")
+                    .await;
 
             anchor.fail_next_stores(failures);
             let result = manager
@@ -4931,5 +5004,429 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(read_back(&session, &file).await, V1_1_CONTENT);
+    }
+
+    // -- KDF floor and untagged 1.1 configs ---------------------------------
+
+    /// Strip the manifest (N-1) and rewrite `vault.config` as 1.1 without its
+    /// tag, applying `edit` too: what a provider serves a new device.
+    async fn relabel_as_untagged_v1_1(
+        provider: &MemoryProvider,
+        edit: &dyn Fn(&mut serde_json::Value),
+    ) {
+        provider.delete(&manifest_path()).await.unwrap();
+        rewrite_config_object(provider, &config_path(), &|json| {
+            json["version"] = serde_json::json!({ "major": 1, "minor": 1 });
+            strip_config_mac(json);
+            edit(json);
+        })
+        .await;
+    }
+
+    /// Assert `result` is refused with `expected` and nothing was written: not
+    /// to storage, not to `device`'s anchor for `vault_id` or the location.
+    async fn assert_refused_without_writes(
+        result: Result<VaultSession>,
+        expected: &str,
+        provider: &MemoryProvider,
+        before: &std::collections::BTreeMap<String, (String, Option<String>)>,
+        device: &InMemoryFreshnessAnchor,
+        vault_id: &str,
+    ) {
+        match result {
+            Ok(session) => panic!(
+                "accepted; the master key was rewrapped under {:?}",
+                session.config().kdf_params
+            ),
+            Err(error) => assert!(error.to_string().contains(expected), "{error}"),
+        }
+        assert_eq!(&storage_objects(provider).await, before);
+        assert_eq!(
+            device
+                .load_state(&test_anchor_id(&VaultId::new(vault_id).unwrap()))
+                .unwrap(),
+            None
+        );
+        let location_id = VaultManager::new()
+            .location_freshness_id("test", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(device.load(&location_id).unwrap(), None);
+    }
+
+    /// (a) On a device that has never seen the vault, a provider relabels the
+    /// config 1.1, strips its tag and weakens its KDF parameters. Before the
+    /// floor, recovery accepted it and rewrapped the new master key under the
+    /// weak parameters, so the new password was cheap to brute-force from the
+    /// next `vault.config`.
+    #[tokio::test]
+    async fn new_device_recovery_refuses_a_relabelled_untagged_weak_kdf_config() {
+        let provider = Arc::new(MemoryProvider::new());
+        let creator =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let (_, words) = write_current_vault_with_file(&creator, "kdf-floor-relabel").await;
+        relabel_as_untagged_v1_1(&provider, &weaken_kdf).await;
+        let before = storage_objects(provider.as_ref()).await;
+
+        let new_device = Arc::new(InMemoryFreshnessAnchor::new());
+        let result = manager_with_storage(provider.clone(), new_device.clone())
+            .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+            .await;
+        assert_refused_without_writes(
+            result,
+            "KDF parameters below the minimum",
+            &provider,
+            &before,
+            &new_device,
+            "kdf-floor-relabel",
+        )
+        .await;
+    }
+
+    /// (b) The same relabelled, untagged config with the vault's own KDF
+    /// parameters is refused by recovery: nothing authenticates it.
+    #[tokio::test]
+    async fn new_device_recovery_refuses_a_relabelled_untagged_config() {
+        let provider = Arc::new(MemoryProvider::new());
+        let creator =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let (_, words) = write_current_vault_with_file(&creator, "untagged-relabel").await;
+        relabel_as_untagged_v1_1(&provider, &|_| {}).await;
+        let before = storage_objects(provider.as_ref()).await;
+
+        let new_device = Arc::new(InMemoryFreshnessAnchor::new());
+        let result = manager_with_storage(provider.clone(), new_device.clone())
+            .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+            .await;
+        assert_refused_without_writes(
+            result,
+            crate::config::UNAUTHENTICATED_V1_1,
+            &provider,
+            &before,
+            &new_device,
+            "untagged-relabel",
+        )
+        .await;
+    }
+
+    /// (c) and (e) A genuine tagged config at the floor (`moderate()`, the
+    /// CLI's weakest strength) and above it (`interactive()`) changes its
+    /// password and recovers on a new device, with and without the manifest;
+    /// a tagged 1.1 config at the floor upgrades and changes its password.
+    #[tokio::test]
+    async fn genuine_configs_at_or_above_the_floor_upgrade_change_password_and_recover() {
+        use crate::operations::VaultOperations;
+
+        let floor = KdfParams::moderate();
+        assert_eq!(
+            (floor.memory_cost, floor.time_cost),
+            (KdfParams::MIN_MEMORY_COST, KdfParams::MIN_TIME_COST)
+        );
+        for params in [KdfParams::moderate(), KdfParams::interactive()] {
+            let provider = Arc::new(MemoryProvider::new());
+            let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = manager_with_storage(provider.clone(), anchor.clone());
+            let creation = manager
+                .create_vault(
+                    VaultId::new("floor-genuine").unwrap(),
+                    b"password",
+                    "test",
+                    serde_json::Value::Null,
+                    params.clone(),
+                )
+                .await
+                .unwrap();
+            let file = VaultPath::parse("/notes.txt").unwrap();
+            VaultOperations::new(&creation.session)
+                .unwrap()
+                .create_file(&file, V1_1_CONTENT)
+                .await
+                .unwrap();
+            let words = creation.recovery_words.clone();
+            drop(creation);
+
+            let mut session = manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await
+                .unwrap();
+            session
+                .change_password(b"password", b"changed-password")
+                .unwrap();
+            manager.save_config(&mut session).await.unwrap();
+            drop(session);
+            assert_genuine_snapshot_opens(&provider, &anchor, b"changed-password", &file).await;
+
+            for strip_manifest in [false, true] {
+                if strip_manifest {
+                    provider.delete(&manifest_path()).await.unwrap();
+                }
+                let recovered = manager_with_storage(
+                    provider.clone(),
+                    Arc::new(InMemoryFreshnessAnchor::new()),
+                )
+                .recover_vault(
+                    "test",
+                    serde_json::Value::Null,
+                    &words,
+                    b"recovered-password",
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{params:?}, {strip_manifest}: {error}"));
+                assert_eq!(read_back(&recovered, &file).await, V1_1_CONTENT);
+                assert_eq!(
+                    recovered.config().kdf_params.memory_cost,
+                    params.memory_cost
+                );
+            }
+        }
+
+        // A tagged 1.1 vault at the floor, upgraded with the password.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        let (file, _) =
+            write_tagged_v1_1_vault_without_manifest(provider.clone(), "floor-v1-1").await;
+        let mut session = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(session.config().version, VaultVersion::CURRENT);
+        session
+            .change_password(b"password", b"changed-password")
+            .unwrap();
+        manager.save_config(&mut session).await.unwrap();
+        drop(session);
+        assert_genuine_snapshot_opens(&provider, &anchor, b"changed-password", &file).await;
+    }
+
+    /// (d) A genuine config just below the floor is refused on every path that
+    /// rewraps the master key, before any write.
+    #[tokio::test]
+    async fn configs_just_below_the_floor_are_refused_on_every_rewrap_path() {
+        let below = [
+            KdfParams {
+                memory_cost: KdfParams::MIN_MEMORY_COST - 1,
+                ..KdfParams::moderate()
+            },
+            KdfParams {
+                time_cost: KdfParams::MIN_TIME_COST - 1,
+                ..KdfParams::moderate()
+            },
+        ];
+        for params in below {
+            let context = format!("{params:?}");
+            let provider = Arc::new(MemoryProvider::new());
+            let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = manager_with_storage(provider.clone(), anchor.clone());
+            let creation = manager
+                .create_vault(
+                    VaultId::new("below-floor").unwrap(),
+                    b"password",
+                    "test",
+                    serde_json::Value::Null,
+                    params.clone(),
+                )
+                .await
+                .unwrap();
+            let words = creation.recovery_words.clone();
+            drop(creation);
+            let refused = |error: Error| {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("KDF parameters below the minimum"),
+                    "{context}: {error}"
+                )
+            };
+
+            // change_password and the in-session recovery reset.
+            // Opening refreshes the `vault.config` cache; it rewraps nothing.
+            let mut session = manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await
+                .unwrap();
+            let before = storage_objects(provider.as_ref()).await;
+            let anchored = anchor
+                .load_state(&test_anchor_id(&VaultId::new("below-floor").unwrap()))
+                .unwrap();
+            refused(
+                session
+                    .change_password(b"password", b"new-password")
+                    .unwrap_err(),
+            );
+            let recovery_key = RecoveryKey::from_mnemonic(&words).unwrap();
+            refused(
+                session
+                    .reset_password_with_recovery(&recovery_key, b"new-password")
+                    .unwrap_err(),
+            );
+            assert_eq!(session.config().kdf_params.memory_cost, params.memory_cost);
+            drop(session);
+            assert_eq!(
+                storage_objects(provider.as_ref()).await,
+                before,
+                "{context}"
+            );
+
+            // reset_password / rotate_master_key on the config itself.
+            let mut config = stored_config(provider.as_ref()).await;
+            let unchanged = config.to_bytes().unwrap();
+            refused(
+                config
+                    .reset_password(&recovery_key, b"new-password")
+                    .unwrap_err(),
+            );
+            refused(
+                config
+                    .rotate_master_key(&recovery_key, b"new-password")
+                    .unwrap_err(),
+            );
+            assert_eq!(config.to_bytes().unwrap(), unchanged);
+
+            // recover_vault: manifest branch on this device, then both branches
+            // on a new device.
+            for (strip_manifest, device) in [
+                (false, anchor.clone()),
+                (false, Arc::new(InMemoryFreshnessAnchor::new())),
+                (true, Arc::new(InMemoryFreshnessAnchor::new())),
+            ] {
+                if strip_manifest {
+                    provider.delete(&manifest_path()).await.unwrap();
+                }
+                let before = storage_objects(provider.as_ref()).await;
+                let device_state = device
+                    .load_state(&test_anchor_id(&VaultId::new("below-floor").unwrap()))
+                    .unwrap();
+                refused(
+                    manager_with_storage(provider.clone(), device.clone())
+                        .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                        .await
+                        .err()
+                        .expect("recovery under parameters below the floor"),
+                );
+                assert_eq!(
+                    storage_objects(provider.as_ref()).await,
+                    before,
+                    "{context}"
+                );
+                assert_eq!(
+                    device
+                        .load_state(&test_anchor_id(&VaultId::new("below-floor").unwrap()))
+                        .unwrap(),
+                    device_state,
+                    "{context}"
+                );
+            }
+            // Only the manifest deletion above changed storage.
+            let mut expected = before.clone();
+            expected.retain(|path, _| !path.ends_with(MANIFEST_FILENAME));
+            assert_eq!(storage_objects(provider.as_ref()).await, expected);
+            assert_eq!(
+                anchor
+                    .load_state(&test_anchor_id(&VaultId::new("below-floor").unwrap()))
+                    .unwrap(),
+                anchored
+            );
+        }
+    }
+
+    /// (f) A 1.1 config from the registry's `migrate_to_v1_1` is now tagged
+    /// and recovers without the password; an untagged one (a 1.1 client, or
+    /// this registry before the tag) is refused by recovery, upgrades with the
+    /// password, and then recovers.
+    #[tokio::test]
+    async fn v1_1_configs_from_migration_recover_and_untagged_ones_upgrade_first() {
+        use crate::migration::MigrationRegistry;
+
+        // 1.0 -> 1.1 through the registry.
+        let provider = Arc::new(MemoryProvider::new());
+        let mut legacy = VaultConfig::new(
+            VaultId::new("migrated-v1-1").unwrap(),
+            b"password",
+            "test",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        legacy.version = VaultVersion { major: 1, minor: 0 };
+        legacy.wrapped_master_key = None;
+        legacy.recovery_wrapped_master_key = None;
+        legacy.recovery_key_verification = None;
+        legacy.encrypted_recovery_key = None;
+        for dirname in [DATA_DIRNAME, META_DIRNAME] {
+            provider
+                .create_dir(&VaultPath::parse(dirname).unwrap())
+                .await
+                .unwrap();
+        }
+        provider
+            .upload(&config_path(), legacy.to_bytes().unwrap())
+            .await
+            .unwrap();
+        let legacy_key = legacy.verify_password(b"password").unwrap().unwrap();
+        let tree_key = legacy_key.derive_file_key(crate::session::TREE_KEY_CONTEXT);
+        provider
+            .upload(
+                &tree_path(),
+                axiomvault_crypto::encrypt(
+                    tree_key.as_bytes(),
+                    VaultTree::new().to_json().unwrap().as_bytes(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let outcome = MigrationRegistry::with_defaults()
+            .migrate(provider.as_ref(), b"password", &VaultVersion::V1_1)
+            .await
+            .unwrap();
+        let words = outcome.recovery_words.unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&provider.download(&config_path()).await.unwrap()).unwrap();
+        assert_eq!(
+            stored["version"],
+            serde_json::json!({ "major": 1, "minor": 1 })
+        );
+        assert_eq!(stored["config_mac"].as_array().map(Vec::len), Some(32));
+        let recovered =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()))
+                .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                .await
+                .unwrap();
+        assert_eq!(recovered.config().version, VaultVersion::CURRENT);
+        drop(recovered);
+
+        // An untagged 1.1 vault without a manifest, as a 1.1 client wrote it.
+        let provider = Arc::new(MemoryProvider::new());
+        let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+        let (file, words) =
+            write_v1_1_vault_without_manifest(provider.clone(), "untagged-v1-1").await;
+        let before = storage_objects(provider.as_ref()).await;
+        let manager = manager_with_storage(provider.clone(), anchor.clone());
+        assert_refused_without_writes(
+            manager
+                .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+                .await,
+            crate::config::UNAUTHENTICATED_V1_1,
+            &provider,
+            &before,
+            &anchor,
+            "untagged-v1-1",
+        )
+        .await;
+        let upgraded = manager
+            .upgrade_to_current("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        assert_eq!(read_back(&upgraded, &file).await, V1_1_CONTENT);
+        drop(upgraded);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&provider.download(&config_path()).await.unwrap()).unwrap();
+        assert_eq!(stored["config_mac"].as_array().map(Vec::len), Some(32));
+        let recovered = manager
+            .recover_vault("test", serde_json::Value::Null, &words, b"new-password")
+            .await
+            .unwrap();
+        assert_eq!(read_back(&recovered, &file).await, V1_1_CONTENT);
     }
 }

@@ -207,7 +207,14 @@ impl MigrationRegistry {
             ));
         }
 
-        provider.upload(&temp_path, config.to_bytes()?).await?;
+        // Tagged under the proven master key, so recovery, which refuses an
+        // untagged 1.1 config that no manifest binds, accepts it.
+        provider
+            .upload(
+                &temp_path,
+                config.to_authenticated_bytes(&original_master_key)?,
+            )
+            .await?;
         if let Err(error) = provider.rename(&config_path, &backup_path).await {
             let _ = provider.delete(&temp_path).await;
             return Err(error);

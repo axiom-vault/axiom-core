@@ -32,6 +32,34 @@ impl KdfParams {
         self.argon2_params().map(|_| ())
     }
 
+    /// Lowest memory cost a master key may be wrapped under: 32 MiB, the
+    /// `moderate()` preset, which is the weakest one the CLI creates.
+    pub const MIN_MEMORY_COST: u32 = 32_768;
+    /// Lowest iteration count a master key may be wrapped under (`moderate()`).
+    pub const MIN_TIME_COST: u32 = 3;
+
+    /// Reject parameters weaker than the floor, the weakest preset the CLI
+    /// creates.
+    ///
+    /// `validate` bounds only the work an untrusted config can request. A
+    /// path that wraps a master key under parameters read from storage
+    /// must also call this, or a provider that rewrote them could make the
+    /// new password wrap cheap to brute-force. Parallelism is not floored:
+    /// fewer lanes over the same memory and passes cost an attacker no less.
+    pub fn validate_minimum(&self) -> Result<()> {
+        if self.memory_cost < Self::MIN_MEMORY_COST || self.time_cost < Self::MIN_TIME_COST {
+            return Err(Error::Crypto(format!(
+                "KDF parameters below the minimum (memory_cost {} KiB, time_cost {}; minimum {} KiB, {}): \
+                 refusing to wrap a master key under them",
+                self.memory_cost,
+                self.time_cost,
+                Self::MIN_MEMORY_COST,
+                Self::MIN_TIME_COST
+            )));
+        }
+        Ok(())
+    }
+
     fn argon2_params(&self) -> Result<Params> {
         if self.memory_cost > 262_144 || self.time_cost > 4 || self.parallelism > 4 {
             return Err(Error::InvalidInput(
@@ -164,6 +192,37 @@ mod tests {
         ] {
             assert!(params.validate().is_err());
             assert!(derive_key(b"password", &Salt::generate(), &params).is_err());
+        }
+    }
+
+    #[test]
+    fn minimum_accepts_every_cli_preset_and_refuses_anything_below_moderate() {
+        // The CLI's `KdfStrength` maps to exactly these three presets.
+        for params in [
+            KdfParams::moderate(),
+            KdfParams::interactive(),
+            KdfParams::sensitive(),
+        ] {
+            params.validate_minimum().unwrap();
+        }
+        // Fewer lanes than `moderate()` are not weaker.
+        KdfParams {
+            parallelism: 1,
+            ..KdfParams::moderate()
+        }
+        .validate_minimum()
+        .unwrap();
+        for params in [
+            KdfParams {
+                memory_cost: KdfParams::MIN_MEMORY_COST - 1,
+                ..KdfParams::moderate()
+            },
+            KdfParams {
+                time_cost: KdfParams::MIN_TIME_COST - 1,
+                ..KdfParams::moderate()
+            },
+        ] {
+            assert!(params.validate_minimum().is_err(), "{params:?}");
         }
     }
 
