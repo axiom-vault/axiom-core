@@ -23,4 +23,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 zeroize.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+rmcp = { version = "1.7.0", features = ["client", "server", "transport-io"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }

@@ -1,4 +1,10 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
 
 use axiomvault_app::{
     AppError, AppService, CreateVaultParams, DirectoryEntryDto, FileMetadataDto, OpenVaultParams,
@@ -26,9 +32,41 @@ const SERVER_STATUS_URI: &str = "axiom://server/status";
 const VAULT_STATUS_URI: &str = "axiom://vault/status";
 const VAULT_TREE_URI: &str = "axiom://vault/tree";
 
+/// Launch-time capabilities. Everything is off by default; a tool call
+/// cannot turn any of it on.
+#[derive(Clone, Debug, Default)]
+pub struct ServerPolicy {
+    allow_writes: bool,
+    file_io_root: Option<PathBuf>,
+}
+
+impl ServerPolicy {
+    /// `file_io_dir` is canonicalised here, so the jail root is fixed at launch.
+    pub fn new(allow_writes: bool, file_io_dir: Option<&Path>) -> std::io::Result<Self> {
+        let file_io_root = match file_io_dir {
+            Some(dir) => {
+                let root = std::fs::canonicalize(dir)?;
+                if !root.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--allow-file-io is not a directory: {}", root.display()),
+                    ));
+                }
+                Some(root)
+            }
+            None => None,
+        };
+        Ok(Self {
+            allow_writes,
+            file_io_root,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AxiomMcpServer {
     app: Arc<AppService>,
+    policy: ServerPolicy,
     #[expect(
         dead_code,
         reason = "stored router used by rmcp macro-generated handlers"
@@ -42,23 +80,38 @@ pub struct AxiomMcpServer {
 }
 
 impl AxiomMcpServer {
+    /// A read-only server: no mutating tools, no local file I/O.
     pub fn new() -> Self {
+        Self::with_policy(ServerPolicy::default())
+    }
+
+    pub fn with_policy(policy: ServerPolicy) -> Self {
         Self {
             app: Arc::new(AppService::new()),
+            policy,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
     }
 
-    fn write_guard(allow_write: bool) -> Result<(), McpError> {
-        if allow_write {
+    fn write_guard(&self) -> Result<(), McpError> {
+        if self.policy.allow_writes {
             Ok(())
         } else {
-            Err(McpError::invalid_params(
-                "mutating tools require allow_write=true",
+            Err(McpError::invalid_request(
+                "mutating tools are disabled; the server must be launched with --allow-writes",
                 None,
             ))
         }
+    }
+
+    fn file_io_root(&self) -> Result<&Path, McpError> {
+        self.policy.file_io_root.as_deref().ok_or_else(|| {
+            McpError::invalid_request(
+                "local file I/O is disabled; the server must be launched with --allow-file-io=<dir>",
+                None,
+            )
+        })
     }
 
     fn map_app_error(err: AppError) -> McpError {
@@ -152,8 +205,6 @@ pub struct CreateVaultArgs {
     pub provider_type: String,
     #[serde(default)]
     pub provider_config: serde_json::Value,
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -171,14 +222,6 @@ pub struct RecoverVaultArgs {
     pub provider_type: String,
     #[serde(default)]
     pub provider_config: serde_json::Value,
-    #[serde(default)]
-    pub allow_write: bool,
-}
-
-#[derive(Clone, Deserialize, JsonSchema)]
-pub struct CloseVaultArgs {
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -199,31 +242,23 @@ pub struct WriteFileArgs {
     pub content: String,
     #[serde(default = "default_encoding")]
     pub encoding: String,
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct DeletePathArgs {
     pub path: String,
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct ImportFileArgs {
     pub local_path: String,
     pub vault_path: String,
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct ExportFileArgs {
     pub vault_path: String,
     pub local_path: String,
-    #[serde(default)]
-    pub allow_write: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -240,6 +275,8 @@ pub struct StatusResponse {
     pub server: &'static str,
     pub max_read_bytes: usize,
     pub write_protection_default: bool,
+    pub writes_enabled: bool,
+    pub file_io_enabled: bool,
     pub vault_open: bool,
 }
 
@@ -275,7 +312,6 @@ struct CreateVaultSecretDto {
     password: Zeroizing<String>,
     provider_type: String,
     provider_config: serde_json::Value,
-    allow_write: bool,
 }
 
 impl From<CreateVaultArgs> for CreateVaultSecretDto {
@@ -285,7 +321,6 @@ impl From<CreateVaultArgs> for CreateVaultSecretDto {
             password: Zeroizing::new(value.password),
             provider_type: value.provider_type,
             provider_config: value.provider_config,
-            allow_write: value.allow_write,
         }
     }
 }
@@ -297,7 +332,6 @@ impl std::fmt::Debug for CreateVaultSecretDto {
             .field("password", &"[REDACTED]")
             .field("provider_type", &self.provider_type)
             .field("provider_config", &"[REDACTED]")
-            .field("allow_write", &self.allow_write)
             .finish()
     }
 }
@@ -308,7 +342,6 @@ struct RecoverVaultSecretDto {
     new_password: Zeroizing<String>,
     provider_type: String,
     provider_config: serde_json::Value,
-    allow_write: bool,
 }
 
 impl From<RecoverVaultArgs> for RecoverVaultSecretDto {
@@ -318,7 +351,6 @@ impl From<RecoverVaultArgs> for RecoverVaultSecretDto {
             new_password: Zeroizing::new(value.new_password),
             provider_type: value.provider_type,
             provider_config: value.provider_config,
-            allow_write: value.allow_write,
         }
     }
 }
@@ -330,7 +362,6 @@ impl std::fmt::Debug for RecoverVaultSecretDto {
             .field("new_password", &"[REDACTED]")
             .field("provider_type", &self.provider_type)
             .field("provider_config", &"[REDACTED]")
-            .field("allow_write", &self.allow_write)
             .finish()
     }
 }
@@ -354,6 +385,82 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
 
+fn jail_error(message: impl Into<String>) -> McpError {
+    McpError::invalid_params(message.into(), None)
+}
+
+const JAIL_IMPORT_DENIED: &str = "local_path is not a regular file inside the file I/O directory";
+const JAIL_EXPORT_DENIED: &str =
+    "local_path is not in an existing directory inside the file I/O directory";
+
+/// Joins `local_path` onto the jail root without touching the filesystem.
+/// Any `..` is rejected outright, and an absolute path must already sit
+/// under the root, so nothing outside the jail is ever stat'ed. Callers
+/// still check the canonical result, which catches symlinked directories.
+fn jail_candidate(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
+    let requested = Path::new(local_path);
+    if local_path.is_empty() {
+        return Err(jail_error("local_path is empty"));
+    }
+    if requested
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(jail_error("local_path must not contain '..'"));
+    }
+    if requested.is_absolute() && !requested.starts_with(root) {
+        return Err(jail_error("local_path is outside the file I/O directory"));
+    }
+    Ok(root.join(requested))
+}
+
+/// Resolves an import source: an existing regular file, not a symlink, whose
+/// canonical path is inside the jail root.
+async fn jail_import_source(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
+    let candidate = jail_candidate(root, local_path)?;
+    let metadata = tokio::fs::symlink_metadata(&candidate)
+        .await
+        .map_err(|_| jail_error(JAIL_IMPORT_DENIED))?;
+    if metadata.file_type().is_symlink() {
+        return Err(jail_error("local_path must not be a symlink"));
+    }
+    let canonical = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|_| jail_error(JAIL_IMPORT_DENIED))?;
+    if !metadata.is_file() || !canonical.starts_with(root) {
+        return Err(jail_error(JAIL_IMPORT_DENIED));
+    }
+    Ok(canonical)
+}
+
+/// Resolves an export target: a name that does not exist yet, in a parent
+/// directory whose canonical path is inside the jail root. The vault layer
+/// publishes with a no-clobber rename, so a file that appears after this
+/// check is still not overwritten.
+async fn jail_export_target(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
+    let candidate = jail_candidate(root, local_path)?;
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| jail_error("local_path has no file name"))?;
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| jail_error("local_path has no parent directory"))?;
+    let canonical_parent = tokio::fs::canonicalize(parent)
+        .await
+        .map_err(|_| jail_error(JAIL_EXPORT_DENIED))?;
+    if !canonical_parent.starts_with(root) {
+        return Err(jail_error(JAIL_EXPORT_DENIED));
+    }
+    let target = canonical_parent.join(name);
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(_) => Err(jail_error(
+            "local_path already exists; refusing to overwrite",
+        )),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(target),
+        Err(_) => Err(jail_error("local_path cannot be inspected")),
+    }
+}
+
 #[tool_router]
 impl AxiomMcpServer {
     #[tool(description = "Create a vault and return recovery words once")]
@@ -361,8 +468,8 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<CreateVaultArgs>,
     ) -> Result<CallToolResult, McpError> {
+        self.write_guard()?;
         let dto = CreateVaultSecretDto::from(args);
-        Self::write_guard(dto.allow_write)?;
         let created: VaultCreatedDto = self
             .app
             .create_vault(CreateVaultParams {
@@ -402,8 +509,8 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<RecoverVaultArgs>,
     ) -> Result<CallToolResult, McpError> {
+        self.write_guard()?;
         let dto = RecoverVaultSecretDto::from(args);
-        Self::write_guard(dto.allow_write)?;
         let info = self
             .app
             .recover_vault(RecoverVaultParams {
@@ -418,11 +525,7 @@ impl AxiomMcpServer {
     }
 
     #[tool(description = "Close the active vault")]
-    async fn close_vault(
-        &self,
-        Parameters(args): Parameters<CloseVaultArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+    async fn close_vault(&self) -> Result<CallToolResult, McpError> {
         self.app.close_vault().await.map_err(Self::map_app_error)?;
         ok_json(&json!({ "closed": true }))
     }
@@ -465,7 +568,7 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        self.write_guard()?;
         let bytes = decode_content(&args)?;
         self.app
             .create_file(&args.path, &bytes)
@@ -479,7 +582,7 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        self.write_guard()?;
         let bytes = decode_content(&args)?;
         self.app
             .update_file(&args.path, &bytes)
@@ -493,7 +596,7 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<DeletePathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        self.write_guard()?;
         let metadata = self
             .app
             .metadata(&args.path)
@@ -522,7 +625,7 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<DeletePathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        self.write_guard()?;
         self.app
             .create_directory(&args.path)
             .await
@@ -561,9 +664,13 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<ImportFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        self.write_guard()?;
+        let source = jail_import_source(self.file_io_root()?, &args.local_path).await?;
+        let source = source
+            .to_str()
+            .ok_or_else(|| jail_error("local_path is not valid UTF-8"))?;
         self.app
-            .import_file(&args.local_path, &args.vault_path)
+            .import_file(source, &args.vault_path)
             .await
             .map_err(Self::map_app_error)?;
         ok_json(&json!({
@@ -578,9 +685,12 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<ExportFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Self::write_guard(args.allow_write)?;
+        let target = jail_export_target(self.file_io_root()?, &args.local_path).await?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| jail_error("local_path is not valid UTF-8"))?;
         self.app
-            .export_file(&args.vault_path, &args.local_path)
+            .export_file(&args.vault_path, target)
             .await
             .map_err(Self::map_app_error)?;
         ok_json(&json!({
@@ -611,7 +721,7 @@ impl AxiomMcpServer {
     async fn safe_write_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Verify target paths with exists/metadata. 2. Require explicit user approval. 3. Pass allow_write=true only for the specific mutating call. 4. Re-read metadata after write/update/delete/mkdir/import/export.",
+            "1. Verify target paths with exists/metadata. 2. Require explicit user approval. 3. Mutating tools work only when the operator launched the server with --allow-writes; import/export also need --allow-file-io=<dir> and stay inside that directory. 4. Re-read metadata after write/update/delete/mkdir/import/export.",
         )]
     }
 
@@ -622,7 +732,7 @@ impl AxiomMcpServer {
     async fn vault_recovery_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Confirm recovery intent. 2. Use recover_vault with allow_write=true. 3. Never log recovery words or passwords. 4. Rotate to a fresh password and validate vault_info after recovery.",
+            "1. Confirm recovery intent. 2. Use recover_vault with the user's recovery words (requires a server launched with --allow-writes). 3. Never log recovery words or passwords. 4. Rotate to a fresh password and validate vault_info after recovery.",
         )]
     }
 }
@@ -639,7 +749,7 @@ impl ServerHandler for AxiomMcpServer {
                 .build(),
         )
         .with_instructions(
-            "AxiomVault MCP server. Secrets are redacted in debug output. Mutating tools require allow_write=true. Read responses may be truncated.",
+            "AxiomVault MCP server. Secrets are redacted in debug output. Mutating tools are disabled unless the server was launched with --allow-writes. import_file/export_file are disabled unless launched with --allow-file-io=<dir> and are confined to that directory. Read responses may be truncated.",
         )
     }
 
@@ -671,6 +781,8 @@ impl ServerHandler for AxiomMcpServer {
                     server: "axiomvault-mcp",
                     max_read_bytes: MAX_READ_BYTES,
                     write_protection_default: true,
+                    writes_enabled: self.policy.allow_writes,
+                    file_io_enabled: self.policy.file_io_root.is_some(),
                     vault_open: self.app.is_vault_open().await,
                 },
             )?,
@@ -715,9 +827,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_guard_blocks_without_explicit_approval() {
-        let err = AxiomMcpServer::write_guard(false).unwrap_err();
-        assert!(err.message.contains("allow_write=true"));
+    fn write_guard_blocks_without_launch_flag() {
+        let err = AxiomMcpServer::new().write_guard().unwrap_err();
+        assert!(err.message.contains("--allow-writes"));
     }
 
     #[test]
@@ -742,7 +854,6 @@ mod tests {
             path: "/note.txt".into(),
             content: "abc".into(),
             encoding: "hex".into(),
-            allow_write: true,
         })
         .unwrap_err();
         assert!(err.message.contains("unsupported encoding"));
@@ -755,7 +866,6 @@ mod tests {
             password: "top-secret".into(),
             provider_type: "local".into(),
             provider_config: json!({ "token": "secret-token" }),
-            allow_write: true,
         });
         let create_debug = format!("{:?}", create);
         assert!(!create_debug.contains("top-secret"));
@@ -767,7 +877,6 @@ mod tests {
             new_password: "another-secret".into(),
             provider_type: "local".into(),
             provider_config: json!({ "refresh_token": "hidden" }),
-            allow_write: true,
         });
         let recover_debug = format!("{:?}", recover);
         assert!(!recover_debug.contains("abandon ability able"));
