@@ -15,28 +15,32 @@ the unlocked vault and answers requests on a Unix socket. Clients such as
   it. The key lives in the daemon instead, which marks itself non-dumpable
   (`PR_SET_DUMPABLE=0`), so its memory, environment and ptrace are closed to
   other processes of the same uid.
-- **The daemon is the policy boundary.** Writes, file I/O, the vault subtree
-  and idle locking are launch flags enforced in the daemon, because any
-  allowed process can talk to the socket directly.
+- **The daemon is the policy boundary.** The vault, writes, file I/O, the
+  vault subtree and idle locking are launch flags enforced in the daemon,
+  because any allowed process can talk to the socket directly. An unlock
+  request carries only the password, and requests with unknown fields are
+  refused, so no client can point the daemon at a vault it controls.
 - **Same uid is not a security boundary.** A process running as your uid can
   send requests within the daemon's policy, lock the vault, or start a more
   permissive daemon on the socket path and wait for you to unlock it. `unlock`
-  prints the daemon's pid, uid and policy before prompting so you can spot
+  prints the daemon's pid, uid, vault and policy before prompting so you can spot
   that. To make it a real boundary, run the daemon as a separate user (below).
 
 ## Usage
 
 ```bash
-axiom-agent serve [--socket <path>] [--socket-mode 600|660] [--allow-writes]
+axiom-agent serve --vault <local vault dir> [--socket <path>]
+                  [--socket-mode 600|660] [--allow-writes]
                   [--allow-file-io=<dir>] [--root <vault path>]
                   [--idle-lock <secs>] [--allow-uid <uid>]...
-axiom-agent unlock --path <local vault dir> [--socket <path>] [--expect-uid <uid>]
+axiom-agent unlock [--socket <path>] [--expect-uid <uid>]
 axiom-agent lock   [--socket <path>]
 axiom-agent status [--socket <path>]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--vault` | required | The local vault this daemon serves, canonicalised at startup (must exist). Unlock opens this vault and no other. |
 | `--socket` | `$XDG_RUNTIME_DIR/axiom-agent.sock` | Socket path. The parent is created 0700 if missing. A live socket is an error; a stale one is replaced. |
 | `--socket-mode` | `600` | `660` shares the socket with its group. |
 | `--allow-writes` | off | Create, update, delete, mkdir, import. |
@@ -48,8 +52,7 @@ axiom-agent status [--socket <path>]
 Other behaviour:
 
 - Locking drops the vault session, and with it the master key.
-- An unlock is refused while a vault is already unlocked, so a client cannot
-  swap the vault others are using.
+- An unlock is refused while the vault is already unlocked.
 - Each failed unlock delays its response: 1s, doubling to 60s, reset on
   success. Attempts are serialised across connections.
 - Memory is locked with `mlockall` only when `RLIMIT_MEMLOCK` is unlimited
@@ -69,7 +72,7 @@ The protocol is newline-delimited JSON, one response per request, at most
 2. Run the daemon as that user, socket in a directory you can reach:
 
    ```bash
-   sudo -u axiomvault axiom-agent serve \
+   sudo -u axiomvault axiom-agent serve --vault /srv/axiomvault/main \
      --socket /run/axiom-agent/agent.sock --socket-mode 660 \
      --allow-uid "$(id -u you)"
    ```
@@ -81,7 +84,7 @@ The protocol is newline-delimited JSON, one response per request, at most
 
    ```bash
    axiom-agent unlock --socket /run/axiom-agent/agent.sock \
-     --path /srv/axiomvault/main --expect-uid "$(id -u axiomvault)"
+     --expect-uid "$(id -u axiomvault)"
    ```
 
 4. Point `axiom-mcp --socket /run/axiom-agent/agent.sock` at it.

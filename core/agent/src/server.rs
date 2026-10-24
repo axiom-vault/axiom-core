@@ -3,7 +3,7 @@
 use std::{
     fs::{DirBuilder, Permissions},
     os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -35,6 +35,10 @@ const MAX_UNLOCK_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
+    /// The local vault this daemon serves, canonicalised at startup. Unlock
+    /// requests carry only a password, so a client cannot point the daemon
+    /// at a different vault.
+    pub vault_dir: PathBuf,
     pub policy: ServerPolicy,
     /// `None` disables idle auto-lock.
     pub idle_lock: Option<Duration>,
@@ -266,6 +270,7 @@ impl Agent {
                 Err(err) => Err(app_error(err)),
             },
             Request::Status => Ok(Payload::Status(AgentStatus {
+                vault_dir: self.config.vault_dir.clone(),
                 unlocked: app.is_vault_open().await,
                 allow_writes: policy.allow_writes(),
                 file_io_dir: policy.file_io_dir().map(Path::to_path_buf),
@@ -391,10 +396,9 @@ impl Agent {
         }
     }
 
-    /// Unlocks only when no vault is open, so a request cannot silently swap
-    /// the vault that other clients are working in. Each failure delays its
-    /// own response; attempts are serialised, so the delay throttles every
-    /// connection, not just the one that failed.
+    /// Opens the pinned vault, and only when it is not open already. Each
+    /// failure delays its own response; attempts are serialised, so the delay
+    /// throttles every connection, not just the one that failed.
     async fn unlock(&self, params: UnlockParams) -> Result<Payload, AgentError> {
         let mut failures = self.unlock_failures.lock().await;
         if self.app.is_vault_open().await {
@@ -403,17 +407,14 @@ impl Agent {
                 "a vault is already unlocked; lock it first",
             ));
         }
-        let UnlockParams {
-            provider_type,
-            provider_config,
-            password,
-        } = params;
         let opened = self
             .app
             .open_vault(OpenVaultParams {
-                password,
-                provider_type,
-                provider_config,
+                password: params.password,
+                provider_type: "local".to_string(),
+                provider_config: serde_json::json!({
+                    "root": self.config.vault_dir.to_string_lossy(),
+                }),
             })
             .await;
         match opened {

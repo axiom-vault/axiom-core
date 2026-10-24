@@ -18,9 +18,11 @@ pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 pub const LOCKED_MESSAGE: &str =
     "vault is locked; ask the user to run `axiom-agent unlock` in their own terminal";
 
-/// One request to the agent.
+/// One request to the agent. Unknown fields are an error, so a client cannot
+/// believe it is steering something (such as which vault to unlock) that the
+/// daemon ignores.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Unlock(UnlockParams),
     Lock,
@@ -107,13 +109,11 @@ impl Request {
     }
 }
 
-/// Unlock parameters. `password` is held in [`Zeroizing`] and, like
-/// `provider_config` (which may carry provider tokens), redacted in `Debug`.
+/// Unlock parameters: only the password, held in [`Zeroizing`] and redacted
+/// in `Debug`. Which vault it unlocks is fixed by `serve --vault`.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnlockParams {
-    pub provider_type: String,
-    #[serde(default)]
-    pub provider_config: serde_json::Value,
     #[serde(with = "zeroizing_string")]
     pub password: Zeroizing<String>,
 }
@@ -121,8 +121,6 @@ pub struct UnlockParams {
 impl std::fmt::Debug for UnlockParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnlockParams")
-            .field("provider_type", &self.provider_type)
-            .field("provider_config", &"[REDACTED]")
             .field("password", &"[REDACTED]")
             .finish()
     }
@@ -186,6 +184,8 @@ pub enum Payload {
 /// prompting, so the user can spot a daemon that is not the one they started.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentStatus {
+    /// The local vault directory this daemon is pinned to.
+    pub vault_dir: PathBuf,
     pub unlocked: bool,
     pub allow_writes: bool,
     pub file_io_dir: Option<PathBuf>,
@@ -333,8 +333,6 @@ mod tests {
 
     fn unlock() -> Request {
         Request::Unlock(UnlockParams {
-            provider_type: "local".into(),
-            provider_config: json!({ "root": "/vaults/secret-location", "token": "tok-123" }),
             password: Zeroizing::new("correct horse battery staple".into()),
         })
     }
@@ -380,9 +378,35 @@ mod tests {
     #[test]
     fn unlock_wire_format_is_flat() {
         let value = serde_json::to_value(unlock()).unwrap();
-        assert_eq!(value["op"], "unlock");
-        assert_eq!(value["provider_type"], "local");
-        assert_eq!(value["password"], "correct horse battery staple");
+        assert_eq!(
+            value,
+            json!({ "op": "unlock", "password": "correct horse battery staple" })
+        );
+    }
+
+    /// The daemon is pinned to one vault; a request naming another must be
+    /// refused, not silently ignored. (serde does not apply
+    /// `deny_unknown_fields` to unit variants such as `status`, which carry
+    /// nothing to steer.)
+    #[test]
+    fn unknown_fields_are_rejected() {
+        for line in [
+            json!({ "op": "unlock", "password": "p", "provider_type": "local" }),
+            json!({
+                "op": "unlock",
+                "password": "p",
+                "provider_config": { "root": "/attacker/vault" },
+            }),
+            json!({ "op": "read_file", "path": "/a", "vault": "/other" }),
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(line.clone()).is_err(),
+                "{line} accepted"
+            );
+        }
+        assert!(
+            serde_json::from_value::<Request>(json!({ "op": "unlock", "password": "p" })).is_ok()
+        );
     }
 
     #[test]
@@ -393,6 +417,7 @@ mod tests {
             },
             Response::Ok {
                 payload: Payload::Status(AgentStatus {
+                    vault_dir: "/srv/vault".into(),
                     unlocked: true,
                     allow_writes: false,
                     file_io_dir: Some("/tmp/io".into()),
@@ -444,10 +469,7 @@ mod tests {
     fn unlock_debug_redacts_secrets() {
         let debug = format!("{:?}", unlock());
         assert!(!debug.contains("correct horse"), "{debug}");
-        assert!(!debug.contains("tok-123"), "{debug}");
-        assert!(!debug.contains("secret-location"), "{debug}");
         assert!(debug.contains("[REDACTED]"));
-        assert!(debug.contains("local"));
     }
 
     #[test]

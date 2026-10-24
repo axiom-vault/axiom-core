@@ -22,8 +22,8 @@ own terminal".
 ## Run
 
 ```bash
-axiom-agent serve &                      # see ../agent/README.md for flags
-axiom-agent unlock --path ~/vaults/main  # in your own terminal
+axiom-agent serve --vault ~/vaults/main &  # see ../agent/README.md for flags
+axiom-agent unlock                         # in your own terminal
 cargo run -p axiomvault-mcp -- [--socket <path>]
 ```
 

@@ -15,7 +15,7 @@ use axiomvault_agent::{
 };
 use axiomvault_app::{AppService, CreateVaultParams};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
@@ -23,20 +23,21 @@ const PASSWORD: &str = "old-password";
 
 struct Fixture {
     dir: TempDir,
-    config: Value,
+    vault_dir: PathBuf,
 }
 
 /// A local vault containing `/hello.txt`, `/docs`, `/notes/a.txt` and
 /// `/notes2/b.txt`, created directly through `AppService`.
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let config = json!({ "root": dir.path().join("vault") });
+    // Canonical, as `serve --vault` makes it.
+    let vault_dir = std::fs::canonicalize(dir.path()).unwrap().join("vault");
     let app = AppService::new();
     app.create_vault(CreateVaultParams {
         vault_id: "agent".into(),
         password: Zeroizing::new(PASSWORD.into()),
         provider_type: "local".into(),
-        provider_config: config.clone(),
+        provider_config: json!({ "root": vault_dir }),
     })
     .await
     .unwrap();
@@ -47,7 +48,7 @@ async fn fixture() -> Fixture {
     app.create_directory("/notes2").await.unwrap();
     app.create_file("/notes2/b.txt", b"note b").await.unwrap();
     app.close_vault().await.unwrap();
-    Fixture { dir, config }
+    Fixture { dir, vault_dir }
 }
 
 impl Fixture {
@@ -57,6 +58,7 @@ impl Fixture {
 
     fn config(&self, policy: ServerPolicy) -> DaemonConfig {
         DaemonConfig {
+            vault_dir: self.vault_dir.clone(),
             policy,
             idle_lock: None,
             allowed_uids: vec![self.uid()],
@@ -76,8 +78,6 @@ impl Fixture {
 
     fn unlock_request(&self, password: &str) -> Request {
         Request::Unlock(UnlockParams {
-            provider_type: "local".into(),
-            provider_config: self.config.clone(),
             password: Zeroizing::new(password.into()),
         })
     }
@@ -191,6 +191,44 @@ async fn unlock_needs_the_right_password_and_backs_off_on_failure() {
     // A second unlock cannot swap the open vault, and runs no KDF.
     let (again, _) = kind(req(&socket, fx.unlock_request(PASSWORD)).await);
     assert_eq!(again, ErrorKind::AlreadyUnlocked);
+}
+
+/// Unlock carries only the password: a request that names a vault is
+/// refused, so a client cannot redirect the daemon to a vault it controls.
+#[tokio::test]
+async fn unlock_cannot_name_another_vault() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let fx = fixture().await;
+    let other = tempfile::tempdir().unwrap();
+    let socket = fx.start(fx.config(ServerPolicy::default()));
+
+    let Payload::Status(status) = req(&socket, Request::Status).await.unwrap() else {
+        panic!("not a status");
+    };
+    assert_eq!(status.vault_dir, fx.vault_dir);
+
+    let line = json!({
+        "op": "unlock",
+        "password": PASSWORD,
+        "provider_type": "local",
+        "provider_config": { "root": other.path() },
+    });
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .await
+        .unwrap();
+    assert!(response.contains("invalid_request"), "{response}");
+    assert!(matches!(
+        req(&socket, Request::Status).await.unwrap(),
+        Payload::Status(status) if !status.unlocked
+    ));
 }
 
 #[tokio::test]

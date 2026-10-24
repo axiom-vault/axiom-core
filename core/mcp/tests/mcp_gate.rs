@@ -29,19 +29,19 @@ const PASSWORD: &str = "old-password";
 /// with an agent serving it on a socket in the same temporary directory.
 struct Fixture {
     _dir: TempDir,
-    config: Value,
     socket: PathBuf,
 }
 
 async fn fixture(policy: ServerPolicy) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let config = json!({ "root": dir.path().join("vault") });
+    // Canonical, as `serve --vault` makes it.
+    let vault_dir = std::fs::canonicalize(dir.path()).unwrap().join("vault");
     let app = AppService::new();
     app.create_vault(CreateVaultParams {
         vault_id: "gate".into(),
         password: Zeroizing::new(PASSWORD.into()),
         provider_type: "local".into(),
-        provider_config: config.clone(),
+        provider_config: json!({ "root": vault_dir }),
     })
     .await
     .unwrap();
@@ -54,16 +54,13 @@ async fn fixture(policy: ServerPolicy) -> Fixture {
     tokio::spawn(serve(
         listener,
         DaemonConfig {
+            vault_dir,
             policy,
             idle_lock: None,
             allowed_uids: vec![dir.path().metadata().unwrap().uid()],
         },
     ));
-    Fixture {
-        _dir: dir,
-        config,
-        socket,
-    }
+    Fixture { _dir: dir, socket }
 }
 
 impl Fixture {
@@ -73,8 +70,6 @@ impl Fixture {
             .await
             .unwrap()
             .request(&Request::Unlock(UnlockParams {
-                provider_type: "local".into(),
-                provider_config: self.config.clone(),
                 password: Zeroizing::new(PASSWORD.into()),
             }))
             .await
