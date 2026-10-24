@@ -14,13 +14,16 @@ use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
 const USAGE: &str = "usage:
-  axiom-agent serve  [--socket <path>] [--socket-mode <octal>] [--allow-writes]
+  axiom-agent serve  --vault <local vault dir> [--socket <path>]
+                     [--socket-mode <octal>] [--allow-writes]
                      [--allow-file-io=<dir>] [--root <vault path>]
                      [--idle-lock <secs>] [--allow-uid <uid>]...
-  axiom-agent unlock --path <local vault dir> [--socket <path>] [--expect-uid <uid>]
+  axiom-agent unlock [--socket <path>] [--expect-uid <uid>]
   axiom-agent lock   [--socket <path>]
   axiom-agent status [--socket <path>]
 
+  --vault <dir>          the local vault this daemon serves; unlock can open
+                         no other
   --socket <path>        agent socket (default $XDG_RUNTIME_DIR/axiom-agent.sock)
   --socket-mode <octal>  socket permissions: 600 (default), or 660 to share it
                          with the socket's group
@@ -31,7 +34,6 @@ const USAGE: &str = "usage:
                          (default 900)
   --allow-uid <uid>      uid allowed to connect; repeatable (default: the
                          daemon's own uid)
-  --path <dir>           local vault directory to unlock
   --expect-uid <uid>     refuse to send the password unless the daemon runs
                          as <uid>
 
@@ -120,6 +122,7 @@ struct ServeOptions {
 /// silently starts a daemon with different capabilities than intended.
 fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
     let mut allow_writes = false;
+    let mut vault_dir = None;
     let mut socket = None;
     let mut socket_mode = None;
     let mut file_io_dir = None;
@@ -130,6 +133,8 @@ fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
     while let Some(arg) = args.next() {
         if arg == "--allow-writes" {
             allow_writes = true;
+        } else if let Some(value) = flag_value(&arg, "--vault", &mut args)? {
+            set_once(&mut vault_dir, PathBuf::from(value), "--vault")?;
         } else if let Some(value) = flag_value(&arg, "--socket", &mut args)? {
             set_once(&mut socket, value, "--socket")?;
         } else if let Some(value) = flag_value(&arg, "--socket-mode", &mut args)? {
@@ -154,6 +159,15 @@ fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
             return Err(help_or_unknown(&arg));
         }
     }
+    let vault_dir = vault_dir.context("serve needs --vault <local vault dir>")?;
+    let vault_dir = std::fs::canonicalize(&vault_dir)
+        .with_context(|| format!("--vault {}", vault_dir.display()))?;
+    if !vault_dir.is_dir() {
+        bail!("--vault is not a directory: {}", vault_dir.display());
+    }
+    if vault_dir.to_str().is_none() {
+        bail!("--vault is not valid UTF-8: {}", vault_dir.display());
+    }
     if allowed_uids.is_empty() {
         // SAFETY: getuid has no preconditions and cannot fail.
         allowed_uids.push(unsafe { libc::getuid() });
@@ -172,6 +186,7 @@ fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
         socket: socket_or_default(socket)?,
         socket_mode: socket_mode.unwrap_or(0o600),
         config: DaemonConfig {
+            vault_dir,
             policy,
             idle_lock,
             allowed_uids,
@@ -182,7 +197,6 @@ fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
 enum Command {
     Unlock {
         socket: PathBuf,
-        vault_dir: PathBuf,
         expect_uid: Option<u32>,
     },
     Lock(PathBuf),
@@ -191,14 +205,11 @@ enum Command {
 
 fn parse_unlock(args: impl IntoIterator<Item = String>) -> Result<Command> {
     let mut socket = None;
-    let mut vault_dir = None;
     let mut expect_uid = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if let Some(value) = flag_value(&arg, "--socket", &mut args)? {
             set_once(&mut socket, value, "--socket")?;
-        } else if let Some(value) = flag_value(&arg, "--path", &mut args)? {
-            set_once(&mut vault_dir, PathBuf::from(value), "--path")?;
         } else if let Some(value) = flag_value(&arg, "--expect-uid", &mut args)? {
             let uid = value.parse().context("--expect-uid needs a numeric uid")?;
             set_once(&mut expect_uid, uid, "--expect-uid")?;
@@ -208,7 +219,6 @@ fn parse_unlock(args: impl IntoIterator<Item = String>) -> Result<Command> {
     }
     Ok(Command::Unlock {
         socket: socket_or_default(socket)?,
-        vault_dir: vault_dir.context("unlock needs --path <local vault dir>")?,
         expect_uid,
     })
 }
@@ -247,6 +257,7 @@ fn run_serve(options: ServeOptions) -> Result<()> {
         info!(
             socket = %options.socket.display(),
             mode = format_args!("{:o}", options.socket_mode),
+            vault = %config.vault_dir.display(),
             allow_writes = config.policy.allow_writes(),
             file_io_dir = ?config.policy.file_io_dir(),
             root = config.policy.root().as_str(),
@@ -272,11 +283,7 @@ fn run_client(command: Command) -> Result<()> {
         .build()?;
     runtime.block_on(async {
         match command {
-            Command::Unlock {
-                socket,
-                vault_dir,
-                expect_uid,
-            } => unlock(&socket, vault_dir, expect_uid).await,
+            Command::Unlock { socket, expect_uid } => unlock(&socket, expect_uid).await,
             Command::Lock(socket) => {
                 connect(&socket).await?.request(&Request::Lock).await?;
                 println!("locked");
@@ -312,6 +319,7 @@ async fn describe(socket: &std::path::Path, client: &mut AgentClient) -> Result<
     println!("agent at {}", socket.display());
     println!("  pid:       {pid}");
     println!("  uid:       {}", peer.uid());
+    println!("  vault:     {}", status.vault_dir.display());
     println!(
         "  writes:    {}",
         if status.allow_writes { "on" } else { "off" }
@@ -342,25 +350,11 @@ async fn describe(socket: &std::path::Path, client: &mut AgentClient) -> Result<
     Ok(status)
 }
 
-async fn unlock(
-    socket: &std::path::Path,
-    vault_dir: PathBuf,
-    expect_uid: Option<u32>,
-) -> Result<()> {
+async fn unlock(socket: &std::path::Path, expect_uid: Option<u32>) -> Result<()> {
     // Best effort: this process holds the password only briefly.
     if let Err(err) = hardening::disable_dumping() {
         warn!(%err, "process is dumpable");
     }
-    // Same resolution as the FFI layer, so the provider config (and the
-    // freshness anchor derived from it) matches the one used at creation.
-    // Not checked here: a daemon running as another user may be the only
-    // one that can see the directory.
-    let vault_dir = if vault_dir.is_absolute() {
-        vault_dir
-    } else {
-        std::env::current_dir()?.join(vault_dir)
-    };
-
     let mut client = connect(socket).await?;
     let status = describe(socket, &mut client).await?;
     if let Some(expected) = expect_uid {
@@ -381,11 +375,7 @@ async fn unlock(
                  run `axiom-agent unlock` in an interactive terminal"
             )
         })?;
-    let request = Request::Unlock(UnlockParams {
-        provider_type: "local".to_string(),
-        provider_config: serde_json::json!({ "root": vault_dir }),
-        password,
-    });
+    let request = Request::Unlock(UnlockParams { password });
     let result = client.request(&request).await;
     drop(request);
     match result? {
