@@ -4,7 +4,10 @@ use std::{
     fs::{DirBuilder, Permissions},
     os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -54,6 +57,10 @@ struct Agent {
     /// Inputs of the automatic lock. The lock task holds this while it
     /// locks, so no request can start in between.
     timers: Mutex<Timers>,
+    /// Requests being handled. Idle lock waits for them to finish. Raised
+    /// under `timers`, lowered by [`InFlight`]'s `Drop`, so a request that
+    /// panics still releases idle lock.
+    in_flight: AtomicUsize,
     /// Wakes the lock task after the timers change.
     timers_changed: Notify,
     /// Consecutive failed unlocks. Held across each attempt and its backoff,
@@ -63,16 +70,28 @@ struct Agent {
 
 struct Timers {
     last_activity: Instant,
-    /// Requests being handled. Idle lock waits for them to finish.
-    in_flight: usize,
     /// Set by a successful unlock, cleared by any lock.
     unlocked_at: Option<Instant>,
+}
+
+/// Counts one request as in flight for as long as it lives.
+struct InFlight<'a>(&'a Agent);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.timers_changed.notify_one();
+    }
 }
 
 impl Timers {
     /// The next automatic lock and its reason. A deadline that does not fit
     /// in an `Instant` never comes.
-    fn next_lock(&self, config: &DaemonConfig) -> Option<(Instant, &'static str)> {
+    fn next_lock(
+        &self,
+        config: &DaemonConfig,
+        in_flight: usize,
+    ) -> Option<(Instant, &'static str)> {
         let unlocked_at = self.unlocked_at?;
         let max_unlock = config
             .max_unlock
@@ -80,7 +99,7 @@ impl Timers {
             .map(|deadline| (deadline, "max_unlock"));
         let idle_lock = config
             .idle_lock
-            .filter(|_| self.in_flight == 0)
+            .filter(|_| in_flight == 0)
             .and_then(|idle| self.last_activity.checked_add(idle))
             .map(|deadline| (deadline, "idle_lock"));
         [max_unlock, idle_lock]
@@ -140,9 +159,9 @@ pub async fn serve(listener: UnixListener, config: DaemonConfig) {
         config,
         timers: Mutex::new(Timers {
             last_activity: Instant::now(),
-            in_flight: 0,
             unlocked_at: None,
         }),
+        in_flight: AtomicUsize::new(0),
         timers_changed: Notify::new(),
         unlock_failures: Mutex::new(0),
     });
@@ -167,7 +186,11 @@ pub async fn serve(listener: UnixListener, config: DaemonConfig) {
 async fn lock_timer_task(agent: Arc<Agent>) {
     loop {
         let changed = agent.timers_changed.notified();
-        let next = agent.timers.lock().await.next_lock(&agent.config);
+        let next = agent
+            .timers
+            .lock()
+            .await
+            .next_lock(&agent.config, agent.in_flight.load(Ordering::SeqCst));
         match next {
             Some((deadline, _)) => tokio::select! {
                 () = tokio::time::sleep_until(deadline.into()) => {}
@@ -180,7 +203,8 @@ async fn lock_timer_task(agent: Arc<Agent>) {
         }
         // Re-check under the lock: a request may have started or ended since.
         let mut timers = agent.timers.lock().await;
-        let Some((deadline, reason)) = timers.next_lock(&agent.config) else {
+        let in_flight = agent.in_flight.load(Ordering::SeqCst);
+        let Some((deadline, reason)) = timers.next_lock(&agent.config, in_flight) else {
             continue;
         };
         if deadline > Instant::now() {
@@ -304,15 +328,16 @@ impl Agent {
     async fn handle(&self, request: Request, uid: u32, pid: Option<i32>) -> Response {
         let op = request.op();
         let vault_path = request.vault_path().map(str::to_owned);
-        {
+        let in_flight = {
             let mut timers = self.timers.lock().await;
-            timers.in_flight += 1;
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
             timers.last_activity = Instant::now();
-        }
+            InFlight(self)
+        };
         let result = self.dispatch(request).await;
         {
             let mut timers = self.timers.lock().await;
-            timers.in_flight -= 1;
+            drop(in_flight);
             timers.last_activity = Instant::now();
             match (op, &result) {
                 ("unlock", Ok(_)) => timers.unlocked_at = Some(Instant::now()),
@@ -539,35 +564,54 @@ mod tests {
         let now = Instant::now();
         let mut timers = Timers {
             last_activity: now,
-            in_flight: 0,
             unlocked_at: Some(now),
         };
         let both = config(Some(Duration::from_secs(5)), Some(Duration::from_secs(60)));
         assert_eq!(
-            timers.next_lock(&both),
+            timers.next_lock(&both, 0),
             Some((now + Duration::from_secs(5), "idle_lock"))
         );
-        timers.in_flight = 1;
         assert_eq!(
-            timers.next_lock(&both),
+            timers.next_lock(&both, 1),
             Some((now + Duration::from_secs(60), "max_unlock"))
         );
         assert_eq!(
-            timers.next_lock(&config(Some(Duration::from_secs(5)), None)),
+            timers.next_lock(&config(Some(Duration::from_secs(5)), None), 1),
             None
         );
         timers.unlocked_at = None;
-        assert_eq!(timers.next_lock(&both), None);
+        assert_eq!(timers.next_lock(&both, 0), None);
+    }
+
+    #[test]
+    fn a_panicking_request_still_leaves_flight() {
+        let agent = Agent {
+            app: AppService::new(),
+            config: config(Some(Duration::from_secs(5)), None),
+            timers: Mutex::new(Timers {
+                last_activity: Instant::now(),
+                unlocked_at: None,
+            }),
+            in_flight: AtomicUsize::new(0),
+            timers_changed: Notify::new(),
+            unlock_failures: Mutex::new(0),
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            agent.in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlight(&agent);
+            panic!("handler panicked");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(agent.in_flight.load(Ordering::SeqCst), 0);
     }
 
     #[test]
     fn lock_deadlines_that_overflow_never_come() {
         let timers = Timers {
             last_activity: Instant::now(),
-            in_flight: 0,
             unlocked_at: Some(Instant::now()),
         };
         let huge = Some(Duration::MAX);
-        assert_eq!(timers.next_lock(&config(huge, huge)), None);
+        assert_eq!(timers.next_lock(&config(huge, huge), 0), None);
     }
 }
