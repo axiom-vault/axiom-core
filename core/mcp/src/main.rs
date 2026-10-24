@@ -1,45 +1,44 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use axiomvault_mcp::{AxiomMcpServer, ServerPolicy};
+use axiomvault_agent::default_socket_path;
+use axiomvault_mcp::AxiomMcpServer;
 use rmcp::{transport::stdio, ServiceExt};
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: axiom-mcp [--allow-writes] [--allow-file-io=<dir>]
+const USAGE: &str = "usage: axiom-mcp [--socket <path>]
 
-  --allow-writes         enable mutating tools (create, write, update, delete,
-                         mkdir, import, recover). Off by default.
-  --allow-file-io=<dir>  enable import_file/export_file, confined to <dir>.
-                         Off by default.";
+  --socket <path>  axiom-agent socket to use
+                   (default $XDG_RUNTIME_DIR/axiom-agent.sock)
+
+What the tools may do (writes, file I/O, the visible vault subtree) is set
+by the flags `axiom-agent serve` was launched with, not here.";
 
 /// Hand-parsed launch flags. Unknown arguments are an error, so a typo never
-/// silently starts a server with different capabilities than intended.
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ServerPolicy> {
-    let mut allow_writes = false;
-    let mut file_io_dir: Option<PathBuf> = None;
+/// silently starts a server with different settings than intended.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<PathBuf> {
+    let mut socket: Option<PathBuf> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        let dir = match arg.as_str() {
-            "--allow-writes" => {
-                allow_writes = true;
-                continue;
-            }
+        let path = match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
-            "--allow-file-io" => args.next().context("--allow-file-io needs a directory")?,
-            other => match other.strip_prefix("--allow-file-io=") {
-                Some(dir) => dir.to_string(),
+            "--socket" => args.next().context("--socket needs a path")?,
+            other => match other.strip_prefix("--socket=") {
+                Some(path) => path.to_string(),
                 None => bail!("unknown argument: {other}\n{USAGE}"),
             },
         };
-        if dir.is_empty() || file_io_dir.replace(PathBuf::from(dir)).is_some() {
-            bail!("--allow-file-io needs exactly one non-empty directory");
+        if path.is_empty() || socket.replace(PathBuf::from(path)).is_some() {
+            bail!("--socket needs exactly one non-empty path");
         }
     }
-    ServerPolicy::new(allow_writes, file_io_dir.as_deref())
-        .context("invalid --allow-file-io directory")
+    match socket {
+        Some(socket) => Ok(socket),
+        None => default_socket_path().context("no agent socket"),
+    }
 }
 
 #[tokio::main]
@@ -50,8 +49,8 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    let policy = parse_args(std::env::args().skip(1))?;
-    let service = AxiomMcpServer::with_policy(policy).serve(stdio()).await?;
+    let socket = parse_args(std::env::args().skip(1))?;
+    let service = AxiomMcpServer::new(socket).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

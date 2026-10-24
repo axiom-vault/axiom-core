@@ -11,6 +11,7 @@ members = [
     "core/fuse",
     "core/webdav",
     "core/mcp",
+    "core/agent",
 ]
 
 [workspace.package]
