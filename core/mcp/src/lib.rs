@@ -1,14 +1,14 @@
-use std::{
-    future::Future,
-    io::ErrorKind,
-    path::{Component, Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-};
+//! MCP front end for an `axiom-agent` daemon.
+//!
+//! This server holds no key and no secret, and has no tool that accepts or
+//! returns one: the agent keeps the unlocked vault, enforces the launch
+//! policy, and is unlocked only by the user at their own terminal.
 
-use axiomvault_app::{
-    AppError, AppService, CreateVaultParams, DirectoryEntryDto, FileMetadataDto, OpenVaultParams,
-    RecoverVaultParams, VaultCreatedDto, VaultInfoDto,
+use std::{future::Future, path::PathBuf, pin::Pin};
+
+use axiomvault_agent::{
+    protocol::{Base64Content, Metadata},
+    AgentClient, AgentStatus, ClientError, ErrorKind, Payload, Request, LOCKED_MESSAGE,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rmcp::{
@@ -24,7 +24,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zeroize::Zeroizing;
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_RESOURCE_BYTES: usize = 16 * 1024;
@@ -32,41 +31,9 @@ const SERVER_STATUS_URI: &str = "axiom://server/status";
 const VAULT_STATUS_URI: &str = "axiom://vault/status";
 const VAULT_TREE_URI: &str = "axiom://vault/tree";
 
-/// Launch-time capabilities. Everything is off by default; a tool call
-/// cannot turn any of it on.
-#[derive(Clone, Debug, Default)]
-pub struct ServerPolicy {
-    allow_writes: bool,
-    file_io_root: Option<PathBuf>,
-}
-
-impl ServerPolicy {
-    /// `file_io_dir` is canonicalised here, so the jail root is fixed at launch.
-    pub fn new(allow_writes: bool, file_io_dir: Option<&Path>) -> std::io::Result<Self> {
-        let file_io_root = match file_io_dir {
-            Some(dir) => {
-                let root = std::fs::canonicalize(dir)?;
-                if !root.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("--allow-file-io is not a directory: {}", root.display()),
-                    ));
-                }
-                Some(root)
-            }
-            None => None,
-        };
-        Ok(Self {
-            allow_writes,
-            file_io_root,
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct AxiomMcpServer {
-    app: Arc<AppService>,
-    policy: ServerPolicy,
+    socket: PathBuf,
     #[expect(
         dead_code,
         reason = "stored router used by rmcp macro-generated handlers"
@@ -80,91 +47,109 @@ pub struct AxiomMcpServer {
 }
 
 impl AxiomMcpServer {
-    /// A read-only server: no mutating tools, no local file I/O.
-    pub fn new() -> Self {
-        Self::with_policy(ServerPolicy::default())
-    }
-
-    pub fn with_policy(policy: ServerPolicy) -> Self {
+    /// A client of the agent listening on `socket`. What is allowed (writes,
+    /// file I/O, the visible subtree) is the agent's launch policy.
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
-            app: Arc::new(AppService::new()),
-            policy,
+            socket: socket.into(),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
         }
     }
 
-    fn write_guard(&self) -> Result<(), McpError> {
-        if self.policy.allow_writes {
-            Ok(())
-        } else {
-            Err(McpError::invalid_request(
-                "mutating tools are disabled; the server must be launched with --allow-writes",
-                None,
-            ))
-        }
-    }
-
-    fn file_io_root(&self) -> Result<&Path, McpError> {
-        self.policy.file_io_root.as_deref().ok_or_else(|| {
-            McpError::invalid_request(
-                "local file I/O is disabled; the server must be launched with --allow-file-io=<dir>",
+    async fn connect(&self) -> Result<AgentClient, McpError> {
+        AgentClient::connect(&self.socket).await.map_err(|err| {
+            McpError::internal_error(
+                format!(
+                    "cannot reach axiom-agent at {} ({err}); ask the user to start `axiom-agent serve`",
+                    self.socket.display()
+                ),
                 None,
             )
         })
     }
 
-    fn map_app_error(err: AppError) -> McpError {
-        match err {
-            AppError::InvalidInput(message) => McpError::invalid_params(message, None),
-            AppError::NoOpenVault => McpError::invalid_request("no vault is open", None),
-            AppError::PathNotFound(message) | AppError::VaultNotFound(message) => {
-                McpError::resource_not_found("not_found", Some(json!({ "message": message })))
-            }
-            other => McpError::internal_error(other.to_string(), None),
-        }
+    async fn agent(&self, request: Request) -> Result<Payload, McpError> {
+        self.connect()
+            .await?
+            .request(&request)
+            .await
+            .map_err(map_client_error)
     }
 
-    fn truncate_bytes(bytes: &[u8], requested: Option<usize>, ceiling: usize) -> ReadBuffer {
-        let limit = requested.unwrap_or(ceiling).min(ceiling).max(1);
-        let returned = bytes.len().min(limit);
-        let slice = &bytes[..returned];
-        let truncated = bytes.len() > returned;
+    /// Bytes to read: the requested amount, capped at `ceiling`, at least 1.
+    fn read_limit(requested: Option<usize>, ceiling: usize) -> usize {
+        requested.unwrap_or(ceiling).min(ceiling).max(1)
+    }
+
+    /// Describes `slice`, the first bytes of something `size` bytes long.
+    fn read_buffer(slice: &[u8], size: usize) -> ReadBuffer {
+        let returned = slice.len();
+        let truncated = size > returned;
 
         match String::from_utf8(slice.to_vec()) {
             Ok(text) => ReadBuffer {
                 encoding: "utf-8".to_string(),
                 content: text,
-                size: bytes.len(),
+                size,
                 returned_bytes: returned,
                 truncated,
             },
             Err(_) => ReadBuffer {
                 encoding: "base64".to_string(),
                 content: BASE64.encode(slice),
-                size: bytes.len(),
+                size,
                 returned_bytes: returned,
                 truncated,
             },
         }
     }
 
-    async fn vault_tree(&self) -> Result<VaultTreeNode, AppError> {
-        self.walk_tree("/").await
+    fn truncate_bytes(bytes: &[u8], requested: Option<usize>, ceiling: usize) -> ReadBuffer {
+        let returned = bytes.len().min(Self::read_limit(requested, ceiling));
+        Self::read_buffer(&bytes[..returned], bytes.len())
     }
 
-    fn walk_tree<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<VaultTreeNode, AppError>> + Send + 'a>> {
+    /// The tree below the agent's `--root`, over one connection.
+    async fn vault_tree(&self) -> Result<VaultTreeNode, McpError> {
+        let mut client = self.connect().await?;
+        let root = match client
+            .request(&Request::Status)
+            .await
+            .map_err(map_client_error)?
+        {
+            Payload::Status(status) => status.root,
+            other => return Err(unexpected(other)),
+        };
+        Self::walk_tree(&mut client, root).await
+    }
+
+    fn walk_tree(
+        client: &mut AgentClient,
+        path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<VaultTreeNode, McpError>> + Send + '_>> {
         Box::pin(async move {
-            let metadata = self.app.metadata(path).await?;
+            let metadata = match client
+                .request(&Request::Metadata { path: path.clone() })
+                .await
+                .map_err(map_client_error)?
+            {
+                Payload::Metadata(metadata) => metadata,
+                other => return Err(unexpected(other)),
+            };
             let mut node = VaultTreeNode::from_metadata(metadata);
             if node.is_directory {
-                let entries = self.app.list_directory(path).await?;
+                let entries = match client
+                    .request(&Request::ListDirectory { path })
+                    .await
+                    .map_err(map_client_error)?
+                {
+                    Payload::Entries { entries } => entries,
+                    other => return Err(unexpected(other)),
+                };
                 let mut children = Vec::with_capacity(entries.len());
                 for entry in entries {
-                    children.push(Box::new(self.walk_tree(&entry.path).await?));
+                    children.push(Box::new(Self::walk_tree(client, entry.path).await?));
                 }
                 node.children = Some(children);
             }
@@ -192,36 +177,33 @@ impl AxiomMcpServer {
     }
 }
 
-impl Default for AxiomMcpServer {
-    fn default() -> Self {
-        Self::new()
+fn map_client_error(err: ClientError) -> McpError {
+    match err {
+        ClientError::Io(err) => {
+            McpError::internal_error(format!("axiom-agent connection failed: {err}"), None)
+        }
+        ClientError::Agent(err) => match err.kind {
+            ErrorKind::Locked => McpError::invalid_request(LOCKED_MESSAGE, None),
+            ErrorKind::NotFound => {
+                McpError::resource_not_found("not_found", Some(json!({ "message": err.message })))
+            }
+            ErrorKind::InvalidParams | ErrorKind::AlreadyExists => {
+                McpError::invalid_params(err.message, None)
+            }
+            ErrorKind::Denied
+            | ErrorKind::AlreadyUnlocked
+            | ErrorKind::AuthFailed
+            | ErrorKind::InvalidRequest => McpError::invalid_request(err.message, None),
+            ErrorKind::Internal => McpError::internal_error(err.message, None),
+        },
     }
 }
 
-#[derive(Clone, Deserialize, JsonSchema)]
-pub struct CreateVaultArgs {
-    pub vault_id: String,
-    pub password: String,
-    pub provider_type: String,
-    #[serde(default)]
-    pub provider_config: serde_json::Value,
-}
-
-#[derive(Clone, Deserialize, JsonSchema)]
-pub struct OpenVaultArgs {
-    pub password: String,
-    pub provider_type: String,
-    #[serde(default)]
-    pub provider_config: serde_json::Value,
-}
-
-#[derive(Clone, Deserialize, JsonSchema)]
-pub struct RecoverVaultArgs {
-    pub recovery_words: String,
-    pub new_password: String,
-    pub provider_type: String,
-    #[serde(default)]
-    pub provider_config: serde_json::Value,
+fn unexpected(payload: Payload) -> McpError {
+    McpError::internal_error(
+        format!("unexpected axiom-agent response: {payload:?}"),
+        None,
+    )
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -274,10 +256,8 @@ pub struct ReadBuffer {
 pub struct StatusResponse {
     pub server: &'static str,
     pub max_read_bytes: usize,
-    pub write_protection_default: bool,
-    pub writes_enabled: bool,
-    pub file_io_enabled: bool,
-    pub vault_open: bool,
+    /// The agent's launch policy and lock state, or why it is unavailable.
+    pub agent: Result<AgentStatus, String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -291,7 +271,7 @@ pub struct VaultTreeNode {
 }
 
 impl VaultTreeNode {
-    fn from_metadata(metadata: FileMetadataDto) -> Self {
+    fn from_metadata(metadata: Metadata) -> Self {
         Self {
             name: metadata.name,
             path: metadata.path,
@@ -304,66 +284,6 @@ impl VaultTreeNode {
 
 fn default_encoding() -> String {
     "utf-8".to_string()
-}
-
-#[derive(Clone)]
-struct CreateVaultSecretDto {
-    vault_id: String,
-    password: Zeroizing<String>,
-    provider_type: String,
-    provider_config: serde_json::Value,
-}
-
-impl From<CreateVaultArgs> for CreateVaultSecretDto {
-    fn from(value: CreateVaultArgs) -> Self {
-        Self {
-            vault_id: value.vault_id,
-            password: Zeroizing::new(value.password),
-            provider_type: value.provider_type,
-            provider_config: value.provider_config,
-        }
-    }
-}
-
-impl std::fmt::Debug for CreateVaultSecretDto {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CreateVaultSecretDto")
-            .field("vault_id", &self.vault_id)
-            .field("password", &"[REDACTED]")
-            .field("provider_type", &self.provider_type)
-            .field("provider_config", &"[REDACTED]")
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-struct RecoverVaultSecretDto {
-    recovery_words: Zeroizing<String>,
-    new_password: Zeroizing<String>,
-    provider_type: String,
-    provider_config: serde_json::Value,
-}
-
-impl From<RecoverVaultArgs> for RecoverVaultSecretDto {
-    fn from(value: RecoverVaultArgs) -> Self {
-        Self {
-            recovery_words: Zeroizing::new(value.recovery_words),
-            new_password: Zeroizing::new(value.new_password),
-            provider_type: value.provider_type,
-            provider_config: value.provider_config,
-        }
-    }
-}
-
-impl std::fmt::Debug for RecoverVaultSecretDto {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecoverVaultSecretDto")
-            .field("recovery_words", &"[REDACTED]")
-            .field("new_password", &"[REDACTED]")
-            .field("provider_type", &self.provider_type)
-            .field("provider_config", &"[REDACTED]")
-            .finish()
-    }
 }
 
 fn decode_content(args: &WriteFileArgs) -> Result<Vec<u8>, McpError> {
@@ -385,155 +305,20 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
 
-fn jail_error(message: impl Into<String>) -> McpError {
-    McpError::invalid_params(message.into(), None)
-}
-
-const JAIL_IMPORT_DENIED: &str = "local_path is not a regular file inside the file I/O directory";
-const JAIL_EXPORT_DENIED: &str =
-    "local_path is not in an existing directory inside the file I/O directory";
-
-/// Joins `local_path` onto the jail root without touching the filesystem.
-/// Any `..` is rejected outright, and an absolute path must already sit
-/// under the root, so nothing outside the jail is ever stat'ed. Callers
-/// still check the canonical result, which catches symlinked directories.
-fn jail_candidate(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
-    let requested = Path::new(local_path);
-    if local_path.is_empty() {
-        return Err(jail_error("local_path is empty"));
-    }
-    if requested
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(jail_error("local_path must not contain '..'"));
-    }
-    if requested.is_absolute() && !requested.starts_with(root) {
-        return Err(jail_error("local_path is outside the file I/O directory"));
-    }
-    Ok(root.join(requested))
-}
-
-/// Resolves an import source: an existing regular file, not a symlink, whose
-/// canonical path is inside the jail root.
-async fn jail_import_source(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
-    let candidate = jail_candidate(root, local_path)?;
-    let metadata = tokio::fs::symlink_metadata(&candidate)
-        .await
-        .map_err(|_| jail_error(JAIL_IMPORT_DENIED))?;
-    if metadata.file_type().is_symlink() {
-        return Err(jail_error("local_path must not be a symlink"));
-    }
-    let canonical = tokio::fs::canonicalize(&candidate)
-        .await
-        .map_err(|_| jail_error(JAIL_IMPORT_DENIED))?;
-    if !metadata.is_file() || !canonical.starts_with(root) {
-        return Err(jail_error(JAIL_IMPORT_DENIED));
-    }
-    Ok(canonical)
-}
-
-/// Resolves an export target: a name that does not exist yet, in a parent
-/// directory whose canonical path is inside the jail root. The vault layer
-/// publishes with a no-clobber rename, so a file that appears after this
-/// check is still not overwritten.
-async fn jail_export_target(root: &Path, local_path: &str) -> Result<PathBuf, McpError> {
-    let candidate = jail_candidate(root, local_path)?;
-    let name = candidate
-        .file_name()
-        .ok_or_else(|| jail_error("local_path has no file name"))?;
-    let parent = candidate
-        .parent()
-        .ok_or_else(|| jail_error("local_path has no parent directory"))?;
-    let canonical_parent = tokio::fs::canonicalize(parent)
-        .await
-        .map_err(|_| jail_error(JAIL_EXPORT_DENIED))?;
-    if !canonical_parent.starts_with(root) {
-        return Err(jail_error(JAIL_EXPORT_DENIED));
-    }
-    let target = canonical_parent.join(name);
-    match tokio::fs::symlink_metadata(&target).await {
-        Ok(_) => Err(jail_error(
-            "local_path already exists; refusing to overwrite",
-        )),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(target),
-        Err(_) => Err(jail_error("local_path cannot be inspected")),
-    }
-}
-
 #[tool_router]
 impl AxiomMcpServer {
-    #[tool(description = "Create a vault and return recovery words once")]
-    async fn create_vault(
-        &self,
-        Parameters(args): Parameters<CreateVaultArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
-        let dto = CreateVaultSecretDto::from(args);
-        let created: VaultCreatedDto = self
-            .app
-            .create_vault(CreateVaultParams {
-                vault_id: dto.vault_id,
-                password: dto.password,
-                provider_type: dto.provider_type,
-                provider_config: dto.provider_config,
-            })
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&json!({
-            "info": created.info,
-            "recovery_words": created.recovery_words.to_string(),
-            "secret_note": "show once and store securely",
-        }))
-    }
-
-    #[tool(description = "Open an existing vault")]
-    async fn open_vault(
-        &self,
-        Parameters(args): Parameters<OpenVaultArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let info = self
-            .app
-            .open_vault(OpenVaultParams {
-                password: Zeroizing::new(args.password),
-                provider_type: args.provider_type,
-                provider_config: args.provider_config,
-            })
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&info)
-    }
-
-    #[tool(description = "Recover a vault using recovery words and set a new password")]
-    async fn recover_vault(
-        &self,
-        Parameters(args): Parameters<RecoverVaultArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
-        let dto = RecoverVaultSecretDto::from(args);
-        let info = self
-            .app
-            .recover_vault(RecoverVaultParams {
-                recovery_words: dto.recovery_words,
-                new_password: dto.new_password,
-                provider_type: dto.provider_type,
-                provider_config: dto.provider_config,
-            })
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&info)
-    }
-
-    #[tool(description = "Close the active vault")]
-    async fn close_vault(&self) -> Result<CallToolResult, McpError> {
-        self.app.close_vault().await.map_err(Self::map_app_error)?;
-        ok_json(&json!({ "closed": true }))
+    #[tool(description = "Lock the vault; only the user can unlock it again")]
+    async fn lock_vault(&self) -> Result<CallToolResult, McpError> {
+        self.agent(Request::Lock).await?;
+        ok_json(&json!({ "locked": true }))
     }
 
     #[tool(description = "Get active vault info")]
     async fn vault_info(&self) -> Result<CallToolResult, McpError> {
-        let info: VaultInfoDto = self.app.vault_info().await.map_err(Self::map_app_error)?;
-        ok_json(&info)
+        match self.agent(Request::VaultInfo).await? {
+            Payload::VaultInfo(info) => ok_json(&info),
+            other => Err(unexpected(other)),
+        }
     }
 
     #[tool(description = "List a vault directory")]
@@ -541,12 +326,13 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<VaultPathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let entries: Vec<DirectoryEntryDto> = self
-            .app
-            .list_directory(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&entries)
+        match self
+            .agent(Request::ListDirectory { path: args.path })
+            .await?
+        {
+            Payload::Entries { entries } => ok_json(&entries),
+            other => Err(unexpected(other)),
+        }
     }
 
     #[tool(description = "Read a file with size limits and truncation metadata")]
@@ -554,13 +340,22 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<ReadFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let bytes = self
-            .app
-            .read_file(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
-        let buffer = Self::truncate_bytes(&bytes, args.max_bytes, MAX_READ_BYTES);
-        ok_json(&buffer)
+        let limit = Self::read_limit(args.max_bytes, MAX_READ_BYTES);
+        let (content, size) = match self
+            .agent(Request::ReadFile {
+                path: args.path,
+                max_bytes: Some(limit as u64),
+            })
+            .await?
+        {
+            Payload::File { content_b64, size } => (content_b64, size),
+            other => return Err(unexpected(other)),
+        };
+        let bytes = BASE64
+            .decode(content.0)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?;
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        ok_json(&Self::read_buffer(&bytes, size))
     }
 
     #[tool(description = "Create a new file inside the vault")]
@@ -568,12 +363,12 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
         let bytes = decode_content(&args)?;
-        self.app
-            .create_file(&args.path, &bytes)
-            .await
-            .map_err(Self::map_app_error)?;
+        self.agent(Request::CreateFile {
+            path: args.path.clone(),
+            content_b64: Base64Content(BASE64.encode(&bytes)),
+        })
+        .await?;
         ok_json(&json!({ "written": true, "path": args.path, "bytes": bytes.len() }))
     }
 
@@ -582,12 +377,12 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
         let bytes = decode_content(&args)?;
-        self.app
-            .update_file(&args.path, &bytes)
-            .await
-            .map_err(Self::map_app_error)?;
+        self.agent(Request::UpdateFile {
+            path: args.path.clone(),
+            content_b64: Base64Content(BASE64.encode(&bytes)),
+        })
+        .await?;
         ok_json(&json!({ "updated": true, "path": args.path, "bytes": bytes.len() }))
     }
 
@@ -596,23 +391,15 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<DeletePathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
-        let metadata = self
-            .app
-            .metadata(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
-        if metadata.is_directory {
-            self.app
-                .delete_directory(&args.path)
-                .await
-                .map_err(Self::map_app_error)?;
-        } else {
-            self.app
-                .delete_file(&args.path)
-                .await
-                .map_err(Self::map_app_error)?;
-        }
+        let metadata = match self
+            .agent(Request::Delete {
+                path: args.path.clone(),
+            })
+            .await?
+        {
+            Payload::Metadata(metadata) => metadata,
+            other => return Err(unexpected(other)),
+        };
         ok_json(&json!({
             "deleted": true,
             "path": args.path,
@@ -625,11 +412,10 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<DeletePathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
-        self.app
-            .create_directory(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
+        self.agent(Request::Mkdir {
+            path: args.path.clone(),
+        })
+        .await?;
         ok_json(&json!({ "created": true, "path": args.path }))
     }
 
@@ -638,12 +424,10 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<VaultPathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let metadata = self
-            .app
-            .metadata(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&metadata)
+        match self.agent(Request::Metadata { path: args.path }).await? {
+            Payload::Metadata(metadata) => ok_json(&metadata),
+            other => Err(unexpected(other)),
+        }
     }
 
     #[tool(description = "Check whether a vault path exists")]
@@ -651,12 +435,15 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<VaultPathArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let exists = self
-            .app
-            .exists(&args.path)
-            .await
-            .map_err(Self::map_app_error)?;
-        ok_json(&json!({ "path": args.path, "exists": exists }))
+        match self
+            .agent(Request::Exists {
+                path: args.path.clone(),
+            })
+            .await?
+        {
+            Payload::Exists { exists } => ok_json(&json!({ "path": args.path, "exists": exists })),
+            other => Err(unexpected(other)),
+        }
     }
 
     #[tool(description = "Import a local file into the vault")]
@@ -664,15 +451,11 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<ImportFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.write_guard()?;
-        let source = jail_import_source(self.file_io_root()?, &args.local_path).await?;
-        let source = source
-            .to_str()
-            .ok_or_else(|| jail_error("local_path is not valid UTF-8"))?;
-        self.app
-            .import_file(source, &args.vault_path)
-            .await
-            .map_err(Self::map_app_error)?;
+        self.agent(Request::ImportFile {
+            local_path: args.local_path.clone(),
+            vault_path: args.vault_path.clone(),
+        })
+        .await?;
         ok_json(&json!({
             "imported": true,
             "local_path": args.local_path,
@@ -685,14 +468,11 @@ impl AxiomMcpServer {
         &self,
         Parameters(args): Parameters<ExportFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let target = jail_export_target(self.file_io_root()?, &args.local_path).await?;
-        let target = target
-            .to_str()
-            .ok_or_else(|| jail_error("local_path is not valid UTF-8"))?;
-        self.app
-            .export_file(&args.vault_path, target)
-            .await
-            .map_err(Self::map_app_error)?;
+        self.agent(Request::ExportFile {
+            vault_path: args.vault_path.clone(),
+            local_path: args.local_path.clone(),
+        })
+        .await?;
         ok_json(&json!({
             "exported": true,
             "vault_path": args.vault_path,
@@ -710,7 +490,7 @@ impl AxiomMcpServer {
     async fn safe_readonly_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Open the vault with open_vault. 2. Inspect vault_info. 3. Use exists, metadata, list_directory, and read_file before any mutation. 4. Respect truncation flags and request smaller reads when needed.",
+            "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags and request smaller reads when needed.",
         )]
     }
 
@@ -721,18 +501,7 @@ impl AxiomMcpServer {
     async fn safe_write_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Verify target paths with exists/metadata. 2. Require explicit user approval. 3. Mutating tools work only when the operator launched the server with --allow-writes; import/export also need --allow-file-io=<dir> and stay inside that directory. 4. Re-read metadata after write/update/delete/mkdir/import/export.",
-        )]
-    }
-
-    #[prompt(
-        name = "vault_recovery_workflow",
-        description = "Checklist for safe vault recovery handling"
-    )]
-    async fn vault_recovery_workflow(&self) -> Vec<PromptMessage> {
-        vec![PromptMessage::new_text(
-            PromptMessageRole::Assistant,
-            "1. Confirm recovery intent. 2. Use recover_vault with the user's recovery words (requires a server launched with --allow-writes). 3. Never log recovery words or passwords. 4. Rotate to a fresh password and validate vault_info after recovery.",
+            "1. Verify target paths with exists/metadata. 2. Require explicit user approval. 3. Mutating tools work only when the user launched axiom-agent with --allow-writes; import/export also need --allow-file-io=<dir> and stay inside that directory; every vault path must lie under the agent's --root. 4. Re-read metadata after write/update/delete/mkdir/import/export.",
         )]
     }
 }
@@ -749,7 +518,7 @@ impl ServerHandler for AxiomMcpServer {
                 .build(),
         )
         .with_instructions(
-            "AxiomVault MCP server. Secrets are redacted in debug output. Mutating tools are disabled unless the server was launched with --allow-writes. import_file/export_file are disabled unless launched with --allow-file-io=<dir> and are confined to that directory. Read responses may be truncated.",
+            "AxiomVault MCP server. It is a client of axiom-agent, which holds the vault keys; this server handles no secrets and cannot unlock the vault. If a tool reports that the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal. Mutating tools need an agent launched with --allow-writes; import_file/export_file need --allow-file-io=<dir> and are confined to that directory; vault paths must lie under the agent's --root. Read responses may be truncated.",
         )
     }
 
@@ -775,28 +544,36 @@ impl ServerHandler for AxiomMcpServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let contents = match request.uri.as_str() {
-            SERVER_STATUS_URI => Self::resource_text(
-                SERVER_STATUS_URI,
-                &StatusResponse {
-                    server: "axiomvault-mcp",
-                    max_read_bytes: MAX_READ_BYTES,
-                    write_protection_default: true,
-                    writes_enabled: self.policy.allow_writes,
-                    file_io_enabled: self.policy.file_io_root.is_some(),
-                    vault_open: self.app.is_vault_open().await,
-                },
-            )?,
+            SERVER_STATUS_URI => {
+                let agent = match self.agent(Request::Status).await {
+                    Ok(Payload::Status(status)) => Ok(status),
+                    Ok(other) => Err(unexpected(other).message.to_string()),
+                    Err(err) => Err(err.message.to_string()),
+                };
+                Self::resource_text(
+                    SERVER_STATUS_URI,
+                    &StatusResponse {
+                        server: "axiomvault-mcp",
+                        max_read_bytes: MAX_READ_BYTES,
+                        agent,
+                    },
+                )?
+            }
             VAULT_STATUS_URI => {
-                let payload = match self.app.vault_info().await {
-                    Ok(info) => serde_json::to_value(info)
+                let response = self.connect().await?.request(&Request::VaultInfo).await;
+                let payload = match response {
+                    Ok(Payload::VaultInfo(info)) => serde_json::to_value(info)
                         .map_err(|err| McpError::internal_error(err.to_string(), None))?,
-                    Err(AppError::NoOpenVault) => json!({ "open": false }),
-                    Err(err) => return Err(Self::map_app_error(err)),
+                    Ok(other) => return Err(unexpected(other)),
+                    Err(ClientError::Agent(err)) if err.kind == ErrorKind::Locked => {
+                        json!({ "open": false })
+                    }
+                    Err(err) => return Err(map_client_error(err)),
                 };
                 Self::resource_text(VAULT_STATUS_URI, &payload)?
             }
             VAULT_TREE_URI => {
-                let tree = self.vault_tree().await.map_err(Self::map_app_error)?;
+                let tree = self.vault_tree().await?;
                 Self::resource_text(VAULT_TREE_URI, &tree)?
             }
             _ => {
@@ -825,12 +602,7 @@ impl ServerHandler for AxiomMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn write_guard_blocks_without_launch_flag() {
-        let err = AxiomMcpServer::new().write_guard().unwrap_err();
-        assert!(err.message.contains("--allow-writes"));
-    }
+    use axiomvault_agent::AgentError;
 
     #[test]
     fn truncate_bytes_marks_truncation_and_size() {
@@ -849,6 +621,14 @@ mod tests {
     }
 
     #[test]
+    fn read_limit_is_capped_and_positive() {
+        assert_eq!(AxiomMcpServer::read_limit(None, 10), 10);
+        assert_eq!(AxiomMcpServer::read_limit(Some(50), 10), 10);
+        assert_eq!(AxiomMcpServer::read_limit(Some(0), 10), 1);
+        assert_eq!(AxiomMcpServer::read_limit(Some(3), 10), 3);
+    }
+
+    #[test]
     fn decode_content_rejects_unknown_encoding() {
         let err = decode_content(&WriteFileArgs {
             path: "/note.txt".into(),
@@ -860,27 +640,11 @@ mod tests {
     }
 
     #[test]
-    fn secret_debug_redacts_values() {
-        let create = CreateVaultSecretDto::from(CreateVaultArgs {
-            vault_id: "vault-1".into(),
-            password: "top-secret".into(),
-            provider_type: "local".into(),
-            provider_config: json!({ "token": "secret-token" }),
-        });
-        let create_debug = format!("{:?}", create);
-        assert!(!create_debug.contains("top-secret"));
-        assert!(!create_debug.contains("secret-token"));
-        assert!(create_debug.contains("[REDACTED]"));
-
-        let recover = RecoverVaultSecretDto::from(RecoverVaultArgs {
-            recovery_words: "abandon ability able".into(),
-            new_password: "another-secret".into(),
-            provider_type: "local".into(),
-            provider_config: json!({ "refresh_token": "hidden" }),
-        });
-        let recover_debug = format!("{:?}", recover);
-        assert!(!recover_debug.contains("abandon ability able"));
-        assert!(!recover_debug.contains("another-secret"));
-        assert!(!recover_debug.contains("hidden"));
+    fn locked_error_tells_the_model_to_ask_the_user() {
+        let err = map_client_error(ClientError::Agent(AgentError::new(
+            ErrorKind::Locked,
+            "anything",
+        )));
+        assert_eq!(err.message, LOCKED_MESSAGE);
     }
 }
