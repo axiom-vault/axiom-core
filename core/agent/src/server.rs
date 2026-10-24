@@ -11,16 +11,15 @@ use std::{
 use axiomvault_app::{AppError, AppService, FileMetadataDto, OpenVaultParams};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tokio::{
-    io::BufReader,
     net::{UnixListener, UnixStream},
-    sync::{watch, Mutex},
+    sync::{Mutex, Notify},
 };
 use tracing::{info, warn};
 
 use crate::{
     policy::{jail_export_target, jail_import_source, peer_allowed, ServerPolicy},
     protocol::{
-        read_line, write_line, AgentError, AgentStatus, Base64Content, DirEntry, ErrorKind,
+        write_line, AgentError, AgentStatus, Base64Content, DirEntry, ErrorKind, LineReader,
         Metadata, Payload, Request, Response, UnlockParams, VaultInfo, LOCKED_MESSAGE,
         MAX_LINE_BYTES,
     },
@@ -42,6 +41,9 @@ pub struct DaemonConfig {
     pub policy: ServerPolicy,
     /// `None` disables idle auto-lock.
     pub idle_lock: Option<Duration>,
+    /// Longest an unlock lasts, however busy the vault is (ssh-agent `-t`).
+    /// `None` disables it.
+    pub max_unlock: Option<Duration>,
     /// Peers with any other uid are disconnected before anything is read.
     pub allowed_uids: Vec<u32>,
 }
@@ -49,10 +51,43 @@ pub struct DaemonConfig {
 struct Agent {
     app: AppService,
     config: DaemonConfig,
-    activity: watch::Sender<Instant>,
+    /// Inputs of the automatic lock. The lock task holds this while it
+    /// locks, so no request can start in between.
+    timers: Mutex<Timers>,
+    /// Wakes the lock task after the timers change.
+    timers_changed: Notify,
     /// Consecutive failed unlocks. Held across each attempt and its backoff,
     /// so parallel connections cannot run guesses side by side.
     unlock_failures: Mutex<u32>,
+}
+
+struct Timers {
+    last_activity: Instant,
+    /// Requests being handled. Idle lock waits for them to finish.
+    in_flight: usize,
+    /// Set by a successful unlock, cleared by any lock.
+    unlocked_at: Option<Instant>,
+}
+
+impl Timers {
+    /// The next automatic lock and its reason. A deadline that does not fit
+    /// in an `Instant` never comes.
+    fn next_lock(&self, config: &DaemonConfig) -> Option<(Instant, &'static str)> {
+        let unlocked_at = self.unlocked_at?;
+        let max_unlock = config
+            .max_unlock
+            .and_then(|max| unlocked_at.checked_add(max))
+            .map(|deadline| (deadline, "max_unlock"));
+        let idle_lock = config
+            .idle_lock
+            .filter(|_| self.in_flight == 0)
+            .and_then(|idle| self.last_activity.checked_add(idle))
+            .map(|deadline| (deadline, "idle_lock"));
+        [max_unlock, idle_lock]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(deadline, _)| *deadline)
+    }
 }
 
 /// Creates the listening socket at `path` with permissions `mode`.
@@ -99,16 +134,20 @@ pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
 
 /// Serves connections on `listener` until the process exits.
 pub async fn serve(listener: UnixListener, config: DaemonConfig) {
-    let (activity, activity_rx) = watch::channel(Instant::now());
-    let idle_lock = config.idle_lock;
+    let timed = config.idle_lock.is_some() || config.max_unlock.is_some();
     let agent = Arc::new(Agent {
         app: AppService::new(),
         config,
-        activity,
+        timers: Mutex::new(Timers {
+            last_activity: Instant::now(),
+            in_flight: 0,
+            unlocked_at: None,
+        }),
+        timers_changed: Notify::new(),
         unlock_failures: Mutex::new(0),
     });
-    if let Some(idle) = idle_lock {
-        tokio::spawn(idle_lock_task(Arc::clone(&agent), idle, activity_rx));
+    if timed {
+        tokio::spawn(lock_timer_task(Arc::clone(&agent)));
     }
     loop {
         match listener.accept().await {
@@ -123,28 +162,41 @@ pub async fn serve(listener: UnixListener, config: DaemonConfig) {
     }
 }
 
-/// Locks the vault once no request has arrived for `idle`, then waits for
-/// the next request before arming again.
-async fn idle_lock_task(agent: Arc<Agent>, idle: Duration, mut activity: watch::Receiver<Instant>) {
+/// Locks the vault when `--idle-lock` passes with no request in flight, or
+/// when `--max-unlock` has passed since the unlock, whichever comes first.
+async fn lock_timer_task(agent: Arc<Agent>) {
     loop {
-        let last = *activity.borrow_and_update();
-        tokio::select! {
-            _ = tokio::time::sleep_until((last + idle).into()) => {
-                match agent.app.close_vault().await {
-                    Ok(()) => info!(op = "idle_lock", idle_secs = idle.as_secs(), outcome = "ok", "vault locked"),
-                    Err(AppError::NoOpenVault) => {}
-                    Err(err) => warn!(op = "idle_lock", %err, outcome = "error", "idle lock failed"),
-                }
-                if activity.changed().await.is_err() {
-                    return;
-                }
-            }
-            changed = activity.changed() => {
-                if changed.is_err() {
-                    return;
-                }
+        let changed = agent.timers_changed.notified();
+        let next = agent.timers.lock().await.next_lock(&agent.config);
+        match next {
+            Some((deadline, _)) => tokio::select! {
+                () = tokio::time::sleep_until(deadline.into()) => {}
+                () = changed => continue,
+            },
+            None => {
+                changed.await;
+                continue;
             }
         }
+        // Re-check under the lock: a request may have started or ended since.
+        let mut timers = agent.timers.lock().await;
+        let Some((deadline, reason)) = timers.next_lock(&agent.config) else {
+            continue;
+        };
+        if deadline > Instant::now() {
+            continue;
+        }
+        match agent.app.close_vault().await {
+            Ok(()) => info!(op = reason, outcome = "ok", "vault locked"),
+            Err(AppError::NoOpenVault) => {}
+            Err(err) => {
+                warn!(op = reason, %err, outcome = "error", "automatic lock failed; retrying");
+                drop(timers);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        }
+        timers.unlocked_at = None;
     }
 }
 
@@ -167,12 +219,18 @@ async fn handle_connection(agent: Arc<Agent>, stream: UnixStream) {
         return;
     }
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let mut reader = LineReader::new(reader);
     loop {
-        let response = match read_line(&mut reader).await {
+        let mut last = false;
+        let response = match reader.read_line().await {
             Ok(None) => return,
             Ok(Some(line)) => match serde_json::from_slice::<Request>(&line) {
-                Ok(request) => agent.handle(request, uid, pid).await,
+                Ok(request) => {
+                    // An unlock ends its connection, so no buffer that held
+                    // the password outlives the request.
+                    last = matches!(request, Request::Unlock(_));
+                    agent.handle(request, uid, pid).await
+                }
                 // serde's message can quote the offending value, which may be
                 // a secret, so only the position is reported.
                 Err(err) => {
@@ -197,7 +255,7 @@ async fn handle_connection(agent: Arc<Agent>, stream: UnixStream) {
                 return;
             }
         };
-        if write_line(&mut writer, &response).await.is_err() {
+        if write_line(&mut writer, &response).await.is_err() || last {
             return;
         }
     }
@@ -244,11 +302,25 @@ impl Agent {
     /// Runs one request and writes its audit record. Contents, passwords
     /// and provider configuration never reach the log.
     async fn handle(&self, request: Request, uid: u32, pid: Option<i32>) -> Response {
-        self.activity.send_replace(Instant::now());
         let op = request.op();
         let vault_path = request.vault_path().map(str::to_owned);
+        {
+            let mut timers = self.timers.lock().await;
+            timers.in_flight += 1;
+            timers.last_activity = Instant::now();
+        }
         let result = self.dispatch(request).await;
-        self.activity.send_replace(Instant::now());
+        {
+            let mut timers = self.timers.lock().await;
+            timers.in_flight -= 1;
+            timers.last_activity = Instant::now();
+            match (op, &result) {
+                ("unlock", Ok(_)) => timers.unlocked_at = Some(Instant::now()),
+                ("lock", Ok(_)) => timers.unlocked_at = None,
+                _ => {}
+            }
+        }
+        self.timers_changed.notify_one();
         match &result {
             Ok(_) => {
                 info!(op, vault_path, peer_uid = uid, peer_pid = ?pid, outcome = "ok", "request")
@@ -276,6 +348,7 @@ impl Agent {
                 file_io_dir: policy.file_io_dir().map(Path::to_path_buf),
                 root: policy.root().as_str().to_string(),
                 idle_lock_secs: self.config.idle_lock.map_or(0, |idle| idle.as_secs()),
+                max_unlock_secs: self.config.max_unlock.map_or(0, |max| max.as_secs()),
             })),
             Request::VaultInfo => {
                 let info = app.vault_info().await.map_err(app_error)?;
@@ -367,30 +440,28 @@ impl Agent {
                 vault_path,
             } => {
                 policy.write_guard()?;
-                let jail = policy.file_io_root()?;
+                let jail = policy.file_io_jail()?;
                 let vault_path = policy.root().scope(&vault_path)?;
+                // Held until the import returns: on Linux the path names
+                // its descriptor.
                 let source = jail_import_source(jail, &local_path).await?;
-                let source = source.to_str().ok_or_else(|| {
-                    AgentError::new(ErrorKind::InvalidParams, "local_path is not valid UTF-8")
-                })?;
-                app.import_file(source, &vault_path)
+                app.import_file(source.as_str()?, &vault_path)
                     .await
                     .map_err(app_error)?;
+                drop(source);
                 Ok(Payload::Done)
             }
             Request::ExportFile {
                 vault_path,
                 local_path,
             } => {
-                let jail = policy.file_io_root()?;
+                let jail = policy.file_io_jail()?;
                 let vault_path = policy.root().scope(&vault_path)?;
                 let target = jail_export_target(jail, &local_path).await?;
-                let target = target.to_str().ok_or_else(|| {
-                    AgentError::new(ErrorKind::InvalidParams, "local_path is not valid UTF-8")
-                })?;
-                app.export_file(&vault_path, target)
+                app.export_file(&vault_path, target.as_str()?)
                     .await
                     .map_err(app_error)?;
+                drop(target);
                 Ok(Payload::Done)
             }
         }
@@ -451,5 +522,52 @@ mod tests {
         let err = app_error(AppError::NoOpenVault);
         assert_eq!(err.kind, ErrorKind::Locked);
         assert!(err.message.contains("axiom-agent unlock"));
+    }
+
+    fn config(idle: Option<Duration>, max: Option<Duration>) -> DaemonConfig {
+        DaemonConfig {
+            vault_dir: PathBuf::from("/vault"),
+            policy: ServerPolicy::default(),
+            idle_lock: idle,
+            max_unlock: max,
+            allowed_uids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn idle_lock_waits_for_requests_in_flight_but_max_unlock_does_not() {
+        let now = Instant::now();
+        let mut timers = Timers {
+            last_activity: now,
+            in_flight: 0,
+            unlocked_at: Some(now),
+        };
+        let both = config(Some(Duration::from_secs(5)), Some(Duration::from_secs(60)));
+        assert_eq!(
+            timers.next_lock(&both),
+            Some((now + Duration::from_secs(5), "idle_lock"))
+        );
+        timers.in_flight = 1;
+        assert_eq!(
+            timers.next_lock(&both),
+            Some((now + Duration::from_secs(60), "max_unlock"))
+        );
+        assert_eq!(
+            timers.next_lock(&config(Some(Duration::from_secs(5)), None)),
+            None
+        );
+        timers.unlocked_at = None;
+        assert_eq!(timers.next_lock(&both), None);
+    }
+
+    #[test]
+    fn lock_deadlines_that_overflow_never_come() {
+        let timers = Timers {
+            last_activity: Instant::now(),
+            in_flight: 0,
+            unlocked_at: Some(Instant::now()),
+        };
+        let huge = Some(Duration::MAX);
+        assert_eq!(timers.next_lock(&config(huge, huge)), None);
     }
 }

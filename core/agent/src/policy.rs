@@ -4,9 +4,14 @@
 //! talk to the socket directly, so every check lives here rather than in a
 //! client such as the MCP server.
 
+use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::{
-    io::ErrorKind as IoErrorKind,
-    path::{Component, Path, PathBuf},
+    ffi::CString,
+    fs::File,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    sync::Arc,
 };
 
 use crate::protocol::{AgentError, ErrorKind};
@@ -16,7 +21,7 @@ use crate::protocol::{AgentError, ErrorKind};
 #[derive(Clone, Debug)]
 pub struct ServerPolicy {
     allow_writes: bool,
-    file_io_root: Option<PathBuf>,
+    file_io: Option<FileIoJail>,
     root: VaultRoot,
 }
 
@@ -24,35 +29,23 @@ impl Default for ServerPolicy {
     fn default() -> Self {
         Self {
             allow_writes: false,
-            file_io_root: None,
+            file_io: None,
             root: VaultRoot::whole_vault(),
         }
     }
 }
 
 impl ServerPolicy {
-    /// `file_io_dir` is canonicalised here, so the jail root is fixed at launch.
+    /// `file_io_dir` is canonicalised (and on Linux opened) here, so the jail
+    /// root is fixed at launch.
     pub fn new(
         allow_writes: bool,
         file_io_dir: Option<&Path>,
         root: VaultRoot,
     ) -> std::io::Result<Self> {
-        let file_io_root = match file_io_dir {
-            Some(dir) => {
-                let root = std::fs::canonicalize(dir)?;
-                if !root.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("--allow-file-io is not a directory: {}", root.display()),
-                    ));
-                }
-                Some(root)
-            }
-            None => None,
-        };
         Ok(Self {
             allow_writes,
-            file_io_root,
+            file_io: file_io_dir.map(FileIoJail::open).transpose()?,
             root,
         })
     }
@@ -62,7 +55,7 @@ impl ServerPolicy {
     }
 
     pub fn file_io_dir(&self) -> Option<&Path> {
-        self.file_io_root.as_deref()
+        self.file_io.as_ref().map(|jail| jail.root.as_path())
     }
 
     pub fn root(&self) -> &VaultRoot {
@@ -80,8 +73,8 @@ impl ServerPolicy {
         }
     }
 
-    pub fn file_io_root(&self) -> Result<&Path, AgentError> {
-        self.file_io_root.as_deref().ok_or_else(|| {
+    pub fn file_io_jail(&self) -> Result<&FileIoJail, AgentError> {
+        self.file_io.as_ref().ok_or_else(|| {
             AgentError::new(
                 ErrorKind::Denied,
                 "local file I/O is disabled; axiom-agent must be launched with --allow-file-io=<dir>",
@@ -163,11 +156,13 @@ fn jail_error(message: impl Into<String>) -> AgentError {
 const JAIL_IMPORT_DENIED: &str = "local_path is not a regular file inside the file I/O directory";
 const JAIL_EXPORT_DENIED: &str =
     "local_path is not in an existing directory inside the file I/O directory";
+const JAIL_EXPORT_EXISTS: &str = "local_path already exists; refusing to overwrite";
 
 /// Joins `local_path` onto the jail root without touching the filesystem.
 /// Any `..` is rejected outright, and an absolute path must already sit
 /// under the root, so nothing outside the jail is ever stat'ed. Callers
-/// still check the canonical result, which catches symlinked directories.
+/// then resolve it without following symlinks (Linux) or check the
+/// canonical result (elsewhere).
 fn jail_candidate(root: &Path, local_path: &str) -> Result<PathBuf, AgentError> {
     let requested = Path::new(local_path);
     if local_path.is_empty() {
@@ -185,9 +180,180 @@ fn jail_candidate(root: &Path, local_path: &str) -> Result<PathBuf, AgentError> 
     Ok(root.join(requested))
 }
 
+/// The `--allow-file-io` directory. On Linux it is opened at launch and
+/// every lookup below it goes through `openat2` with
+/// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, and the vault layer is handed a
+/// `/proc/self/fd` path to the descriptor that was checked. A symlink or
+/// directory swapped in after the check therefore cannot redirect the
+/// daemon, which matters when the directory is writable by someone else.
+/// Elsewhere the checks are path-based and race a concurrent writer.
+#[derive(Clone, Debug)]
+pub struct FileIoJail {
+    root: PathBuf,
+    #[cfg(target_os = "linux")]
+    dir: Arc<OwnedFd>,
+}
+
+impl FileIoJail {
+    fn open(dir: &Path) -> std::io::Result<Self> {
+        let root = std::fs::canonicalize(dir)?;
+        if !root.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--allow-file-io is not a directory: {}", root.display()),
+            ));
+        }
+        Ok(Self {
+            #[cfg(target_os = "linux")]
+            dir: Arc::new(OwnedFd::from(File::open(&root)?)),
+            root,
+        })
+    }
+
+    /// `local_path` relative to the root, after the path-only checks.
+    #[cfg(target_os = "linux")]
+    fn relative(&self, local_path: &str, denied: &str) -> Result<PathBuf, AgentError> {
+        let candidate = jail_candidate(&self.root, local_path)?;
+        candidate
+            .strip_prefix(&self.root)
+            .map(Path::to_path_buf)
+            .map_err(|_| jail_error(denied))
+    }
+}
+
+/// A local path for the vault layer that resolves to what the jail
+/// approved. On Linux it names a descriptor held here (`/proc/self/fd/<n>`),
+/// so it is valid, and pinned, only while this value lives.
+pub struct JailedPath {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _fd: OwnedFd,
+}
+
+impl JailedPath {
+    pub fn as_str(&self) -> Result<&str, AgentError> {
+        self.path
+            .to_str()
+            .ok_or_else(|| jail_error("local_path is not valid UTF-8"))
+    }
+}
+
+/// `openat2(dir, rel, flags, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS)`: `rel` may not leave `dir` or pass through any
+/// symlink, including its last component.
+#[cfg(target_os = "linux")]
+fn open_beneath(dir: impl AsFd, rel: &Path, flags: libc::c_int) -> std::io::Result<OwnedFd> {
+    let rel = CString::new(rel.as_os_str().as_bytes())?;
+    // SAFETY: open_how is plain data; all-zero is its documented default.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: the pointers are valid for the call and the size matches.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dir.as_fd().as_raw_fd(),
+            rel.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat2 returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_beneath_error(err: std::io::Error, denied: &str) -> AgentError {
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) => AgentError::new(
+            ErrorKind::Denied,
+            "local file I/O needs openat2 (Linux 5.6 or later); \
+             refusing the path-based fallback, which a symlink swap could redirect",
+        ),
+        Some(libc::ELOOP) => jail_error("local_path must not be or pass through a symlink"),
+        _ => jail_error(denied),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_fd_path(fd: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// Resolves an import source: a regular file with a single link, reached
+/// without any symlink, inside the jail root.
+#[cfg(target_os = "linux")]
+pub async fn jail_import_source(
+    jail: &FileIoJail,
+    local_path: &str,
+) -> Result<JailedPath, AgentError> {
+    let rel = jail.relative(local_path, JAIL_IMPORT_DENIED)?;
+    // O_NONBLOCK so that a FIFO planted in the jail cannot hang the open.
+    let fd = open_beneath(&*jail.dir, &rel, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(|err| open_beneath_error(err, JAIL_IMPORT_DENIED))?;
+    let file = File::from(fd);
+    let metadata = file
+        .metadata()
+        .map_err(|_| jail_error(JAIL_IMPORT_DENIED))?;
+    if !metadata.is_file() {
+        return Err(jail_error(JAIL_IMPORT_DENIED));
+    }
+    // A second link could be a hard link to a file outside the jail.
+    if metadata.nlink() > 1 {
+        return Err(jail_error(
+            "local_path has more than one hard link; refusing to import it",
+        ));
+    }
+    let fd = OwnedFd::from(file);
+    Ok(JailedPath {
+        path: proc_fd_path(&fd),
+        _fd: fd,
+    })
+}
+
+/// Resolves an export target: a name that does not exist yet, in a
+/// directory reached without any symlink inside the jail root. The vault
+/// layer publishes with a no-clobber rename, so a file that appears after
+/// this check is still not overwritten.
+#[cfg(target_os = "linux")]
+pub async fn jail_export_target(
+    jail: &FileIoJail,
+    local_path: &str,
+) -> Result<JailedPath, AgentError> {
+    let rel = jail.relative(local_path, JAIL_EXPORT_DENIED)?;
+    let name = rel
+        .file_name()
+        .ok_or_else(|| jail_error("local_path has no file name"))?;
+    let parent = match rel.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let dir = open_beneath(&*jail.dir, parent, libc::O_RDONLY | libc::O_DIRECTORY)
+        .map_err(|err| open_beneath_error(err, JAIL_EXPORT_DENIED))?;
+    // With O_PATH | O_NOFOLLOW even a symlink or FIFO opens, so any entry
+    // counts as existing; ELOOP is a symlink refused by RESOLVE_NO_SYMLINKS.
+    match open_beneath(&dir, Path::new(name), libc::O_PATH) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(JailedPath {
+            path: proc_fd_path(&dir).join(name),
+            _fd: dir,
+        }),
+        Ok(_) => Err(jail_error(JAIL_EXPORT_EXISTS)),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => Err(jail_error(JAIL_EXPORT_EXISTS)),
+        Err(err) => Err(open_beneath_error(err, "local_path cannot be inspected")),
+    }
+}
+
 /// Resolves an import source: an existing regular file, not a symlink, whose
 /// canonical path is inside the jail root.
-pub async fn jail_import_source(root: &Path, local_path: &str) -> Result<PathBuf, AgentError> {
+#[cfg(not(target_os = "linux"))]
+pub async fn jail_import_source(
+    jail: &FileIoJail,
+    local_path: &str,
+) -> Result<JailedPath, AgentError> {
+    let root = jail.root.as_path();
     let candidate = jail_candidate(root, local_path)?;
     let metadata = tokio::fs::symlink_metadata(&candidate)
         .await
@@ -201,14 +367,19 @@ pub async fn jail_import_source(root: &Path, local_path: &str) -> Result<PathBuf
     if !metadata.is_file() || !canonical.starts_with(root) {
         return Err(jail_error(JAIL_IMPORT_DENIED));
     }
-    Ok(canonical)
+    Ok(JailedPath { path: canonical })
 }
 
 /// Resolves an export target: a name that does not exist yet, in a parent
 /// directory whose canonical path is inside the jail root. The vault layer
 /// publishes with a no-clobber rename, so a file that appears after this
 /// check is still not overwritten.
-pub async fn jail_export_target(root: &Path, local_path: &str) -> Result<PathBuf, AgentError> {
+#[cfg(not(target_os = "linux"))]
+pub async fn jail_export_target(
+    jail: &FileIoJail,
+    local_path: &str,
+) -> Result<JailedPath, AgentError> {
+    let root = jail.root.as_path();
     let candidate = jail_candidate(root, local_path)?;
     let name = candidate
         .file_name()
@@ -224,10 +395,8 @@ pub async fn jail_export_target(root: &Path, local_path: &str) -> Result<PathBuf
     }
     let target = canonical_parent.join(name);
     match tokio::fs::symlink_metadata(&target).await {
-        Ok(_) => Err(jail_error(
-            "local_path already exists; refusing to overwrite",
-        )),
-        Err(err) if err.kind() == IoErrorKind::NotFound => Ok(target),
+        Ok(_) => Err(jail_error(JAIL_EXPORT_EXISTS)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(JailedPath { path: target }),
         Err(_) => Err(jail_error("local_path cannot be inspected")),
     }
 }
@@ -245,7 +414,7 @@ mod tests {
         let err = ServerPolicy::default().write_guard().unwrap_err();
         assert_eq!(err.kind, ErrorKind::Denied);
         assert!(err.message.contains("--allow-writes"));
-        let err = ServerPolicy::default().file_io_root().unwrap_err();
+        let err = ServerPolicy::default().file_io_jail().unwrap_err();
         assert!(err.message.contains("--allow-file-io"));
     }
 

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 /// Longest accepted line in either direction, newline excluded.
@@ -192,6 +192,8 @@ pub struct AgentStatus {
     pub root: String,
     /// 0 when idle auto-lock is disabled.
     pub idle_lock_secs: u64,
+    /// 0 when unlocks do not expire.
+    pub max_unlock_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -277,28 +279,82 @@ impl From<Response> for Result<Payload, AgentError> {
     }
 }
 
-/// Reads one line without its newline. `Ok(None)` is a clean end of stream.
-/// The buffer is [`Zeroizing`] because an unlock line carries the password.
-pub async fn read_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
-    let mut line = Zeroizing::new(Vec::new());
-    let read = reader
-        .take(MAX_LINE_BYTES as u64 + 1)
-        .read_until(b'\n', &mut line)
-        .await?;
-    if read == 0 {
-        return Ok(None);
+/// Bytes read from the socket per call.
+const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Reads newline-delimited lines without leaving copies behind: an unlock
+/// line carries the password, so every buffer that holds socket bytes is
+/// [`Zeroizing`], grows by copying into a fresh zeroizing buffer instead of
+/// reallocating in place, and has its spare capacity wiped once a line is
+/// taken out.
+pub struct LineReader<R> {
+    inner: R,
+    pending: Zeroizing<Vec<u8>>,
+    chunk: Zeroizing<Vec<u8>>,
+}
+
+impl<R: AsyncRead + Unpin> LineReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: Zeroizing::new(Vec::with_capacity(READ_CHUNK_BYTES)),
+            chunk: Zeroizing::new(vec![0; READ_CHUNK_BYTES]),
+        }
     }
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    } else if line.len() > MAX_LINE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("line exceeds {MAX_LINE_BYTES} bytes"),
-        ));
+
+    /// Reads one line without its newline. `Ok(None)` is a clean end of
+    /// stream; a final line without a newline is returned as is.
+    pub async fn read_line(&mut self) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        // Bytes of `pending` already known to hold no newline.
+        let mut scanned = 0;
+        loop {
+            if let Some(found) = self.pending[scanned..].iter().position(|&b| b == b'\n') {
+                let end = scanned + found;
+                if end > MAX_LINE_BYTES {
+                    return Err(line_too_long());
+                }
+                return Ok(Some(self.take(end, end + 1)));
+            }
+            if self.pending.len() > MAX_LINE_BYTES {
+                return Err(line_too_long());
+            }
+            scanned = self.pending.len();
+            let read = self.inner.read(&mut self.chunk[..]).await?;
+            if read == 0 {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let len = self.pending.len();
+                return Ok(Some(self.take(len, len)));
+            }
+            if self.pending.capacity() - self.pending.len() < read {
+                let wanted = (self.pending.len() + read).max(self.pending.capacity() * 2);
+                let mut bigger = Zeroizing::new(Vec::with_capacity(wanted));
+                bigger.extend_from_slice(&self.pending);
+                self.pending = bigger;
+            }
+            self.pending.extend_from_slice(&self.chunk[..read]);
+            self.chunk[..read].fill(0);
+        }
     }
-    Ok(Some(line))
+
+    /// Moves `pending[..line_end]` out as a line and drops `..consumed`.
+    fn take(&mut self, line_end: usize, consumed: usize) -> Zeroizing<Vec<u8>> {
+        let mut line = Zeroizing::new(Vec::with_capacity(line_end));
+        line.extend_from_slice(&self.pending[..line_end]);
+        self.pending.drain(..consumed);
+        for byte in self.pending.spare_capacity_mut() {
+            byte.write(0);
+        }
+        line
+    }
+}
+
+fn line_too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("line exceeds {MAX_LINE_BYTES} bytes"),
+    )
 }
 
 /// Serialises `value` as one line into a [`Zeroizing`] buffer and writes it.
@@ -308,10 +364,7 @@ pub async fn write_line<W: AsyncWrite + Unpin, T: Serialize>(
 ) -> std::io::Result<()> {
     let mut line = Zeroizing::new(serde_json::to_vec(value)?);
     if line.len() > MAX_LINE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("line exceeds {MAX_LINE_BYTES} bytes"),
-        ));
+        return Err(line_too_long());
     }
     line.push(b'\n');
     writer.write_all(&line).await?;
@@ -423,6 +476,7 @@ mod tests {
                     file_io_dir: Some("/tmp/io".into()),
                     root: "/notes".into(),
                     idle_lock_secs: 900,
+                    max_unlock_secs: 3600,
                 }),
             },
             Response::Ok {
@@ -487,15 +541,46 @@ mod tests {
     async fn read_line_refuses_oversized_lines() {
         let mut long = vec![b'x'; MAX_LINE_BYTES + 1];
         long.push(b'\n');
-        let mut reader = tokio::io::BufReader::new(long.as_slice());
-        let err = read_line(&mut reader).await.unwrap_err();
+        let err = LineReader::new(long.as_slice())
+            .read_line()
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 
-        let mut reader = tokio::io::BufReader::new(&b"{\"op\":\"status\"}\nrest"[..]);
-        let line = read_line(&mut reader).await.unwrap().unwrap();
+        let mut exact = vec![b'x'; MAX_LINE_BYTES];
+        exact.push(b'\n');
+        let line = LineReader::new(exact.as_slice())
+            .read_line()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_LINE_BYTES);
+
+        let mut reader = LineReader::new(&b"{\"op\":\"status\"}\n\nrest"[..]);
+        let line = reader.read_line().await.unwrap().unwrap();
         assert_eq!(line.as_slice(), b"{\"op\":\"status\"}");
-        let tail = read_line(&mut reader).await.unwrap().unwrap();
+        assert!(reader.read_line().await.unwrap().unwrap().is_empty());
+        let tail = reader.read_line().await.unwrap().unwrap();
         assert_eq!(tail.as_slice(), b"rest");
-        assert!(read_line(&mut reader).await.unwrap().is_none());
+        assert!(reader.read_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_line_wipes_consumed_bytes() {
+        let mut reader = LineReader::new(&b"{\"password\":\"hunter2\"}\n{\"op\":\"lock\"}\n"[..]);
+        reader.read_line().await.unwrap().unwrap();
+        // Everything past the unread tail, including where the first line
+        // was before it was shifted out, is zero.
+        let pending = &reader.pending;
+        let spare = pending.capacity() - pending.len();
+        // SAFETY: `take` initialised the spare capacity (to zero), so the
+        // whole allocation is initialised bytes owned by `pending`.
+        let raw = unsafe { std::slice::from_raw_parts(pending.as_ptr(), pending.capacity()) };
+        assert_eq!(&raw[..pending.len()], b"{\"op\":\"lock\"}\n");
+        assert!(
+            raw[pending.len()..].iter().all(|&b| b == 0),
+            "{spare} spare bytes not wiped"
+        );
+        assert!(reader.chunk.iter().all(|&b| b == 0));
     }
 }

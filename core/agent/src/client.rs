@@ -2,15 +2,12 @@
 
 use std::path::Path;
 
-use tokio::{
-    io::BufReader,
-    net::{
-        unix::{OwnedReadHalf, OwnedWriteHalf, UCred},
-        UnixStream,
-    },
+use tokio::net::{
+    unix::{OwnedReadHalf, OwnedWriteHalf, UCred},
+    UnixStream,
 };
 
-use crate::protocol::{read_line, write_line, AgentError, Payload, Request, Response};
+use crate::protocol::{write_line, AgentError, LineReader, Payload, Request, Response};
 
 /// A failed request: either the socket or the daemon said no.
 #[derive(Debug)]
@@ -39,7 +36,7 @@ impl From<std::io::Error> for ClientError {
 }
 
 pub struct AgentClient {
-    reader: BufReader<OwnedReadHalf>,
+    reader: LineReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     peer: UCred,
 }
@@ -50,7 +47,7 @@ impl AgentClient {
         let peer = stream.peer_cred()?;
         let (reader, writer) = stream.into_split();
         Ok(Self {
-            reader: BufReader::new(reader),
+            reader: LineReader::new(reader),
             writer,
             peer,
         })
@@ -63,7 +60,7 @@ impl AgentClient {
 
     pub async fn request(&mut self, request: &Request) -> Result<Payload, ClientError> {
         write_line(&mut self.writer, request).await?;
-        let line = read_line(&mut self.reader).await?.ok_or_else(|| {
+        let line = self.reader.read_line().await?.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "agent closed the connection",

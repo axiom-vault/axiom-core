@@ -4,10 +4,10 @@
 //! returns one: the agent keeps the unlocked vault, enforces the launch
 //! policy, and is unlocked only by the user at their own terminal.
 
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{collections::VecDeque, path::PathBuf};
 
 use axiomvault_agent::{
-    protocol::{Base64Content, Metadata},
+    protocol::{Base64Content, DirEntry},
     AgentClient, AgentStatus, ClientError, ErrorKind, Payload, Request, LOCKED_MESSAGE,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -30,6 +30,10 @@ const MAX_RESOURCE_BYTES: usize = 16 * 1024;
 const SERVER_STATUS_URI: &str = "axiom://server/status";
 const VAULT_STATUS_URI: &str = "axiom://vault/status";
 const VAULT_TREE_URI: &str = "axiom://vault/tree";
+/// Directories below the root that the tree resource descends into.
+const MAX_TREE_DEPTH: usize = 32;
+/// Allowance per tree entry for the whitespace of pretty-printed JSON.
+const TREE_ENTRY_OVERHEAD: usize = 64;
 
 #[derive(Clone)]
 pub struct AxiomMcpServer {
@@ -83,98 +87,111 @@ impl AxiomMcpServer {
     }
 
     /// Describes `slice`, the first bytes of something `size` bytes long.
+    /// Text cut inside a character by the size limit is returned up to the
+    /// last whole character rather than switched to base64.
     fn read_buffer(slice: &[u8], size: usize) -> ReadBuffer {
-        let returned = slice.len();
-        let truncated = size > returned;
-
-        match String::from_utf8(slice.to_vec()) {
-            Ok(text) => ReadBuffer {
-                encoding: "utf-8".to_string(),
-                content: text,
-                size,
-                returned_bytes: returned,
-                truncated,
-            },
-            Err(_) => ReadBuffer {
-                encoding: "base64".to_string(),
-                content: BASE64.encode(slice),
-                size,
-                returned_bytes: returned,
-                truncated,
-            },
+        let text = match std::str::from_utf8(slice) {
+            Ok(text) => Some(text),
+            Err(err)
+                if err.error_len().is_none() && err.valid_up_to() > 0 && size > slice.len() =>
+            {
+                std::str::from_utf8(&slice[..err.valid_up_to()]).ok()
+            }
+            Err(_) => None,
+        };
+        let (encoding, content, returned) = match text {
+            Some(text) => ("utf-8", text.to_string(), text.len()),
+            None => ("base64", BASE64.encode(slice), slice.len()),
+        };
+        ReadBuffer {
+            encoding: encoding.to_string(),
+            content,
+            size,
+            returned_bytes: returned,
+            truncated: size > returned,
         }
     }
 
-    fn truncate_bytes(bytes: &[u8], requested: Option<usize>, ceiling: usize) -> ReadBuffer {
-        let returned = bytes.len().min(Self::read_limit(requested, ceiling));
-        Self::read_buffer(&bytes[..returned], bytes.len())
-    }
-
-    /// The tree below the agent's `--root`, over one connection.
-    async fn vault_tree(&self) -> Result<VaultTreeNode, McpError> {
+    /// A flat listing of the agent's `--root` subtree, breadth first, that
+    /// stops at [`MAX_TREE_DEPTH`] or once it would no longer fit in
+    /// [`MAX_RESOURCE_BYTES`], and says so in `truncated`.
+    async fn vault_tree(&self) -> Result<VaultTree, McpError> {
         let mut client = self.connect().await?;
-        let root = match client
-            .request(&Request::Status)
-            .await
-            .map_err(map_client_error)?
-        {
+        let root = match ask(&mut client, Request::Status).await? {
             Payload::Status(status) => status.root,
             other => return Err(unexpected(other)),
         };
-        Self::walk_tree(&mut client, root).await
-    }
-
-    fn walk_tree(
-        client: &mut AgentClient,
-        path: String,
-    ) -> Pin<Box<dyn Future<Output = Result<VaultTreeNode, McpError>> + Send + '_>> {
-        Box::pin(async move {
-            let metadata = match client
-                .request(&Request::Metadata { path: path.clone() })
-                .await
-                .map_err(map_client_error)?
-            {
-                Payload::Metadata(metadata) => metadata,
+        let root_meta = match ask(&mut client, Request::Metadata { path: root.clone() }).await? {
+            Payload::Metadata(metadata) => metadata,
+            other => return Err(unexpected(other)),
+        };
+        let mut tree = VaultTree {
+            root: root.clone(),
+            entries: Vec::new(),
+            truncated: false,
+        };
+        if !root_meta.is_directory {
+            tree.entries.push(DirEntry {
+                name: root_meta.name,
+                path: root_meta.path,
+                is_directory: false,
+                size: root_meta.size,
+            });
+            return Ok(tree);
+        }
+        let mut used = serde_json::to_vec_pretty(&tree)
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+            .len();
+        let mut queue = VecDeque::from([(root, 0)]);
+        while let Some((dir, depth)) = queue.pop_front() {
+            let entries = match ask(&mut client, Request::ListDirectory { path: dir }).await? {
+                Payload::Entries { entries } => entries,
                 other => return Err(unexpected(other)),
             };
-            let mut node = VaultTreeNode::from_metadata(metadata);
-            if node.is_directory {
-                let entries = match client
-                    .request(&Request::ListDirectory { path })
-                    .await
-                    .map_err(map_client_error)?
-                {
-                    Payload::Entries { entries } => entries,
-                    other => return Err(unexpected(other)),
-                };
-                let mut children = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    children.push(Box::new(Self::walk_tree(client, entry.path).await?));
+            for entry in entries {
+                let cost = serde_json::to_vec(&entry)
+                    .map_err(|err| McpError::internal_error(err.to_string(), None))?
+                    .len()
+                    + TREE_ENTRY_OVERHEAD;
+                if used + cost > MAX_RESOURCE_BYTES {
+                    tree.truncated = true;
+                    return Ok(tree);
                 }
-                node.children = Some(children);
+                used += cost;
+                if entry.is_directory {
+                    if depth < MAX_TREE_DEPTH {
+                        queue.push_back((entry.path.clone(), depth + 1));
+                    } else {
+                        tree.truncated = true;
+                    }
+                }
+                tree.entries.push(entry);
             }
-            Ok(node)
-        })
+        }
+        Ok(tree)
     }
 
+    /// Pretty JSON, or, past [`MAX_RESOURCE_BYTES`], a small valid JSON
+    /// object saying so instead of a cut-off document.
     fn resource_text<T: Serialize>(uri: &str, value: &T) -> Result<ResourceContents, McpError> {
-        let json = serde_json::to_vec_pretty(value)
+        let json = serde_json::to_string_pretty(value)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        let truncated = Self::truncate_bytes(&json, Some(MAX_RESOURCE_BYTES), MAX_RESOURCE_BYTES);
-        let payload = if truncated.truncated {
+        let payload = if json.len() > MAX_RESOURCE_BYTES {
             json!({
-                "content": truncated.content,
-                "encoding": truncated.encoding,
-                "size": truncated.size,
-                "returned_bytes": truncated.returned_bytes,
                 "truncated": true,
+                "size": json.len(),
+                "message": format!("resource exceeds {MAX_RESOURCE_BYTES} bytes"),
             })
             .to_string()
         } else {
-            truncated.content
+            json
         };
         Ok(ResourceContents::text(payload, uri.to_string()))
     }
+}
+
+async fn ask(client: &mut AgentClient, request: Request) -> Result<Payload, McpError> {
+    client.request(&request).await.map_err(map_client_error)
 }
 
 fn map_client_error(err: ClientError) -> McpError {
@@ -261,25 +278,11 @@ pub struct StatusResponse {
 }
 
 #[derive(Clone, Serialize)]
-pub struct VaultTreeNode {
-    pub name: String,
-    pub path: String,
-    pub is_directory: bool,
-    pub size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub children: Option<Vec<Box<VaultTreeNode>>>,
-}
-
-impl VaultTreeNode {
-    fn from_metadata(metadata: Metadata) -> Self {
-        Self {
-            name: metadata.name,
-            path: metadata.path,
-            is_directory: metadata.is_directory,
-            size: metadata.size,
-            children: None,
-        }
-    }
+pub struct VaultTree {
+    pub root: String,
+    pub entries: Vec<DirEntry>,
+    /// True if entries were left out to stay within the size or depth cap.
+    pub truncated: bool,
 }
 
 fn default_encoding() -> String {
@@ -605,8 +608,8 @@ mod tests {
     use axiomvault_agent::AgentError;
 
     #[test]
-    fn truncate_bytes_marks_truncation_and_size() {
-        let output = AxiomMcpServer::truncate_bytes(b"hello world", Some(5), MAX_READ_BYTES);
+    fn read_buffer_marks_truncation_and_size() {
+        let output = AxiomMcpServer::read_buffer(b"hello", 11);
         assert_eq!(output.content, "hello");
         assert_eq!(output.returned_bytes, 5);
         assert_eq!(output.size, 11);
@@ -614,10 +617,42 @@ mod tests {
     }
 
     #[test]
-    fn truncate_bytes_uses_base64_for_binary_content() {
-        let output = AxiomMcpServer::truncate_bytes(&[0, 159, 146, 150], None, MAX_READ_BYTES);
+    fn read_buffer_uses_base64_for_binary_content() {
+        let output = AxiomMcpServer::read_buffer(&[0, 159, 146, 150], 4);
         assert_eq!(output.encoding, "base64");
         assert!(!output.content.is_empty());
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn read_buffer_backs_off_to_a_character_boundary() {
+        // "aé" is 61 c3 a9; a 2-byte read cuts the é in half.
+        let output = AxiomMcpServer::read_buffer("aé".as_bytes().get(..2).unwrap(), 3);
+        assert_eq!(output.encoding, "utf-8");
+        assert_eq!(output.content, "a");
+        assert_eq!(output.returned_bytes, 1);
+        assert!(output.truncated);
+
+        // A cut before the first whole character, and a file that really
+        // ends mid-character, are not text.
+        let output = AxiomMcpServer::read_buffer(&"é".as_bytes()[..1], 2);
+        assert_eq!(output.encoding, "base64");
+        let output = AxiomMcpServer::read_buffer(&"aé".as_bytes()[..2], 2);
+        assert_eq!(output.encoding, "base64");
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn oversized_resources_stay_valid_json() {
+        let big = vec!["x".repeat(100); 1000];
+        let ResourceContents::TextResourceContents { text, .. } =
+            AxiomMcpServer::resource_text("axiom://test", &big).unwrap()
+        else {
+            panic!("not text");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert!(text.len() < MAX_RESOURCE_BYTES);
     }
 
     #[test]
