@@ -8,7 +8,7 @@ use std::{
 };
 
 use axiomvault_agent::{
-    bind_socket,
+    bind_socket, hardening,
     protocol::{Base64Content, UnlockParams},
     serve, AgentClient, ClientError, DaemonConfig, ErrorKind, Payload, Request, ServerPolicy,
     VaultRoot, LOCKED_MESSAGE,
@@ -61,6 +61,7 @@ impl Fixture {
             vault_dir: self.vault_dir.clone(),
             policy,
             idle_lock: None,
+            max_unlock: None,
             allowed_uids: vec![self.uid()],
         }
     }
@@ -493,11 +494,25 @@ async fn import_is_confined_to_the_file_io_directory() {
     std::fs::write(base.path().join("secret"), b"secret").unwrap();
     std::os::unix::fs::symlink(base.path().join("secret"), jail.join("link")).unwrap();
     std::os::unix::fs::symlink(base.path(), jail.join("linkdir")).unwrap();
+    // Symlinks that stay inside the jail are refused too: any symlink could
+    // be swapped for one that leaves it after the check.
+    std::os::unix::fs::symlink(jail.join("inside.txt"), jail.join("inlink")).unwrap();
+    std::fs::create_dir(jail.join("sub")).unwrap();
+    std::fs::write(jail.join("sub/f.txt"), b"f").unwrap();
+    std::os::unix::fs::symlink(jail.join("sub"), jail.join("sublink")).unwrap();
+    std::fs::hard_link(base.path().join("secret"), jail.join("hard")).unwrap();
+    let fifo = std::ffi::CString::new(path_str(jail.join("fifo"))).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
+    // The daemon is non-dumpable; the /proc/self/fd paths must still work.
+    hardening::disable_dumping().unwrap();
     let socket = unlocked(&fx, file_io(true, &jail)).await;
 
     req(&socket, import("inside.txt", "/a")).await.unwrap();
     assert_eq!(read_text(&socket, "/a").await.unwrap(), "inside");
+    req(&socket, import("sub/f.txt", "/f")).await.unwrap();
+    assert_eq!(read_text(&socket, "/f").await.unwrap(), "f");
     req(&socket, import(path_str(jail.join("inside.txt")), "/b"))
         .await
         .unwrap();
@@ -508,14 +523,21 @@ async fn import_is_confined_to_the_file_io_directory() {
         path_str(base.path().join("secret")),
         "link".to_string(),
         "linkdir/secret".to_string(),
+        "inlink".to_string(),
+        "sublink/f.txt".to_string(),
+        "hard".to_string(),
+        "fifo".to_string(),
+        "sub".to_string(),
+        ".".to_string(),
         "/etc/passwd".to_string(),
         String::new(),
     ];
     for (index, local_path) in escapes.into_iter().enumerate() {
         let vault_path = format!("/escape{index}");
-        req(&socket, import(local_path.clone(), &vault_path))
-            .await
-            .unwrap_err();
+        let (_, message) = kind(req(&socket, import(local_path.clone(), &vault_path)).await);
+        if ["link", "inlink", "sublink/f.txt", "linkdir/secret"].contains(&local_path.as_str()) {
+            assert!(message.contains("symlink"), "{local_path}: {message}");
+        }
         assert!(
             !exists(&socket, &vault_path).await,
             "{local_path} was imported"
@@ -549,8 +571,11 @@ async fn export_is_confined_and_never_overwrites() {
     std::fs::write(jail.join("existing.txt"), b"keep me").unwrap();
     std::os::unix::fs::symlink(base.path().join("victim"), jail.join("dangling")).unwrap();
     std::os::unix::fs::symlink(base.path(), jail.join("linkdir")).unwrap();
+    std::fs::create_dir(jail.join("sub")).unwrap();
+    std::os::unix::fs::symlink(jail.join("sub"), jail.join("sublink")).unwrap();
 
     // Export writes only inside the jail and does not need --allow-writes.
+    hardening::disable_dumping().unwrap();
     let socket = unlocked(&fx, file_io(false, &jail)).await;
 
     let refused = [
@@ -560,6 +585,7 @@ async fn export_is_confined_and_never_overwrites() {
         path_str(jail.join("../escape.txt")),
         path_str(base.path().join("escape.txt")),
         "linkdir/escape.txt".to_string(),
+        "sublink/out.txt".to_string(),
         "missing-dir/out.txt".to_string(),
     ];
     for local_path in refused {
@@ -584,4 +610,151 @@ async fn export_is_confined_and_never_overwrites() {
 
     // A second export to the same name is refused.
     req(&socket, export("out.txt")).await.unwrap_err();
+
+    // A real subdirectory works; the same directory through a symlink did not.
+    req(&socket, export("sub/out.txt")).await.unwrap();
+    assert_eq!(std::fs::read(jail.join("sub/out.txt")).unwrap(), b"hello");
+    assert_eq!(std::fs::read_dir(jail.join("sub")).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn failed_unlocks_are_throttled_across_connections() {
+    let fx = fixture().await;
+    let socket = fx.start(fx.config(ServerPolicy::default()));
+    let started = Instant::now();
+    let (first, second) = tokio::join!(
+        req(&socket, fx.unlock_request("wrong-1")),
+        req(&socket, fx.unlock_request("wrong-2")),
+    );
+    first.unwrap_err();
+    second.unwrap_err();
+    // Serialised: one waits out the other's 1s backoff, then its own 2s.
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn an_unlock_ends_its_connection() {
+    let fx = fixture().await;
+    let socket = fx.start(fx.config(ServerPolicy::default()));
+    let mut client = AgentClient::connect(&socket).await.unwrap();
+    client.request(&fx.unlock_request(PASSWORD)).await.unwrap();
+    match client.request(&Request::Status).await {
+        Err(ClientError::Io(_)) => {}
+        other => panic!("connection stayed open: {other:?}"),
+    }
+    assert_eq!(read_text(&socket, "/hello.txt").await.unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn activity_resets_the_idle_timer() {
+    let fx = fixture().await;
+    let socket = fx.start(DaemonConfig {
+        idle_lock: Some(Duration::from_secs(2)),
+        ..fx.config(ServerPolicy::default())
+    });
+    req(&socket, fx.unlock_request(PASSWORD)).await.unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(read_text(&socket, "/hello.txt").await.unwrap(), "hello");
+    }
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let (locked, _) = kind(
+        read_text(&socket, "/hello.txt")
+            .await
+            .map(|_| Payload::Done),
+    );
+    assert_eq!(locked, ErrorKind::Locked);
+}
+
+#[tokio::test]
+async fn max_unlock_locks_however_busy() {
+    let fx = fixture().await;
+    let socket = fx.start(DaemonConfig {
+        idle_lock: Some(Duration::from_secs(60)),
+        max_unlock: Some(Duration::from_secs(2)),
+        ..fx.config(ServerPolicy::default())
+    });
+    req(&socket, fx.unlock_request(PASSWORD)).await.unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1500) {
+        assert_eq!(read_text(&socket, "/hello.txt").await.unwrap(), "hello");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let Payload::Status(status) = req(&socket, Request::Status).await.unwrap() else {
+        panic!("not a status");
+    };
+    assert_eq!(status.max_unlock_secs, 2);
+    assert!(!status.unlocked);
+
+    // The next unlock gets a fresh lifetime.
+    req(&socket, fx.unlock_request(PASSWORD)).await.unwrap();
+    assert_eq!(read_text(&socket, "/hello.txt").await.unwrap(), "hello");
+}
+
+/// Runs the `axiom-agent` binary with `args`; returns (success, stdout, stderr).
+async fn agent_cli(args: Vec<String>) -> (bool, String, String) {
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_axiom-agent"))
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cli_labels_daemon_claims_and_enforces_expect_uid() {
+    let fx = fixture().await;
+    let socket = fx.start(fx.config(ServerPolicy::default()));
+    let socket_arg = path_str(socket.clone());
+
+    let (ok, stdout, stderr) =
+        agent_cli(vec!["status".into(), "--socket".into(), socket_arg.clone()]).await;
+    assert!(ok, "{stderr}");
+    let (checked, reported) = stdout
+        .split_once("reported by the daemon (unverified")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(checked.contains("checked by this client"), "{stdout}");
+    assert!(
+        checked.contains(&format!("uid:        {}", fx.uid())),
+        "{stdout}"
+    );
+    assert!(checked.contains("exe:"), "{stdout}");
+    assert!(
+        reported.contains(&format!("vault:      {}", fx.vault_dir.display())),
+        "{stdout}"
+    );
+
+    let wrong = fx.uid().wrapping_add(1).to_string();
+    let (ok, stdout, stderr) = agent_cli(vec![
+        "unlock".into(),
+        "--socket".into(),
+        socket_arg,
+        "--expect-uid".into(),
+        wrong.clone(),
+    ])
+    .await;
+    assert!(!ok, "{stdout}");
+    assert!(
+        stderr.contains(&format!("not {wrong}; refusing to send the password")),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("password:"), "{stdout}");
+    assert!(matches!(
+        req(&socket, Request::Status).await.unwrap(),
+        Payload::Status(status) if !status.unlocked
+    ));
 }

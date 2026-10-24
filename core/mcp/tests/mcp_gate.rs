@@ -57,6 +57,7 @@ async fn fixture(policy: ServerPolicy) -> Fixture {
             vault_dir,
             policy,
             idle_lock: None,
+            max_unlock: None,
             allowed_uids: vec![dir.path().metadata().unwrap().uid()],
         },
     ));
@@ -310,9 +311,48 @@ async fn vault_tree_starts_at_the_agent_root() {
     let client = connect(&fx.socket).await;
 
     let tree: Value = serde_json::from_str(&resource(&client, "axiom://vault/tree").await).unwrap();
-    assert_eq!(tree["path"], "/docs");
+    assert_eq!(tree["root"], "/docs");
+    assert_eq!(tree["truncated"], false);
     let err = call(&client, "read_file", json!({ "path": "/hello.txt" }))
         .await
         .unwrap_err();
     assert!(err.contains("--root"), "{err}");
+}
+
+#[tokio::test]
+async fn vault_tree_is_bounded_and_valid_json() {
+    let fx = fixture(ServerPolicy::new(true, None, VaultRoot::whole_vault()).unwrap()).await;
+    fx.unlock().await;
+    let client = connect(&fx.socket).await;
+
+    // Deeper than the depth cap: a recursive walk would follow it all.
+    let mut path = String::new();
+    for _ in 0..40 {
+        path.push_str("/d");
+        call(&client, "mkdir", json!({ "path": path }))
+            .await
+            .unwrap();
+    }
+    let tree: Value = serde_json::from_str(&resource(&client, "axiom://vault/tree").await).unwrap();
+    assert_eq!(tree["truncated"], true);
+    let entries = tree["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|entry| entry["path"] == "/hello.txt"));
+    assert!(entries.len() < 40, "{}", entries.len());
+
+    // More entries than fit: the listing stops early and stays valid JSON.
+    for index in 0..200 {
+        let path = format!("/docs/{index:03}-{}", "x".repeat(60));
+        call(
+            &client,
+            "write_file",
+            json!({ "path": path, "content": "" }),
+        )
+        .await
+        .unwrap();
+    }
+    let text = resource(&client, "axiom://vault/tree").await;
+    assert!(text.len() <= 16 * 1024, "{}", text.len());
+    let tree: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(tree["truncated"], true);
+    assert!(tree["entries"].as_array().unwrap().len() < 200);
 }
