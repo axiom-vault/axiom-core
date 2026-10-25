@@ -486,6 +486,30 @@ async fn socket_setup_refuses_a_live_agent_and_replaces_a_stale_socket() {
     assert_eq!(std::fs::read(&file).unwrap(), b"keep");
 }
 
+#[tokio::test]
+async fn untrusted_lock_files_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A symlink at the lock path is not followed.
+    let socket = dir.path().join("a.sock");
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("a.sock.lock")).unwrap();
+    let err = bind_socket(&socket, 0o600).unwrap_err();
+    assert!(err.to_string().contains("a.sock.lock"), "{err}");
+    assert!(!socket.exists());
+
+    // Nor is a lock file that others can write.
+    let socket = dir.path().join("b.sock");
+    let lock = dir.path().join("b.sock.lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let err = bind_socket(&socket, 0o600).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(err.to_string().contains("mode 666"), "{err}");
+    assert!(!socket.exists());
+}
+
 /// Two daemons started together on a stale socket: both used to see it as
 /// stale, and the loser kept running on an unlinked socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

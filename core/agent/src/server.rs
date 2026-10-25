@@ -2,7 +2,7 @@
 
 use std::{
     fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -129,7 +129,9 @@ impl Drop for SocketLock {
 ///
 /// First takes an exclusive `flock` on `<path>.lock`, held by the returned
 /// [`SocketLock`], so of two daemons started together only one gets past
-/// it. An existing socket that accepts connections means another agent is
+/// it. The lock file is not followed if it is a symlink, and must be a
+/// regular file owned by the effective uid that group and others cannot
+/// write. An existing socket that accepts connections means another agent is
 /// running, which is an error; a stale one is removed. Anything else at
 /// `path` is left alone and is an error.
 ///
@@ -165,7 +167,30 @@ pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<(UnixListener, Soc
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&lock_path)?;
+        .open(&lock_path)
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot open lock file {}: {err}", lock_path.display()),
+            )
+        })?;
+    // A lock file someone else owns or can write could be held, or swapped,
+    // by them to keep this daemon from starting or to start beside it.
+    let metadata = lock.metadata()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing lock file {}: it must be a regular file owned by uid {euid} and \
+                 writable only by it (found uid {}, mode {:o}); remove it",
+                lock_path.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            ),
+        ));
+    }
     match lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
