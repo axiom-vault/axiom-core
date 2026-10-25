@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
 use crate::freshness::{
-    FreshnessAnchor, FreshnessState, LocalFileFreshnessAnchor, UnavailableFreshnessAnchor,
+    AnchorKeys, FreshnessAnchor, FreshnessState, LocalFileFreshnessAnchor,
+    UnavailableFreshnessAnchor,
 };
 use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::migration::{check_migration_needed, MigrationStatus};
@@ -153,6 +154,36 @@ pub struct VaultManager {
     ephemeral_namespace: String,
 }
 
+/// A provider location as given by the caller and, for a local root, as
+/// the filesystem resolves it; see [`AnchorKeys`].
+struct AnchorLocation<'a> {
+    provider_type: &'a str,
+    typed: &'a serde_json::Value,
+    resolved: Option<serde_json::Value>,
+    namespace: &'a str,
+}
+
+impl AnchorLocation<'_> {
+    /// Keys for the location alone, or for `vault_id` at it. `config.id`
+    /// comes from the unauthenticated `vault.config`, so a location marker is
+    /// what lets the no-manifest path detect a vault this device has already
+    /// anchored.
+    fn keys(&self, vault_id: Option<&VaultId>) -> Result<AnchorKeys> {
+        let id = |config| {
+            VaultManager::freshness_id_from(
+                self.provider_type,
+                config,
+                vault_id,
+                Some(self.namespace),
+            )
+        };
+        Ok(AnchorKeys::new(
+            id(self.typed)?,
+            self.resolved.as_ref().map(id).transpose()?,
+        ))
+    }
+}
+
 impl VaultManager {
     /// Create a new vault manager with default providers.
     pub fn new() -> Self {
@@ -239,105 +270,28 @@ impl VaultManager {
         VaultId::new(format!("anchor-{}", digest(&material)))
     }
 
-    /// Anchor keys for a location, or for `vault_id` at it: the key to use,
-    /// and the one earlier builds derived from a local root as typed, when
-    /// that differs. A local root is keyed as the filesystem resolves it, so
-    /// every spelling of one directory finds the same anchor.
-    fn anchor_ids(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-        vault_id: Option<&VaultId>,
-    ) -> Result<(VaultId, Option<VaultId>)> {
-        let namespace = Some(self.ephemeral_namespace.as_str());
-        let as_typed =
-            Self::freshness_id_from(provider_type, provider_config, vault_id, namespace)?;
-        if provider_type != "local" {
-            return Ok((as_typed, None));
-        }
-        let resolved = serde_json::json!({ "root": canonical_local_root(provider_config)? });
-        let anchor_id = Self::freshness_id_from(provider_type, &resolved, vault_id, namespace)?;
-        let legacy_id = (as_typed != anchor_id).then_some(as_typed);
-        Ok((anchor_id, legacy_id))
+    /// The anchor identity of a provider location, worked out once per
+    /// operation so that every key it uses comes from one resolution of the
+    /// local root.
+    fn anchor_location<'a>(
+        &'a self,
+        provider_type: &'a str,
+        provider_config: &'a serde_json::Value,
+    ) -> Result<AnchorLocation<'a>> {
+        let resolved = match provider_type {
+            "local" => Some(serde_json::json!({ "root": canonical_local_root(provider_config)? })),
+            _ => None,
+        };
+        Ok(AnchorLocation {
+            provider_type,
+            typed: provider_config,
+            resolved,
+            namespace: &self.ephemeral_namespace,
+        })
     }
 
-    fn freshness_id(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-        vault_id: &VaultId,
-    ) -> Result<VaultId> {
-        Ok(self
-            .anchor_ids(provider_type, provider_config, Some(vault_id))?
-            .0)
-    }
-
-    /// Anchor key for the provider location alone. `config.id` comes from the
-    /// unauthenticated `vault.config`, so a location marker is what lets the
-    /// no-manifest path detect a vault this device has already anchored.
-    fn location_freshness_id(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-    ) -> Result<VaultId> {
-        Ok(self.anchor_ids(provider_type, provider_config, None)?.0)
-    }
-
-    /// The trusted state of `vault_id` at this location, and its anchor key.
-    /// A state that only the legacy as-typed key holds, or that is newer
-    /// there, is copied to the anchor key first: opening a vault through a
-    /// new spelling of its path must neither bootstrap a fresh anchor for it
-    /// (trust on first use) nor forget a higher generation.
-    fn load_anchor_state(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-        vault_id: &VaultId,
-    ) -> Result<(VaultId, Option<FreshnessState>)> {
-        let (anchor_id, legacy_id) =
-            self.anchor_ids(provider_type, provider_config, Some(vault_id))?;
-        let mut state = self.freshness_anchor.load_state(&anchor_id)?;
-        if let Some(legacy_id) = legacy_id {
-            if let Some(legacy) = self.freshness_anchor.load_state(&legacy_id)? {
-                if state
-                    .as_ref()
-                    .is_none_or(|current| legacy.generation > current.generation)
-                {
-                    self.freshness_anchor
-                        .store_state(&anchor_id, legacy.clone())?;
-                    state = Some(legacy);
-                }
-            }
-        }
-        Ok((anchor_id, state))
-    }
-
-    /// Whether this device has a location marker for this location, under
-    /// the anchor key or the legacy as-typed one.
-    fn location_anchored(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-    ) -> Result<bool> {
-        let (location_id, legacy_id) = self.anchor_ids(provider_type, provider_config, None)?;
-        for id in std::iter::once(location_id).chain(legacy_id) {
-            if self.freshness_anchor.load(&id)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn mark_location_anchored(
-        &self,
-        provider_type: &str,
-        provider_config: &serde_json::Value,
-    ) -> Result<()> {
-        let location_id = self.location_freshness_id(provider_type, provider_config)?;
-        if self.freshness_anchor.load(&location_id)?.is_none() {
-            self.freshness_anchor.store(&location_id, 0)?;
-        }
-        Ok(())
+    fn mark_location_anchored(&self, location: &AnchorLocation<'_>) -> Result<()> {
+        location.keys(None)?.mark(self.freshness_anchor.as_ref())
     }
 
     /// Get the provider registry.
@@ -417,9 +371,12 @@ impl VaultManager {
         provider_config: serde_json::Value,
         kdf_params: KdfParams,
     ) -> Result<VaultCreation> {
-        let (anchor_id, anchored_state) =
-            self.load_anchor_state(provider_type, &provider_config, &vault_id)?;
-        if anchored_state.is_some() {
+        let location = self.anchor_location(provider_type, &provider_config)?;
+        let anchor_keys = location.keys(Some(&vault_id))?;
+        if anchor_keys
+            .load_state(self.freshness_anchor.as_ref())?
+            .is_some()
+        {
             return Err(Error::AlreadyExists(
                 "freshness anchor already exists for vault ID".to_string(),
             ));
@@ -446,11 +403,11 @@ impl VaultManager {
             provider,
             VaultTree::new(),
             self.freshness_anchor.clone(),
-            anchor_id,
+            anchor_keys,
             0,
         )?;
         session.save_tree().await?;
-        self.mark_location_anchored(provider_type, &provider_config)?;
+        self.mark_location_anchored(&location)?;
 
         Ok(VaultCreation {
             session,
@@ -523,6 +480,7 @@ impl VaultManager {
     ) -> Result<VaultSession> {
         let runtime_config = self.runtime_provider_config(provider_type, &provider_config)?;
         let provider = self.registry.resolve(provider_type, runtime_config)?;
+        let location = self.anchor_location(provider_type, &provider_config)?;
 
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
@@ -561,8 +519,8 @@ impl VaultManager {
             }
             let mut config = snapshot_config;
             let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
-            let (anchor_id, anchored_state) =
-                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
+            let anchor_keys = location.keys(Some(&config.id))?;
+            let anchored_state = anchor_keys.load_state(self.freshness_anchor.as_ref())?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(format!(
@@ -581,14 +539,14 @@ impl VaultManager {
                     ));
                 }
             }
-            self.freshness_anchor.store_state(
-                &anchor_id,
-                FreshnessState {
+            anchor_keys.store_state(
+                self.freshness_anchor.as_ref(),
+                &FreshnessState {
                     generation: manifest.generation,
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
-            self.mark_location_anchored(provider_type, &provider_config)?;
+            self.mark_location_anchored(&location)?;
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             if upgrade {
                 config.version = VaultVersion::CURRENT;
@@ -599,7 +557,7 @@ impl VaultManager {
                 provider,
                 tree,
                 self.freshness_anchor.clone(),
-                anchor_id,
+                anchor_keys,
                 manifest.generation,
             )?;
             if upgrade {
@@ -615,9 +573,11 @@ impl VaultManager {
         let config_bytes = provider.download(&config_path).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
 
-        let (anchor_id, anchored_state) =
-            self.load_anchor_state(provider_type, &provider_config, &config.id)?;
-        let location_anchored = self.location_anchored(provider_type, &provider_config)?;
+        let anchor_keys = location.keys(Some(&config.id))?;
+        let anchored_state = anchor_keys.load_state(self.freshness_anchor.as_ref())?;
+        let location_anchored = location
+            .keys(None)?
+            .is_anchored(self.freshness_anchor.as_ref())?;
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
@@ -658,12 +618,12 @@ impl VaultManager {
             provider,
             tree,
             self.freshness_anchor.clone(),
-            anchor_id,
+            anchor_keys,
             0,
         )?;
         session.save_tree().await?;
         // Marked only after the first manifest commit, so a failed bootstrap can retry.
-        self.mark_location_anchored(provider_type, &provider_config)?;
+        self.mark_location_anchored(&location)?;
         Ok(session)
     }
 
@@ -688,6 +648,7 @@ impl VaultManager {
     ) -> Result<VaultSession> {
         let runtime_config = self.runtime_provider_config(provider_type, &provider_config)?;
         let provider = self.registry.resolve(provider_type, runtime_config)?;
+        let location = self.anchor_location(provider_type, &provider_config)?;
 
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
         let recovery_key = RecoveryKey::from_mnemonic(recovery_words)?;
@@ -746,8 +707,8 @@ impl VaultManager {
             if upgrade {
                 config.verify_recovery_key_binding(&recovery_key, &master_key)?;
             }
-            let (anchor_id, anchored_state) =
-                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
+            let anchor_keys = location.keys(Some(&config.id))?;
+            let anchored_state = anchor_keys.load_state(self.freshness_anchor.as_ref())?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(
@@ -765,21 +726,24 @@ impl VaultManager {
                     ));
                 }
             }
-            self.freshness_anchor.store_state(
-                &anchor_id,
-                FreshnessState {
+            anchor_keys.store_state(
+                self.freshness_anchor.as_ref(),
+                &FreshnessState {
                     generation: manifest.generation,
                     manifest_digest: Some(digest(&manifest_bytes)),
                 },
             )?;
-            self.mark_location_anchored(provider_type, &provider_config)?;
+            self.mark_location_anchored(&location)?;
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             (tree, manifest.generation, upgrade)
         } else {
-            let (_, anchored_state) =
-                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
+            let anchored_state = location
+                .keys(Some(&config.id))?
+                .load_state(self.freshness_anchor.as_ref())?;
             if anchored_state.is_some()
-                || self.location_anchored(provider_type, &provider_config)?
+                || location
+                    .keys(None)?
+                    .is_anchored(self.freshness_anchor.as_ref())?
             {
                 return Err(Error::Conflict(
                     "snapshot manifest missing for a vault with trusted freshness state"
@@ -815,19 +779,19 @@ impl VaultManager {
             config.version = VaultVersion::CURRENT;
         }
 
-        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
+        let anchor_keys = location.keys(Some(&config.id))?;
         let mut session = VaultSession::from_master_key_with_freshness(
             config,
             master_key,
             provider.clone(),
             tree,
             self.freshness_anchor.clone(),
-            anchor_id,
+            anchor_keys,
             generation,
         )?;
         session.stage_master_key_rotation(new_master_key);
         session.commit_master_key_rotation().await?;
-        self.mark_location_anchored(provider_type, &provider_config)?;
+        self.mark_location_anchored(&location)?;
         Ok(session)
     }
 
@@ -1085,6 +1049,10 @@ mod tests {
     fn test_anchor_id(vault_id: &VaultId) -> VaultId {
         VaultManager::freshness_id_from("test", &serde_json::Value::Null, Some(vault_id), None)
             .unwrap()
+    }
+
+    fn test_location_id() -> VaultId {
+        VaultManager::freshness_id_from("test", &serde_json::Value::Null, None, None).unwrap()
     }
 
     #[test]
@@ -3493,9 +3461,7 @@ mod tests {
         );
         assert_eq!(storage_objects(provider.as_ref()).await, before);
         assert_eq!(anchor.load_state(&test_anchor_id(&vault_id)).unwrap(), None);
-        let location_id = manager
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         assert_eq!(anchor.load(&location_id).unwrap(), None);
 
         // With a 1.1 manifest generation: the anchor state is left as it was.
@@ -3826,9 +3792,7 @@ mod tests {
             .upgrade_to_current("test", serde_json::Value::Null, b"password")
             .await
             .unwrap();
-        let location_id = manager
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         assert!(anchor.load(&location_id).unwrap().is_some());
 
         // N-1 after the upgrade, relabelled 1.1 so only the upgrade path would
@@ -3991,9 +3955,7 @@ mod tests {
         let (file, words) =
             write_tagged_v1_1_vault_without_manifest(provider.clone(), vault_id.as_str()).await;
         let before = storage_objects(provider.as_ref()).await;
-        let location_id = manager
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         let wrong_words = RecoveryKey::generate().to_mnemonic().unwrap();
 
         let error = manager
@@ -4150,9 +4112,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(storage_objects(provider.as_ref()).await, before);
-        let location_id = manager
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         assert_eq!(anchor.load(&location_id).unwrap(), None);
     }
 
@@ -4525,9 +4485,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        let location_id = opener
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         assert_eq!(anchor.load(&location_id).unwrap(), None);
     }
 
@@ -4836,9 +4794,7 @@ mod tests {
             }
             assert_eq!(anchor.load_state(&anchor_id).unwrap(), anchored);
             assert_eq!(other_anchor.load_state(&anchor_id).unwrap(), None);
-            let location_id = other_device
-                .location_freshness_id("test", &serde_json::Value::Null)
-                .unwrap();
+            let location_id = test_location_id();
             assert_eq!(other_anchor.load(&location_id).unwrap(), None);
 
             for (path, bytes) in &originals {
@@ -5124,9 +5080,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        let location_id = VaultManager::new()
-            .location_freshness_id("test", &serde_json::Value::Null)
-            .unwrap();
+        let location_id = test_location_id();
         assert_eq!(device.load(&location_id).unwrap(), None);
     }
 
@@ -5633,6 +5587,11 @@ mod tests {
                 .unwrap();
         }
 
+        /// The anchor key of `id` at a local root spelt as in `config`.
+        fn key(config: &serde_json::Value, id: &VaultId) -> VaultId {
+            VaultManager::freshness_id_from("local", config, Some(id), None).unwrap()
+        }
+
         fn is_rollback(result: Result<VaultSession>) -> bool {
             result
                 .err()
@@ -5659,15 +5618,14 @@ mod tests {
             drop(creation);
             let generation_two = vault.copy("generation-two");
 
-            let anchor_id = manager
-                .freshness_id("local", &canonical, &vault.id)
-                .unwrap();
+            let anchor_id = key(&canonical, &vault.id);
             for spelling in [vault.alias(), vault.relative(), vault.trailing_slash()] {
-                assert_eq!(
-                    manager.freshness_id("local", &spelling, &vault.id).unwrap(),
-                    anchor_id,
-                    "{spelling}"
-                );
+                let keys = manager
+                    .anchor_location("local", &spelling)
+                    .unwrap()
+                    .keys(Some(&vault.id))
+                    .unwrap();
+                assert_eq!(keys.lock_id(), &anchor_id, "{spelling}");
             }
 
             let session = manager
@@ -5677,6 +5635,10 @@ mod tests {
             add_file(&session, "/two").await;
             drop(session);
             assert_eq!(anchor.load(&anchor_id).unwrap(), Some(3));
+            assert_eq!(
+                anchor.load(&key(&vault.alias(), &vault.id)).unwrap(),
+                Some(3)
+            );
 
             vault.restore(&generation_two);
             for spelling in [vault.alias(), vault.relative(), canonical] {
@@ -5713,9 +5675,7 @@ mod tests {
             drop(creation);
             let generation_three = vault.copy("generation-three");
 
-            let anchor_id = manager
-                .freshness_id("local", &canonical, &vault.id)
-                .unwrap();
+            let anchor_id = key(&canonical, &vault.id);
             let current = creator.load_state(&anchor_id).unwrap().unwrap();
             // What an older build stored after opening through the alias.
             let legacy_id =
@@ -5776,6 +5736,49 @@ mod tests {
                 error.to_string().contains("snapshot manifest missing"),
                 "{error}"
             );
+        }
+
+        /// The vault is advanced through `alias/vault` while `alias` points
+        /// at `real`; an attacker then repoints `alias` at an older copy.
+        #[tokio::test]
+        async fn repointing_a_parent_symlink_does_not_dodge_the_anchor() {
+            let vault = LocalVault::new("local-repointed");
+            let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = local_manager(anchor);
+            let creation = manager
+                .create_vault(
+                    vault.id.clone(),
+                    b"password",
+                    "local",
+                    vault.alias(),
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
+            add_file(&creation.session, "/one").await;
+            let other = vault.temp.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            copy_dir(&vault.canonical, &other.join("vault"));
+            let generation_two = vault.copy("generation-two");
+            add_file(&creation.session, "/two").await;
+            drop(creation);
+
+            let alias = vault.temp.path().join("alias");
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            assert!(is_rollback(
+                manager
+                    .open_vault("local", vault.alias(), b"password")
+                    .await
+            ));
+
+            // The resolved key was kept too, so the real path sees it.
+            vault.restore(&generation_two);
+            assert!(is_rollback(
+                manager
+                    .open_vault("local", LocalVault::config(&vault.canonical), b"password")
+                    .await
+            ));
         }
 
         #[test]

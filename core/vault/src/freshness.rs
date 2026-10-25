@@ -62,6 +62,102 @@ pub trait FreshnessAnchor: Send + Sync {
     }
 }
 
+/// The anchor keys one vault's trusted state is kept under. A local vault
+/// has two: one derived from its root as the caller spelt it, the only key
+/// before the root was resolved, and one from the root as the filesystem
+/// resolves it, which every spelling shares. Every store writes all keys
+/// and every load takes the highest generation among them, so neither a
+/// new spelling of the path nor a repointed symlink inside an old one
+/// falls back to trust on first use.
+#[derive(Clone, Debug)]
+pub(crate) struct AnchorKeys {
+    typed: VaultId,
+    /// `None` when it equals `typed`, or the provider has no resolved form.
+    resolved: Option<VaultId>,
+}
+
+impl AnchorKeys {
+    pub(crate) fn new(typed: VaultId, resolved: Option<VaultId>) -> Self {
+        let resolved = resolved.filter(|resolved| resolved != &typed);
+        Self { typed, resolved }
+    }
+
+    fn ids(&self) -> impl Iterator<Item = &VaultId> {
+        std::iter::once(&self.typed).chain(self.resolved.as_ref())
+    }
+
+    /// Key of the in-process publication lock: the resolved one, which every
+    /// spelling of the location shares.
+    pub(crate) fn lock_id(&self) -> &VaultId {
+        self.resolved.as_ref().unwrap_or(&self.typed)
+    }
+
+    /// The highest-generation state under any key (the first on a tie).
+    /// Keys behind it are raised to it, never lowered, so a later open
+    /// through either key alone still knows it.
+    pub(crate) fn load_state(
+        &self,
+        anchor: &dyn FreshnessAnchor,
+    ) -> Result<Option<FreshnessState>> {
+        let mut states = Vec::new();
+        for id in self.ids() {
+            states.push((id, anchor.load_state(id)?));
+        }
+        let best = states
+            .iter()
+            .filter_map(|(_, state)| state.clone())
+            .reduce(|best, state| {
+                if state.generation > best.generation {
+                    state
+                } else {
+                    best
+                }
+            });
+        if let Some(best) = &best {
+            for (id, state) in &states {
+                if state
+                    .as_ref()
+                    .is_none_or(|state| state.generation < best.generation)
+                {
+                    anchor.store_state(id, best.clone())?;
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    pub(crate) fn store_state(
+        &self,
+        anchor: &dyn FreshnessAnchor,
+        state: &FreshnessState,
+    ) -> Result<()> {
+        for id in self.ids() {
+            anchor.store_state(id, state.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Whether any key holds a marker or state.
+    pub(crate) fn is_anchored(&self, anchor: &dyn FreshnessAnchor) -> Result<bool> {
+        for id in self.ids() {
+            if anchor.load(id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stores generation 0 under every key that holds nothing yet.
+    pub(crate) fn mark(&self, anchor: &dyn FreshnessAnchor) -> Result<()> {
+        for id in self.ids() {
+            if anchor.load(id)?.is_none() {
+                anchor.store(id, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Anchor used when the platform cannot provide trusted local storage.
 /// Every operation fails closed rather than silently disabling protection.
 pub struct UnavailableFreshnessAnchor {
