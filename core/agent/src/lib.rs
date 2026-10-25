@@ -25,7 +25,7 @@ pub use protocol::{
     AgentError, AgentStatus, ErrorKind, Payload, Request, Response, LOCKED_MESSAGE,
 };
 #[cfg(feature = "daemon")]
-pub use server::{bind_socket, serve, DaemonConfig};
+pub use server::{bind_socket, serve, DaemonConfig, SocketLock};
 
 /// Socket file name inside `$XDG_RUNTIME_DIR`.
 pub const SOCKET_NAME: &str = "axiom-agent.sock";

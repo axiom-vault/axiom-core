@@ -279,7 +279,8 @@ fn run_serve(options: ServeOptions) -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let listener = bind_socket(&options.socket, options.socket_mode)
+        // Removes the socket when the daemon stops, before unlocking it.
+        let (listener, _socket_lock) = bind_socket(&options.socket, options.socket_mode)
             .with_context(|| format!("cannot listen on {}", options.socket.display()))?;
         let config = options.config;
         info!(
@@ -301,7 +302,6 @@ fn run_serve(options: ServeOptions) -> Result<()> {
             _ = terminate.recv() => {}
         }
         info!("shutting down");
-        let _ = std::fs::remove_file(&options.socket);
         Ok(())
     })
 }

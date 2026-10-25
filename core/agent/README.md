@@ -54,7 +54,7 @@ axiom-agent status [--socket <path>]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--vault` | required | The local vault this daemon serves, canonicalised at startup (must exist). Unlock opens this vault and no other. |
-| `--socket` | `$XDG_RUNTIME_DIR/axiom-agent.sock` | Socket path. The parent is created 0700 if missing. A live socket is an error; a stale one is replaced. |
+| `--socket` | `$XDG_RUNTIME_DIR/axiom-agent.sock` | Socket path. The parent is created 0700 if missing; with `--socket-mode 660` it must already exist. The daemon holds an exclusive lock on `<socket>.lock` while it runs, so a second daemon on the same path fails. A live socket is an error; a stale one is replaced. |
 | `--socket-mode` | `600` | `660` shares the socket with its group. |
 | `--allow-writes` | off | Create, update, delete, mkdir, import. |
 | `--allow-file-io=<dir>` | off | Import/export, confined to `<dir>`: no `..`, no symlinks anywhere in the path, single-link regular files only, no overwrites. On Linux every lookup uses `openat2(RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS)` on a descriptor opened at launch and the vault layer works on the descriptor that was checked, so swapping a symlink in later cannot redirect it; without `openat2` (Linux < 5.6) file I/O is refused. On other Unix systems the checks are path-based and race a concurrent writer to the directory. |

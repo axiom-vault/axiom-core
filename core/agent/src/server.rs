@@ -1,8 +1,8 @@
 //! The daemon: holds the unlocked vault and answers requests on the socket.
 
 use std::{
-    fs::{DirBuilder, Permissions},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
+    fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -109,20 +109,72 @@ impl Timers {
     }
 }
 
+/// Exclusive hold on an agent socket path, taken by [`bind_socket`] and
+/// kept for the daemon's lifetime. Dropping it removes the socket and only
+/// then releases the lock, so a daemon starting meanwhile never finds a
+/// socket of ours to remove. The lock file itself stays behind.
+#[derive(Debug)]
+pub struct SocketLock {
+    socket: PathBuf,
+    _lock: File,
+}
+
+impl Drop for SocketLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 /// Creates the listening socket at `path` with permissions `mode`.
 ///
-/// A missing parent directory is created 0700. An existing socket that
-/// accepts connections means another agent is running, which is an error; a
-/// stale one is removed. Anything else at `path` is left alone and is an
-/// error.
-pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+/// First takes an exclusive `flock` on `<path>.lock`, held by the returned
+/// [`SocketLock`], so of two daemons started together only one gets past
+/// it. An existing socket that accepts connections means another agent is
+/// running, which is an error; a stale one is removed. Anything else at
+/// `path` is left alone and is an error.
+///
+/// A missing parent directory is created 0700. That would shut out the
+/// group a `mode` such as 0660 shares the socket with, so with such a mode
+/// the directory must already exist.
+pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<(UnixListener, SocketLock)> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if !parent.exists() {
+            if mode & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "socket directory {} does not exist; create it first, owned by \
+                         the daemon user and the clients' group with mode 0750 (a \
+                         directory created here would be 0700)",
+                        parent.display()
+                    ),
+                ));
+            }
             DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)?;
         }
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("another agent holds {}", lock_path.display()),
+            ))
+        }
+        Err(TryLockError::Error(err)) => return Err(err),
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -147,8 +199,12 @@ pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
     // the chmod below the socket has the umask's mode; a peer that connects
     // in that window is still checked against the uid allowlist.
     let listener = UnixListener::bind(path)?;
+    let lock = SocketLock {
+        socket: path.to_path_buf(),
+        _lock: lock,
+    };
     std::fs::set_permissions(path, Permissions::from_mode(mode))?;
-    Ok(listener)
+    Ok((listener, lock))
 }
 
 /// Serves connections on `listener` until the process exits.

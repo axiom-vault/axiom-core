@@ -50,17 +50,18 @@ async fn fixture(policy: ServerPolicy) -> Fixture {
     app.close_vault().await.unwrap();
 
     let socket = dir.path().join("agent.sock");
-    let listener = bind_socket(&socket, 0o600).unwrap();
-    tokio::spawn(serve(
-        listener,
-        DaemonConfig {
-            vault_dir,
-            policy,
-            idle_lock: None,
-            max_unlock: None,
-            allowed_uids: vec![dir.path().metadata().unwrap().uid()],
-        },
-    ));
+    let (listener, lock) = bind_socket(&socket, 0o600).unwrap();
+    let config = DaemonConfig {
+        vault_dir,
+        policy,
+        idle_lock: None,
+        max_unlock: None,
+        allowed_uids: vec![dir.path().metadata().unwrap().uid()],
+    };
+    tokio::spawn(async move {
+        let _lock = lock;
+        serve(listener, config).await
+    });
     Fixture { _dir: dir, socket }
 }
 
