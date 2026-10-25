@@ -101,14 +101,16 @@ impl Write for PlaintextSender {
     }
 }
 
-/// `Write` sink that keeps plaintext bytes `[skip, skip + wanted)`. The
-/// write that fills it fails, which stops the decryptor before it opens any
-/// later frame. `wanted` must be non-zero.
+/// `Write` sink that keeps plaintext bytes `[skip, skip + wanted)` and drops
+/// the rest. With `stop_when_full`, the write that fills it fails, which
+/// stops the decryptor before it opens any later frame. `wanted` must be
+/// non-zero.
 struct PlaintextWindow {
     skip: u64,
     wanted: usize,
     bytes: Vec<u8>,
-    /// Set by the write that filled the window.
+    stop_when_full: bool,
+    /// Set by the write that filled the window and stopped the decryptor.
     stopped: bool,
 }
 
@@ -119,7 +121,7 @@ impl Write for PlaintextWindow {
         let rest = &bytes[skipped..];
         let take = rest.len().min(self.wanted - self.bytes.len());
         self.bytes.extend_from_slice(&rest[..take]);
-        if self.bytes.len() == self.wanted {
+        if self.stop_when_full && self.bytes.len() == self.wanted {
             self.stopped = true;
             return Err(std::io::Error::other("plaintext window is full"));
         }
@@ -695,8 +697,12 @@ impl<'a> VaultOperations<'a> {
     /// because its digest in the authenticated snapshot is what ties the
     /// blob to the current generation. Frames before `offset` are decrypted
     /// and dropped, as the stream can only be authenticated in order; that
-    /// costs about as much as the hashing every read does anyway. Files
-    /// written in one piece (content version 0) are read whole.
+    /// costs about as much as the hashing every read does anyway. A node
+    /// without a digest (written before digests existed) has nothing else
+    /// that would catch a truncated or extended blob, so every frame up to
+    /// the authenticated end frame is decrypted, and all but the window
+    /// dropped. Files written in one piece (content version 0) are read
+    /// whole.
     pub async fn read_file_range(
         &self,
         path: &VaultPath,
@@ -738,6 +744,7 @@ impl<'a> VaultOperations<'a> {
             .download_stream(&storage_path)
             .await?;
 
+        let verify_with_digest = expected_digest.is_some();
         let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
         let decrypt_task = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let mut input = ChunkReceiver {
@@ -749,6 +756,7 @@ impl<'a> VaultOperations<'a> {
                 skip: offset,
                 wanted: max_bytes,
                 bytes: Vec::new(),
+                stop_when_full: verify_with_digest,
                 stopped: false,
             };
             match DecryptingStream::new(&key)?.decrypt_stream(&mut input, &mut window) {
@@ -1501,6 +1509,43 @@ mod tests {
 
         let err = ops.read_file_range(&path, 0, 16).await.unwrap_err();
         assert!(err.to_string().contains("authenticated snapshot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn range_reads_of_nodes_without_a_digest_verify_the_end_frame() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/old.bin").unwrap();
+        let data = streamed_file(&ops, &path).await;
+        session
+            .tree()
+            .write()
+            .await
+            .get_node_mut(&path)
+            .unwrap()
+            .metadata
+            .content_digest = None;
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let stored = session.provider().list(&data_dir).await.unwrap();
+        let stored_path = data_dir.join(&stored[0].name).unwrap();
+        let ciphertext = session.provider().download(&stored_path).await.unwrap();
+
+        let truncated = ciphertext[..ciphertext.len() - 10].to_vec();
+        let mut extended = ciphertext.clone();
+        extended.extend_from_slice(b"appended");
+        for blob in [truncated, extended] {
+            session.provider().upload(&stored_path, blob).await.unwrap();
+            assert!(ops.read_file(&path).await.is_err());
+            assert!(ops.read_file_range(&path, 0, 16).await.is_err());
+        }
+
+        session
+            .provider()
+            .upload(&stored_path, ciphertext)
+            .await
+            .unwrap();
+        let (bytes, _) = ops.read_file_range(&path, 0, 16).await.unwrap();
+        assert_eq!(bytes, &data[..16]);
     }
 
     #[tokio::test]
