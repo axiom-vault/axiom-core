@@ -227,6 +227,16 @@ async fn read_only_tools_and_resources_go_through_the_agent() {
     assert_eq!(read["size"], 5);
     assert_eq!(read["returned_bytes"], 2);
     assert_eq!(read["truncated"], true);
+    let read = call(
+        &client,
+        "read_file",
+        json!({ "path": "/hello.txt", "offset": 2, "max_bytes": 2 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], "ll");
+    assert_eq!(read["offset"], 2);
+    assert_eq!(read["truncated"], true);
     let metadata = call(&client, "metadata", json!({ "path": "/docs" }))
         .await
         .unwrap();

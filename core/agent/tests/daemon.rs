@@ -13,7 +13,7 @@ use axiomvault_agent::{
     serve, AgentClient, ClientError, DaemonConfig, ErrorKind, Payload, Request, ServerPolicy,
     VaultRoot, LOCKED_MESSAGE,
 };
-use axiomvault_app::{AppService, CreateVaultParams};
+use axiomvault_app::{AppService, CreateVaultParams, OpenVaultParams};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::json;
 use tempfile::TempDir;
@@ -113,6 +113,7 @@ async fn read_text(socket: &Path, path: &str) -> Result<String, ClientError> {
         socket,
         Request::ReadFile {
             path: path.into(),
+            offset: None,
             max_bytes: None,
         },
     )
@@ -391,6 +392,53 @@ async fn malformed_requests_are_refused_without_echo() {
     BufReader::new(stream).read_line(&mut line).await.unwrap();
     assert!(line.contains("invalid_request"), "{line}");
     assert!(!line.contains("hunter2"), "{line}");
+}
+
+#[tokio::test]
+async fn large_files_are_read_in_ranges_and_never_whole() {
+    let fx = fixture().await;
+    // A streamed file larger than one response can carry.
+    let data: Vec<u8> = (0..25 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let source = fx.dir.path().join("big.bin");
+    std::fs::write(&source, &data).unwrap();
+    let app = AppService::new();
+    app.open_vault(OpenVaultParams {
+        password: Zeroizing::new(PASSWORD.into()),
+        provider_type: "local".into(),
+        provider_config: json!({ "root": fx.vault_dir }),
+    })
+    .await
+    .unwrap();
+    app.import_file(source.to_str().unwrap(), "/big.bin")
+        .await
+        .unwrap();
+    app.close_vault().await.unwrap();
+    let socket = unlocked(&fx, ServerPolicy::default()).await;
+    let read = |offset, max_bytes| Request::ReadFile {
+        path: "/big.bin".into(),
+        offset,
+        max_bytes,
+    };
+
+    let (kind, message) = kind(req(&socket, read(None, None)).await);
+    assert_eq!(kind, ErrorKind::InvalidParams);
+    assert!(
+        message.contains(&format!("file is {} bytes", data.len())),
+        "{message}"
+    );
+
+    // Across the boundary between the third and fourth 64 KiB frames.
+    let offset = 3 * 64 * 1024 - 7;
+    for (offset, wanted) in [(None, 0..16), (Some(offset as u64), offset..offset + 20)] {
+        let max_bytes = Some(wanted.len() as u64);
+        match req(&socket, read(offset, max_bytes)).await.unwrap() {
+            Payload::File { content_b64, size } => {
+                assert_eq!(BASE64.decode(content_b64.0).unwrap(), &data[wanted]);
+                assert_eq!(size, data.len() as u64);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]

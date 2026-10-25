@@ -32,9 +32,12 @@ pub enum Request {
         path: String,
     },
     /// Returns at most `max_bytes` of the file (all of it when absent),
-    /// together with the full size.
+    /// starting at byte `offset` (0 when absent), together with the full
+    /// size.
     ReadFile {
         path: String,
+        #[serde(default)]
+        offset: Option<u64>,
         #[serde(default)]
         max_bytes: Option<u64>,
     },
@@ -401,6 +404,7 @@ mod tests {
             Request::ListDirectory { path: "/".into() },
             Request::ReadFile {
                 path: "/a".into(),
+                offset: Some(70_000),
                 max_bytes: Some(5),
             },
             Request::CreateFile {

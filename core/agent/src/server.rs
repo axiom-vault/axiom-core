@@ -398,25 +398,37 @@ impl Agent {
                         .collect(),
                 })
             }
-            Request::ReadFile { path, max_bytes } => {
+            Request::ReadFile {
+                path,
+                offset,
+                max_bytes,
+            } => {
                 let path = policy.root().scope(&path)?;
-                let bytes = app.read_file(&path).await.map_err(app_error)?;
-                let limit = max_bytes.map_or(bytes.len(), |max| {
-                    usize::try_from(max).unwrap_or(usize::MAX).min(bytes.len())
-                });
-                if limit > MAX_READ_BYTES {
+                let offset = offset.unwrap_or(0);
+                // The size comes from the tree, so an oversized read is
+                // refused before anything is decrypted.
+                let size = app.metadata(&path).await.map_err(app_error)?.size;
+                let limit = size
+                    .unwrap_or(0)
+                    .saturating_sub(offset)
+                    .min(max_bytes.unwrap_or(u64::MAX));
+                if limit > MAX_READ_BYTES as u64 {
                     return Err(AgentError::new(
                         ErrorKind::InvalidParams,
                         format!(
                             "file is {} bytes; reads over the socket are capped at {MAX_READ_BYTES}, \
-                             pass max_bytes or use export_file",
-                            bytes.len()
+                             pass max_bytes (and offset) or use export_file",
+                            size.unwrap_or(0)
                         ),
                     ));
                 }
+                let (bytes, size) = app
+                    .read_file_range(&path, offset, limit as usize)
+                    .await
+                    .map_err(app_error)?;
                 Ok(Payload::File {
-                    content_b64: Base64Content(BASE64.encode(&bytes[..limit])),
-                    size: bytes.len() as u64,
+                    content_b64: Base64Content(BASE64.encode(&bytes)),
+                    size,
                 })
             }
             Request::CreateFile { path, content_b64 } => {
