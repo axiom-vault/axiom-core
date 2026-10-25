@@ -14,9 +14,10 @@ use zeroize::Zeroizing;
 pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Sent whenever a request needs an unlocked vault. It names the only way to
-/// unlock: a human at their own terminal.
-pub const LOCKED_MESSAGE: &str =
-    "vault is locked; ask the user to run `axiom-agent unlock` in their own terminal";
+/// unlock: a human at their own terminal. Both spellings of the command are
+/// named, since `axiom` can embed the agent's commands as `axiom agent`.
+pub const LOCKED_MESSAGE: &str = "vault is locked; ask the user to run `axiom-agent unlock` \
+     (or `axiom agent unlock`) in their own terminal";
 
 /// One request to the agent. Unknown fields are an error, so a client cannot
 /// believe it is steering something (such as which vault to unlock) that the

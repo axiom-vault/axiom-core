@@ -51,6 +51,9 @@ axiom-agent lock   [--socket <path>]
 axiom-agent status [--socket <path>]
 ```
 
+Other binaries can embed these commands with `axiomvault_agent::cli::run`,
+e.g. as `axiom agent unlock`; everything below applies to either spelling.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--vault` | required | The local vault this daemon serves, canonicalised at startup (must exist). Unlock opens this vault and no other. |

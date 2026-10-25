@@ -7,6 +7,8 @@
 
 #![cfg(unix)]
 
+#[cfg(feature = "daemon")]
+pub mod cli;
 pub mod client;
 #[cfg(feature = "daemon")]
 pub mod hardening;

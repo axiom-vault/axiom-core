@@ -16,8 +16,8 @@ is unlocked only by the user, in their own terminal, with `axiom-agent unlock`.
 - Read-size caps, ranged reads (`offset`, `max_bytes`) and truncation metadata
 
 There is no tool to create, open or recover a vault. When the vault is locked,
-tools answer "vault is locked; ask the user to run `axiom-agent unlock` in their
-own terminal".
+tools answer "vault is locked; ask the user to run `axiom-agent unlock` (or
+`axiom agent unlock`) in their own terminal".
 
 ## Run
 

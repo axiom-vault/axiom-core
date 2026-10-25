@@ -1,27 +1,34 @@
-//! Command-line front end of the `axiom-agent` binary.
+//! Command-line front end of the agent: the `axiom-agent` binary, and any
+//! binary that embeds the same commands (e.g. as `axiom agent`) through
+//! [`run`].
 
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use axiomvault_agent::{
-    bind_socket, default_socket_path, hardening,
-    protocol::{AgentStatus, UnlockParams},
-    serve, AgentClient, DaemonConfig, Payload, Request, ServerPolicy, VaultRoot,
-};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "usage:
-  axiom-agent serve  --vault <local vault dir> [--socket <path>]
-                     [--socket-mode <octal>] [--allow-writes]
-                     [--allow-file-io=<dir>] [--root <vault path>]
-                     [--idle-lock <secs>] [--max-unlock <secs>]
-                     [--allow-uid <uid>]...
-  axiom-agent unlock [--socket <path>] [--expect-uid <uid>]
-  axiom-agent lock   [--socket <path>]
-  axiom-agent status [--socket <path>]
+use crate::{
+    bind_socket, default_socket_path, hardening,
+    protocol::{AgentStatus, UnlockParams},
+    serve, AgentClient, DaemonConfig, Payload, Request, ServerPolicy, VaultRoot,
+};
+
+/// Usage text, naming the command `program`.
+fn usage(program: &str) -> String {
+    let indent = " ".repeat(program.len() + 10);
+    format!(
+        "usage:
+  {program} serve  --vault <local vault dir> [--socket <path>]
+{indent}[--socket-mode <octal>] [--allow-writes]
+{indent}[--allow-file-io=<dir>] [--root <vault path>]
+{indent}[--idle-lock <secs>] [--max-unlock <secs>]
+{indent}[--allow-uid <uid>]...
+  {program} unlock [--socket <path>] [--expect-uid <uid>]
+  {program} lock   [--socket <path>]
+  {program} status [--socket <path>]
 
   --vault <dir>          the local vault this daemon serves; unlock can open
                          no other
@@ -40,33 +47,77 @@ const USAGE: &str = "usage:
   --expect-uid <uid>     refuse to send the password unless the daemon runs
                          as <uid>
 
-unlock reads the password from the controlling terminal and nowhere else.";
+unlock reads the password from the controlling terminal and nowhere else."
+    )
+}
 
 const DEFAULT_IDLE_LOCK_SECS: u64 = 900;
 /// Upper bound for --idle-lock and --max-unlock: one year.
 const MAX_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
 
-pub fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+/// `-h` or `--help`: [`run`] prints the usage and succeeds.
+#[derive(Debug)]
+struct HelpRequested;
+
+impl std::fmt::Display for HelpRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("help requested")
+    }
+}
+
+impl std::error::Error for HelpRequested {}
+
+/// Runs one agent command. `args` are the arguments after the program name
+/// (or after `agent`, when embedded); `program_name` is how the usage text
+/// and hints name the command, e.g. `axiom-agent` or `axiom agent`.
+///
+/// This is meant to be the whole process's job, called from a plain
+/// (non-async) `main`. It builds its own Tokio runtime, so it refuses to
+/// run inside one, and installs a stderr tracing subscriber unless one is
+/// already set. `serve` makes the process non-dumpable, locks its memory
+/// when it can and stops on SIGINT or SIGTERM; `unlock` also makes the
+/// process non-dumpable. None of that is undone when `run` returns.
+pub fn run<I: IntoIterator<Item = OsString>>(program_name: &str, args: I) -> Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        bail!("{program_name} cannot run inside a Tokio runtime; it starts its own");
+    }
+    // A subscriber the embedding binary installed is kept.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .init();
+        .try_init();
 
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("serve") => run_serve(parse_serve(args)?),
-        Some("unlock") => run_client(parse_unlock(args)?),
-        Some("lock") => run_client(Command::Lock(parse_socket_only(args)?)),
-        Some("status") => run_client(Command::Status(parse_socket_only(args)?)),
-        Some("-h" | "--help") => {
-            println!("{USAGE}");
+    let usage = usage(program_name);
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|arg| anyhow!("argument is not valid UTF-8: {}", arg.to_string_lossy()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut args = args.into_iter();
+    let result = match args.next().as_deref() {
+        Some("serve") => parse_serve(&usage, args).and_then(run_serve),
+        Some("unlock") => {
+            parse_unlock(&usage, args).and_then(|command| run_client(program_name, command))
+        }
+        Some("lock") => parse_socket_only(&usage, args)
+            .and_then(|socket| run_client(program_name, Command::Lock(socket))),
+        Some("status") => parse_socket_only(&usage, args)
+            .and_then(|socket| run_client(program_name, Command::Status(socket))),
+        Some("-h" | "--help") => Err(HelpRequested.into()),
+        Some(other) => bail!("unknown command: {other}\n{usage}"),
+        None => bail!("missing command\n{usage}"),
+    };
+    match result {
+        Err(err) if err.is::<HelpRequested>() => {
+            println!("{usage}");
             Ok(())
         }
-        Some(other) => bail!("unknown command: {other}\n{USAGE}"),
-        None => bail!("missing command\n{USAGE}"),
+        result => result,
     }
 }
 
@@ -102,12 +153,11 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn help_or_unknown(arg: &str) -> anyhow::Error {
+fn help_or_unknown(usage: &str, arg: &str) -> anyhow::Error {
     if matches!(arg, "-h" | "--help") {
-        println!("{USAGE}");
-        std::process::exit(0);
+        return HelpRequested.into();
     }
-    anyhow!("unknown argument: {arg}\n{USAGE}")
+    anyhow!("unknown argument: {arg}\n{usage}")
 }
 
 fn socket_or_default(socket: Option<String>) -> Result<PathBuf> {
@@ -125,7 +175,7 @@ struct ServeOptions {
 
 /// Hand-parsed launch flags. Unknown arguments are an error, so a typo never
 /// silently starts a daemon with different capabilities than intended.
-fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
+fn parse_serve(usage: &str, args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
     let mut allow_writes = false;
     let mut vault_dir = None;
     let mut socket = None;
@@ -169,7 +219,7 @@ fn parse_serve(args: impl IntoIterator<Item = String>) -> Result<ServeOptions> {
         } else if let Some(value) = flag_value(&arg, "--allow-uid", &mut args)? {
             allowed_uids.push(value.parse().context("--allow-uid needs a numeric uid")?);
         } else {
-            return Err(help_or_unknown(&arg));
+            return Err(help_or_unknown(usage, &arg));
         }
     }
     let vault_dir = vault_dir.context("serve needs --vault <local vault dir>")?;
@@ -231,7 +281,7 @@ enum Command {
     Status(PathBuf),
 }
 
-fn parse_unlock(args: impl IntoIterator<Item = String>) -> Result<Command> {
+fn parse_unlock(usage: &str, args: impl IntoIterator<Item = String>) -> Result<Command> {
     let mut socket = None;
     let mut expect_uid = None;
     let mut args = args.into_iter();
@@ -242,7 +292,7 @@ fn parse_unlock(args: impl IntoIterator<Item = String>) -> Result<Command> {
             let uid = value.parse().context("--expect-uid needs a numeric uid")?;
             set_once(&mut expect_uid, uid, "--expect-uid")?;
         } else {
-            return Err(help_or_unknown(&arg));
+            return Err(help_or_unknown(usage, &arg));
         }
     }
     Ok(Command::Unlock {
@@ -251,13 +301,13 @@ fn parse_unlock(args: impl IntoIterator<Item = String>) -> Result<Command> {
     })
 }
 
-fn parse_socket_only(args: impl IntoIterator<Item = String>) -> Result<PathBuf> {
+fn parse_socket_only(usage: &str, args: impl IntoIterator<Item = String>) -> Result<PathBuf> {
     let mut socket = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match flag_value(&arg, "--socket", &mut args)? {
             Some(value) => set_once(&mut socket, value, "--socket")?,
-            None => return Err(help_or_unknown(&arg)),
+            None => return Err(help_or_unknown(usage, &arg)),
         }
     }
     socket_or_default(socket)
@@ -306,30 +356,33 @@ fn run_serve(options: ServeOptions) -> Result<()> {
     })
 }
 
-fn run_client(command: Command) -> Result<()> {
+fn run_client(program: &str, command: Command) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
         match command {
-            Command::Unlock { socket, expect_uid } => unlock(&socket, expect_uid).await,
+            Command::Unlock { socket, expect_uid } => unlock(program, &socket, expect_uid).await,
             Command::Lock(socket) => {
-                connect(&socket).await?.request(&Request::Lock).await?;
+                connect(program, &socket)
+                    .await?
+                    .request(&Request::Lock)
+                    .await?;
                 println!("locked");
                 Ok(())
             }
             Command::Status(socket) => {
-                describe(&socket, &mut connect(&socket).await?).await?;
+                describe(&socket, &mut connect(program, &socket).await?).await?;
                 Ok(())
             }
         }
     })
 }
 
-async fn connect(socket: &std::path::Path) -> Result<AgentClient> {
+async fn connect(program: &str, socket: &std::path::Path) -> Result<AgentClient> {
     AgentClient::connect(socket).await.with_context(|| {
         format!(
-            "cannot reach axiom-agent at {}; is `axiom-agent serve` running?",
+            "cannot reach axiom-agent at {}; is `{program} serve` running?",
             socket.display()
         )
     })
@@ -398,12 +451,12 @@ fn peer_exe(pid: i32) -> String {
     }
 }
 
-async fn unlock(socket: &std::path::Path, expect_uid: Option<u32>) -> Result<()> {
+async fn unlock(program: &str, socket: &std::path::Path, expect_uid: Option<u32>) -> Result<()> {
     // Best effort: this process holds the password only briefly.
     if let Err(err) = hardening::disable_dumping() {
         warn!(%err, "process is dumpable");
     }
-    let mut client = connect(socket).await?;
+    let mut client = connect(program, socket).await?;
     let status = describe(socket, &mut client).await?;
     if let Some(expected) = expect_uid {
         let actual = client.peer().uid();
@@ -412,7 +465,7 @@ async fn unlock(socket: &std::path::Path, expect_uid: Option<u32>) -> Result<()>
         }
     }
     if status.unlocked {
-        bail!("the agent already has a vault unlocked; run `axiom-agent lock` first");
+        bail!("the agent already has a vault unlocked; run `{program} lock` first");
     }
 
     let password = rpassword::prompt_password("Vault password: ")
@@ -420,7 +473,7 @@ async fn unlock(socket: &std::path::Path, expect_uid: Option<u32>) -> Result<()>
         .map_err(|err| {
             anyhow!(
                 "cannot read the password from the controlling terminal ({err}); \
-                 run `axiom-agent unlock` in an interactive terminal"
+                 run `{program} unlock` in an interactive terminal"
             )
         })?;
     let request = Request::Unlock(UnlockParams { password });
@@ -472,6 +525,37 @@ mod tests {
             assert!(reported.contains(field), "{field} not reported: {text}");
             assert!(!checked.contains(field), "{field} shown as checked: {text}");
         }
+    }
+
+    #[test]
+    fn usage_and_hints_name_the_given_program() {
+        let text = usage("axiom agent");
+        for line in [
+            "  axiom agent serve  --vault <local vault dir>",
+            "  axiom agent unlock [--socket <path>]",
+            "  axiom agent lock   [--socket <path>]",
+        ] {
+            assert!(text.contains(line), "{line} missing: {text}");
+        }
+        assert!(!text.contains("axiom-agent unlock"), "{text}");
+        // Continuation lines stay under the first flag.
+        let mut lines = text.lines().skip_while(|line| !line.contains(" serve "));
+        let (serve, next) = (lines.next().unwrap(), lines.next().unwrap());
+        assert_eq!(serve.find("--vault"), next.find("[--socket-mode"));
+
+        let err = run("axiom agent", [OsString::from("bogus")]).unwrap_err();
+        assert!(err.to_string().contains("axiom agent unlock"), "{err}");
+        let err = run("axiom agent", ["lock".into(), "--bogus".into()]).unwrap_err();
+        assert!(err.to_string().contains("axiom agent status"), "{err}");
+        // Help returns instead of exiting the embedding process.
+        assert!(run("axiom agent", [OsString::from("--help")]).is_ok());
+        assert!(run("axiom agent", ["unlock".into(), "-h".into()]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_refuses_to_start_inside_a_runtime() {
+        let err = run("axiom agent", [OsString::from("status")]).unwrap_err();
+        assert!(err.to_string().contains("inside a Tokio runtime"), "{err}");
     }
 
     #[test]

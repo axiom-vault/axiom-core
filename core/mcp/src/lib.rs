@@ -500,7 +500,7 @@ impl AxiomMcpServer {
     async fn safe_readonly_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags; read large files in parts with offset and max_bytes.",
+            "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` (or `axiom agent unlock`) in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags; read large files in parts with offset and max_bytes.",
         )]
     }
 
@@ -528,7 +528,7 @@ impl ServerHandler for AxiomMcpServer {
                 .build(),
         )
         .with_instructions(
-            "AxiomVault MCP server. It is a client of axiom-agent, which holds the vault keys; this server handles no secrets and cannot unlock the vault. If a tool reports that the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal. Mutating tools need an agent launched with --allow-writes; import_file/export_file need --allow-file-io=<dir> and are confined to that directory; vault paths must lie under the agent's --root. Read responses may be truncated.",
+            "AxiomVault MCP server. It is a client of axiom-agent, which holds the vault keys; this server handles no secrets and cannot unlock the vault. If a tool reports that the vault is locked, ask the user to run `axiom-agent unlock` (or `axiom agent unlock`) in their own terminal. Mutating tools need an agent launched with --allow-writes; import_file/export_file need --allow-file-io=<dir> and are confined to that directory; vault paths must lie under the agent's --root. Read responses may be truncated.",
         )
     }
 
