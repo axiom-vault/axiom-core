@@ -386,6 +386,25 @@ impl AppService {
         ops.read_file(&vault_path).await.map_err(AppError::from)
     }
 
+    /// Read at most `max_bytes` of a file from `offset` on, with bounded
+    /// memory and without decrypting the rest of a streamed file. Returns
+    /// the bytes and the file's full size.
+    pub async fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> AppResult<(Vec<u8>, u64)> {
+        let vault_path = Self::parse_path(path)?;
+        let guard = self.active_vault().await?;
+        let active = guard.as_ref().ok_or(AppError::NoOpenVault)?;
+        let ops = Self::ops(active)?;
+
+        ops.read_file_range(&vault_path, offset, max_bytes)
+            .await
+            .map_err(AppError::from)
+    }
+
     /// Update a file in the vault.
     pub async fn update_file(&self, path: &str, content: &[u8]) -> AppResult<()> {
         let vault_path = Self::parse_path(path)?;

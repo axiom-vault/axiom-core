@@ -1,8 +1,8 @@
 //! The daemon: holds the unlocked vault and answers requests on the socket.
 
 use std::{
-    fs::{DirBuilder, Permissions},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
+    fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -109,20 +109,97 @@ impl Timers {
     }
 }
 
+/// Exclusive hold on an agent socket path, taken by [`bind_socket`] and
+/// kept for the daemon's lifetime. Dropping it removes the socket and only
+/// then releases the lock, so a daemon starting meanwhile never finds a
+/// socket of ours to remove. The lock file itself stays behind.
+#[derive(Debug)]
+pub struct SocketLock {
+    socket: PathBuf,
+    _lock: File,
+}
+
+impl Drop for SocketLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 /// Creates the listening socket at `path` with permissions `mode`.
 ///
-/// A missing parent directory is created 0700. An existing socket that
-/// accepts connections means another agent is running, which is an error; a
-/// stale one is removed. Anything else at `path` is left alone and is an
-/// error.
-pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+/// First takes an exclusive `flock` on `<path>.lock`, held by the returned
+/// [`SocketLock`], so of two daemons started together only one gets past
+/// it. The lock file is not followed if it is a symlink, and must be a
+/// regular file owned by the effective uid that group and others cannot
+/// write. An existing socket that accepts connections means another agent is
+/// running, which is an error; a stale one is removed. Anything else at
+/// `path` is left alone and is an error.
+///
+/// A missing parent directory is created 0700. That would shut out the
+/// group a `mode` such as 0660 shares the socket with, so with such a mode
+/// the directory must already exist.
+pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<(UnixListener, SocketLock)> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if !parent.exists() {
+            if mode & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "socket directory {} does not exist; create it first, owned by \
+                         the daemon user and the clients' group with mode 0750 (a \
+                         directory created here would be 0700)",
+                        parent.display()
+                    ),
+                ));
+            }
             DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(parent)?;
         }
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot open lock file {}: {err}", lock_path.display()),
+            )
+        })?;
+    // A lock file someone else owns or can write could be held, or swapped,
+    // by them to keep this daemon from starting or to start beside it.
+    let metadata = lock.metadata()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing lock file {}: it must be a regular file owned by uid {euid} and \
+                 writable only by it (found uid {}, mode {:o}); remove it",
+                lock_path.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            ),
+        ));
+    }
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("another agent holds {}", lock_path.display()),
+            ))
+        }
+        Err(TryLockError::Error(err)) => return Err(err),
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -147,8 +224,12 @@ pub fn bind_socket(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
     // the chmod below the socket has the umask's mode; a peer that connects
     // in that window is still checked against the uid allowlist.
     let listener = UnixListener::bind(path)?;
+    let lock = SocketLock {
+        socket: path.to_path_buf(),
+        _lock: lock,
+    };
     std::fs::set_permissions(path, Permissions::from_mode(mode))?;
-    Ok(listener)
+    Ok((listener, lock))
 }
 
 /// Serves connections on `listener` until the process exits.
@@ -398,25 +479,37 @@ impl Agent {
                         .collect(),
                 })
             }
-            Request::ReadFile { path, max_bytes } => {
+            Request::ReadFile {
+                path,
+                offset,
+                max_bytes,
+            } => {
                 let path = policy.root().scope(&path)?;
-                let bytes = app.read_file(&path).await.map_err(app_error)?;
-                let limit = max_bytes.map_or(bytes.len(), |max| {
-                    usize::try_from(max).unwrap_or(usize::MAX).min(bytes.len())
-                });
-                if limit > MAX_READ_BYTES {
+                let offset = offset.unwrap_or(0);
+                // The size comes from the tree, so an oversized read is
+                // refused before anything is decrypted.
+                let size = app.metadata(&path).await.map_err(app_error)?.size;
+                let limit = size
+                    .unwrap_or(0)
+                    .saturating_sub(offset)
+                    .min(max_bytes.unwrap_or(u64::MAX));
+                if limit > MAX_READ_BYTES as u64 {
                     return Err(AgentError::new(
                         ErrorKind::InvalidParams,
                         format!(
                             "file is {} bytes; reads over the socket are capped at {MAX_READ_BYTES}, \
-                             pass max_bytes or use export_file",
-                            bytes.len()
+                             pass max_bytes (and offset) or use export_file",
+                            size.unwrap_or(0)
                         ),
                     ));
                 }
+                let (bytes, size) = app
+                    .read_file_range(&path, offset, limit as usize)
+                    .await
+                    .map_err(app_error)?;
                 Ok(Payload::File {
-                    content_b64: Base64Content(BASE64.encode(&bytes[..limit])),
-                    size: bytes.len() as u64,
+                    content_b64: Base64Content(BASE64.encode(&bytes)),
+                    size,
                 })
             }
             Request::CreateFile { path, content_b64 } => {

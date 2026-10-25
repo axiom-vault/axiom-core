@@ -8,7 +8,9 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME};
-use crate::freshness::{publication_lock, FreshnessAnchor, FreshnessState as AnchorFreshnessState};
+use crate::freshness::{
+    publication_lock, AnchorKeys, FreshnessAnchor, FreshnessState as AnchorFreshnessState,
+};
 use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
@@ -77,7 +79,7 @@ pub struct VaultSession {
 
 struct FreshnessState {
     anchor: Arc<dyn FreshnessAnchor>,
-    anchor_id: VaultId,
+    anchor_keys: AnchorKeys,
     generation: Mutex<u64>,
 }
 
@@ -105,7 +107,7 @@ impl VaultSession {
         provider: Arc<dyn StorageProvider>,
         tree: VaultTree,
         anchor: Arc<dyn FreshnessAnchor>,
-        anchor_id: VaultId,
+        anchor_keys: AnchorKeys,
         generation: u64,
     ) -> Result<Self> {
         Self::from_master_key_internal(
@@ -115,7 +117,7 @@ impl VaultSession {
             tree,
             Some(FreshnessState {
                 anchor,
-                anchor_id,
+                anchor_keys,
                 generation: Mutex::new(generation),
             }),
         )
@@ -572,7 +574,7 @@ impl VaultSession {
         let publication = self
             .freshness
             .as_ref()
-            .map(|freshness| publication_lock(&freshness.anchor_id))
+            .map(|freshness| publication_lock(freshness.anchor_keys.lock_id()))
             .transpose()?;
         let _publication_guard = match &publication {
             Some(lock) => Some(lock.lock().await),
@@ -603,7 +605,9 @@ impl VaultSession {
             None
         };
 
-        let anchored = freshness.anchor.load_state(&freshness.anchor_id)?;
+        let anchored = freshness
+            .anchor_keys
+            .load_state(freshness.anchor.as_ref())?;
         match (&anchored, &previous_manifest) {
             (None, None) if *generation == 0 => {}
             (Some(state), Some(bytes))
@@ -680,12 +684,12 @@ impl VaultSession {
             manifest_digest: Some(manifest_digest),
         };
         if let Err(error) = freshness
-            .anchor
-            .store_state(&freshness.anchor_id, next_state.clone())
+            .anchor_keys
+            .store_state(freshness.anchor.as_ref(), &next_state)
         {
             freshness
-                .anchor
-                .store_state(&freshness.anchor_id, next_state)
+                .anchor_keys
+                .store_state(freshness.anchor.as_ref(), &next_state)
                 .map_err(|retry| {
                     Error::Storage(format!(
                         "freshness anchor update failed ({error}); durability retry failed ({retry})"

@@ -13,11 +13,11 @@ is unlocked only by the user, in their own terminal, with `axiom-agent unlock`.
 - File and directory tools: `list_directory`, `read_file`, `write_file`, `update_file`, `delete_path`, `mkdir`, `metadata`, `exists`, `import_file`, `export_file`
 - Resources: `axiom://server/status`, `axiom://vault/status`, `axiom://vault/tree` (the tree starts at the agent's `--root`)
 - Static prompts for safe read-only and write workflows
-- Read-size caps and truncation metadata
+- Read-size caps, ranged reads (`offset`, `max_bytes`) and truncation metadata
 
 There is no tool to create, open or recover a vault. When the vault is locked,
-tools answer "vault is locked; ask the user to run `axiom-agent unlock` in their
-own terminal".
+tools answer "vault is locked; ask the user to run `axiom-agent unlock` (or
+`axiom agent unlock`) in their own terminal".
 
 ## Run
 

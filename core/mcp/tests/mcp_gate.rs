@@ -50,17 +50,18 @@ async fn fixture(policy: ServerPolicy) -> Fixture {
     app.close_vault().await.unwrap();
 
     let socket = dir.path().join("agent.sock");
-    let listener = bind_socket(&socket, 0o600).unwrap();
-    tokio::spawn(serve(
-        listener,
-        DaemonConfig {
-            vault_dir,
-            policy,
-            idle_lock: None,
-            max_unlock: None,
-            allowed_uids: vec![dir.path().metadata().unwrap().uid()],
-        },
-    ));
+    let (listener, lock) = bind_socket(&socket, 0o600).unwrap();
+    let config = DaemonConfig {
+        vault_dir,
+        policy,
+        idle_lock: None,
+        max_unlock: None,
+        allowed_uids: vec![dir.path().metadata().unwrap().uid()],
+    };
+    tokio::spawn(async move {
+        let _lock = lock;
+        serve(listener, config).await
+    });
     Fixture { _dir: dir, socket }
 }
 
@@ -226,6 +227,16 @@ async fn read_only_tools_and_resources_go_through_the_agent() {
     assert_eq!(read["content"], "he");
     assert_eq!(read["size"], 5);
     assert_eq!(read["returned_bytes"], 2);
+    assert_eq!(read["truncated"], true);
+    let read = call(
+        &client,
+        "read_file",
+        json!({ "path": "/hello.txt", "offset": 2, "max_bytes": 2 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], "ll");
+    assert_eq!(read["offset"], 2);
     assert_eq!(read["truncated"], true);
     let metadata = call(&client, "metadata", json!({ "path": "/docs" }))
         .await

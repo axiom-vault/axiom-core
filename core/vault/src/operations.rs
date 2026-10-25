@@ -101,6 +101,38 @@ impl Write for PlaintextSender {
     }
 }
 
+/// `Write` sink that keeps plaintext bytes `[skip, skip + wanted)` and drops
+/// the rest. With `stop_when_full`, the write that fills it fails, which
+/// stops the decryptor before it opens any later frame. `wanted` must be
+/// non-zero.
+struct PlaintextWindow {
+    skip: u64,
+    wanted: usize,
+    bytes: Vec<u8>,
+    stop_when_full: bool,
+    /// Set by the write that filled the window and stopped the decryptor.
+    stopped: bool,
+}
+
+impl Write for PlaintextWindow {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip).map_or(bytes.len(), |skip| skip.min(bytes.len()));
+        self.skip -= skipped as u64;
+        let rest = &bytes[skipped..];
+        let take = rest.len().min(self.wanted - self.bytes.len());
+        self.bytes.extend_from_slice(&rest[..take]);
+        if self.stop_when_full && self.bytes.len() == self.wanted {
+            self.stopped = true;
+            return Err(std::io::Error::other("plaintext window is full"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Encrypt a filename under `master_key`.
 fn encrypt_name_with(master_key: &MasterKey, name: &str) -> Result<String> {
     let dir_key = master_key.derive_directory_key(b"names");
@@ -655,6 +687,116 @@ impl<'a> VaultOperations<'a> {
 
         debug!(size = content.len(), "File read");
         Ok(content)
+    }
+
+    /// Read at most `max_bytes` of a file from `offset` on, and the file's
+    /// size as recorded in the authenticated tree.
+    ///
+    /// Only the window is held in memory, and stream frames after it are
+    /// never decrypted. The whole ciphertext is still downloaded and hashed,
+    /// because its digest in the authenticated snapshot is what ties the
+    /// blob to the current generation. Frames before `offset` are decrypted
+    /// and dropped, as the stream can only be authenticated in order; that
+    /// costs about as much as the hashing every read does anyway. A node
+    /// without a digest (written before digests existed) has nothing else
+    /// that would catch a truncated or extended blob, so every frame up to
+    /// the authenticated end frame is decrypted, and all but the window
+    /// dropped. Files written in one piece (content version 0) are read
+    /// whole.
+    pub async fn read_file_range(
+        &self,
+        path: &VaultPath,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, u64)> {
+        let (encrypted_name, expected_digest, content_version, size) = {
+            let tree = self.session.tree().read().await;
+            let node = tree.get_node(path)?;
+            if !node.is_file() {
+                return Err(Error::InvalidInput("Not a file".to_string()));
+            }
+            (
+                node.metadata.encrypted_name.clone(),
+                node.metadata.content_digest.clone(),
+                node.metadata.content_version,
+                node.metadata.size.unwrap_or(0),
+            )
+        };
+        if max_bytes == 0 || offset >= size {
+            return Ok((Vec::new(), size));
+        }
+        if content_version != STREAM_CONTENT_VERSION {
+            let content = self.read_file(path).await?;
+            let start = usize::try_from(offset).map_or(content.len(), |o| o.min(content.len()));
+            let end = start.saturating_add(max_bytes).min(content.len());
+            return Ok((content[start..end].to_vec(), size));
+        }
+
+        let file_key = self
+            .session
+            .master_key()?
+            .derive_file_key(encrypted_name.as_bytes());
+        let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+        let mut stream = self
+            .session
+            .provider()
+            .download_stream(&storage_path)
+            .await?;
+
+        let verify_with_digest = expected_digest.is_some();
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let decrypt_task = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut input = ChunkReceiver {
+                receiver,
+                pending: Vec::new(),
+                offset: 0,
+            };
+            let mut window = PlaintextWindow {
+                skip: offset,
+                wanted: max_bytes,
+                bytes: Vec::new(),
+                stop_when_full: verify_with_digest,
+                stopped: false,
+            };
+            match DecryptingStream::new(&key)?.decrypt_stream(&mut input, &mut window) {
+                Ok(_) => Ok(window.bytes),
+                Err(_) if window.stopped => Ok(window.bytes),
+                Err(error) => Err(error),
+            }
+        });
+        let mut hasher = DigestHasher::new();
+        let mut download_result = Ok(());
+        let mut decrypting = true;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    // Once the decryptor stops (window full or invalid
+                    // frame), the rest is only hashed.
+                    if decrypting && sender.send(chunk).await.is_err() {
+                        decrypting = false;
+                    }
+                }
+                Err(error) => {
+                    download_result = Err(error);
+                    break;
+                }
+            }
+        }
+        drop(sender);
+        let decryption_result = decrypt_task
+            .await
+            .map_err(|error| Error::Storage(format!("decryption task failed: {}", error)))?;
+        download_result?;
+        let bytes = decryption_result?;
+        if expected_digest.is_some_and(|expected| expected != finish_digest(hasher)) {
+            return Err(Error::Crypto(
+                "encrypted file does not match the authenticated snapshot".to_string(),
+            ));
+        }
+        debug!(returned = bytes.len(), size, "File range read");
+        Ok((bytes, size))
     }
 
     /// Update file with new encrypted content.
@@ -1275,6 +1417,135 @@ mod tests {
             std::fs::read(destination).unwrap(),
             b"existing safe content"
         );
+    }
+
+    /// A streamed file five 64 KiB frames and a bit long, with no two
+    /// frames alike.
+    async fn streamed_file(ops: &VaultOperations<'_>, path: &VaultPath) -> Vec<u8> {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.bin");
+        let data: Vec<u8> = (0..5 * 64 * 1024 + 1234).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &data).unwrap();
+        ops.create_file_from_path(path, &source).await.unwrap();
+        data
+    }
+
+    #[tokio::test]
+    async fn range_reads_return_the_window_and_the_full_size() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/large.bin").unwrap();
+        let data = streamed_file(&ops, &path).await;
+        let size = data.len() as u64;
+
+        for (offset, max_bytes) in [
+            (0, 100),
+            // Across the first frame boundary, and across two of them.
+            (64 * 1024 - 10, 20),
+            (64 * 1024 - 1, 64 * 1024 + 2),
+            // The tail, and past it.
+            (data.len() - 5, 100),
+            (0, usize::MAX),
+        ] {
+            let (bytes, total) = ops
+                .read_file_range(&path, offset as u64, max_bytes)
+                .await
+                .unwrap();
+            let end = offset.saturating_add(max_bytes).min(data.len());
+            assert_eq!(
+                bytes,
+                &data[offset..end],
+                "offset {offset}, max {max_bytes}"
+            );
+            assert_eq!(total, size);
+        }
+        for (offset, max_bytes) in [(size, 10), (size + 1, 10), (0, 0)] {
+            let (bytes, total) = ops.read_file_range(&path, offset, max_bytes).await.unwrap();
+            assert!(bytes.is_empty());
+            assert_eq!(total, size);
+        }
+
+        ops.create_file(
+            &VaultPath::parse("/small.txt").unwrap(),
+            b"one-shot content",
+        )
+        .await
+        .unwrap();
+        let (bytes, total) = ops
+            .read_file_range(&VaultPath::parse("/small.txt").unwrap(), 3, 5)
+            .await
+            .unwrap();
+        assert_eq!((bytes.as_slice(), total), (&b"-shot"[..], 16));
+
+        ops.create_directory(&VaultPath::parse("/dir").unwrap())
+            .await
+            .unwrap();
+        assert!(ops
+            .read_file_range(&VaultPath::parse("/dir").unwrap(), 0, 1)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn range_reads_check_the_whole_ciphertext_against_the_snapshot() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/tampered.bin").unwrap();
+        streamed_file(&ops, &path).await;
+
+        // Flip a byte in the last data frame, which a prefix read never
+        // decrypts.
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let stored = session.provider().list(&data_dir).await.unwrap();
+        let stored_path = data_dir.join(&stored[0].name).unwrap();
+        let mut ciphertext = session.provider().download(&stored_path).await.unwrap();
+        let near_end = ciphertext.len() - 200;
+        ciphertext[near_end] ^= 0x80;
+        session
+            .provider()
+            .upload(&stored_path, ciphertext)
+            .await
+            .unwrap();
+
+        let err = ops.read_file_range(&path, 0, 16).await.unwrap_err();
+        assert!(err.to_string().contains("authenticated snapshot"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn range_reads_of_nodes_without_a_digest_verify_the_end_frame() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/old.bin").unwrap();
+        let data = streamed_file(&ops, &path).await;
+        session
+            .tree()
+            .write()
+            .await
+            .get_node_mut(&path)
+            .unwrap()
+            .metadata
+            .content_digest = None;
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let stored = session.provider().list(&data_dir).await.unwrap();
+        let stored_path = data_dir.join(&stored[0].name).unwrap();
+        let ciphertext = session.provider().download(&stored_path).await.unwrap();
+
+        let truncated = ciphertext[..ciphertext.len() - 10].to_vec();
+        let mut extended = ciphertext.clone();
+        extended.extend_from_slice(b"appended");
+        for blob in [truncated, extended] {
+            session.provider().upload(&stored_path, blob).await.unwrap();
+            assert!(ops.read_file(&path).await.is_err());
+            assert!(ops.read_file_range(&path, 0, 16).await.is_err());
+        }
+
+        session
+            .provider()
+            .upload(&stored_path, ciphertext)
+            .await
+            .unwrap();
+        let (bytes, _) = ops.read_file_range(&path, 0, 16).await.unwrap();
+        assert_eq!(bytes, &data[..16]);
     }
 
     #[tokio::test]

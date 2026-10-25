@@ -86,15 +86,14 @@ impl AxiomMcpServer {
         requested.unwrap_or(ceiling).min(ceiling).max(1)
     }
 
-    /// Describes `slice`, the first bytes of something `size` bytes long.
-    /// Text cut inside a character by the size limit is returned up to the
-    /// last whole character rather than switched to base64.
-    fn read_buffer(slice: &[u8], size: usize) -> ReadBuffer {
+    /// Describes `slice`, the bytes at `offset` of something `size` bytes
+    /// long. Text cut inside a character by the size limit is returned up
+    /// to the last whole character rather than switched to base64.
+    fn read_buffer(slice: &[u8], offset: u64, size: u64) -> ReadBuffer {
+        let end = offset.saturating_add(slice.len() as u64);
         let text = match std::str::from_utf8(slice) {
             Ok(text) => Some(text),
-            Err(err)
-                if err.error_len().is_none() && err.valid_up_to() > 0 && size > slice.len() =>
-            {
+            Err(err) if err.error_len().is_none() && err.valid_up_to() > 0 && size > end => {
                 std::str::from_utf8(&slice[..err.valid_up_to()]).ok()
             }
             Err(_) => None,
@@ -107,8 +106,9 @@ impl AxiomMcpServer {
             encoding: encoding.to_string(),
             content,
             size,
+            offset,
             returned_bytes: returned,
-            truncated: size > returned,
+            truncated: size > offset.saturating_add(returned as u64),
         }
     }
 
@@ -231,6 +231,9 @@ pub struct VaultPathArgs {
 #[derive(Clone, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
     pub path: String,
+    /// Byte offset to start reading at (default 0).
+    #[serde(default)]
+    pub offset: Option<u64>,
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
@@ -264,7 +267,8 @@ pub struct ExportFileArgs {
 pub struct ReadBuffer {
     pub encoding: String,
     pub content: String,
-    pub size: usize,
+    pub size: u64,
+    pub offset: u64,
     pub returned_bytes: usize,
     pub truncated: bool,
 }
@@ -338,7 +342,9 @@ impl AxiomMcpServer {
         }
     }
 
-    #[tool(description = "Read a file with size limits and truncation metadata")]
+    #[tool(
+        description = "Read a file, or the part from offset on, with size limits and truncation metadata"
+    )]
     async fn read_file(
         &self,
         Parameters(args): Parameters<ReadFileArgs>,
@@ -347,6 +353,7 @@ impl AxiomMcpServer {
         let (content, size) = match self
             .agent(Request::ReadFile {
                 path: args.path,
+                offset: args.offset,
                 max_bytes: Some(limit as u64),
             })
             .await?
@@ -357,8 +364,7 @@ impl AxiomMcpServer {
         let bytes = BASE64
             .decode(content.0)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        let size = usize::try_from(size).unwrap_or(usize::MAX);
-        ok_json(&Self::read_buffer(&bytes, size))
+        ok_json(&Self::read_buffer(&bytes, args.offset.unwrap_or(0), size))
     }
 
     #[tool(description = "Create a new file inside the vault")]
@@ -493,7 +499,7 @@ impl AxiomMcpServer {
     async fn safe_readonly_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
             PromptMessageRole::Assistant,
-            "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags and request smaller reads when needed.",
+            "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` (or `axiom agent unlock`) in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags; read large files in parts with offset and max_bytes.",
         )]
     }
 
@@ -521,7 +527,7 @@ impl ServerHandler for AxiomMcpServer {
                 .build(),
         )
         .with_instructions(
-            "AxiomVault MCP server. It is a client of axiom-agent, which holds the vault keys; this server handles no secrets and cannot unlock the vault. If a tool reports that the vault is locked, ask the user to run `axiom-agent unlock` in their own terminal. Mutating tools need an agent launched with --allow-writes; import_file/export_file need --allow-file-io=<dir> and are confined to that directory; vault paths must lie under the agent's --root. Read responses may be truncated.",
+            "AxiomVault MCP server. It is a client of axiom-agent, which holds the vault keys; this server handles no secrets and cannot unlock the vault. If a tool reports that the vault is locked, ask the user to run `axiom-agent unlock` (or `axiom agent unlock`) in their own terminal. Mutating tools need an agent launched with --allow-writes; import_file/export_file need --allow-file-io=<dir> and are confined to that directory; vault paths must lie under the agent's --root. Read responses may be truncated.",
         )
     }
 
@@ -609,16 +615,23 @@ mod tests {
 
     #[test]
     fn read_buffer_marks_truncation_and_size() {
-        let output = AxiomMcpServer::read_buffer(b"hello", 11);
+        let output = AxiomMcpServer::read_buffer(b"hello", 0, 11);
         assert_eq!(output.content, "hello");
         assert_eq!(output.returned_bytes, 5);
         assert_eq!(output.size, 11);
+        assert!(output.truncated);
+
+        // A read at an offset is truncated only if bytes follow it.
+        let output = AxiomMcpServer::read_buffer(b"world", 6, 11);
+        assert_eq!(output.offset, 6);
+        assert!(!output.truncated);
+        let output = AxiomMcpServer::read_buffer(b"wor", 6, 11);
         assert!(output.truncated);
     }
 
     #[test]
     fn read_buffer_uses_base64_for_binary_content() {
-        let output = AxiomMcpServer::read_buffer(&[0, 159, 146, 150], 4);
+        let output = AxiomMcpServer::read_buffer(&[0, 159, 146, 150], 0, 4);
         assert_eq!(output.encoding, "base64");
         assert!(!output.content.is_empty());
         assert!(!output.truncated);
@@ -627,7 +640,7 @@ mod tests {
     #[test]
     fn read_buffer_backs_off_to_a_character_boundary() {
         // "aé" is 61 c3 a9; a 2-byte read cuts the é in half.
-        let output = AxiomMcpServer::read_buffer("aé".as_bytes().get(..2).unwrap(), 3);
+        let output = AxiomMcpServer::read_buffer("aé".as_bytes().get(..2).unwrap(), 0, 3);
         assert_eq!(output.encoding, "utf-8");
         assert_eq!(output.content, "a");
         assert_eq!(output.returned_bytes, 1);
@@ -635,9 +648,9 @@ mod tests {
 
         // A cut before the first whole character, and a file that really
         // ends mid-character, are not text.
-        let output = AxiomMcpServer::read_buffer(&"é".as_bytes()[..1], 2);
+        let output = AxiomMcpServer::read_buffer(&"é".as_bytes()[..1], 0, 2);
         assert_eq!(output.encoding, "base64");
-        let output = AxiomMcpServer::read_buffer(&"aé".as_bytes()[..2], 2);
+        let output = AxiomMcpServer::read_buffer(&"aé".as_bytes()[..2], 0, 2);
         assert_eq!(output.encoding, "base64");
         assert!(!output.truncated);
     }

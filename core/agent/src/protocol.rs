@@ -14,9 +14,10 @@ use zeroize::Zeroizing;
 pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Sent whenever a request needs an unlocked vault. It names the only way to
-/// unlock: a human at their own terminal.
-pub const LOCKED_MESSAGE: &str =
-    "vault is locked; ask the user to run `axiom-agent unlock` in their own terminal";
+/// unlock: a human at their own terminal. Both spellings of the command are
+/// named, since `axiom` can embed the agent's commands as `axiom agent`.
+pub const LOCKED_MESSAGE: &str = "vault is locked; ask the user to run `axiom-agent unlock` \
+     (or `axiom agent unlock`) in their own terminal";
 
 /// One request to the agent. Unknown fields are an error, so a client cannot
 /// believe it is steering something (such as which vault to unlock) that the
@@ -32,9 +33,13 @@ pub enum Request {
         path: String,
     },
     /// Returns at most `max_bytes` of the file (all of it when absent),
-    /// together with the full size.
+    /// starting at byte `offset` (0 when absent), together with the full
+    /// size. An absent `offset` is left off the wire, so daemons that
+    /// predate it still accept the request.
     ReadFile {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
         #[serde(default)]
         max_bytes: Option<u64>,
     },
@@ -401,6 +406,7 @@ mod tests {
             Request::ListDirectory { path: "/".into() },
             Request::ReadFile {
                 path: "/a".into(),
+                offset: Some(70_000),
                 max_bytes: Some(5),
             },
             Request::CreateFile {
@@ -434,6 +440,20 @@ mod tests {
         assert_eq!(
             value,
             json!({ "op": "unlock", "password": "correct horse battery staple" })
+        );
+    }
+
+    #[test]
+    fn read_without_offset_omits_it_for_older_daemons() {
+        let value = serde_json::to_value(Request::ReadFile {
+            path: "/a".into(),
+            offset: None,
+            max_bytes: Some(5),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({ "op": "read_file", "path": "/a", "max_bytes": 5 })
         );
     }
 

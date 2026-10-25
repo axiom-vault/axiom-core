@@ -13,7 +13,7 @@ use axiomvault_agent::{
     serve, AgentClient, ClientError, DaemonConfig, ErrorKind, Payload, Request, ServerPolicy,
     VaultRoot, LOCKED_MESSAGE,
 };
-use axiomvault_app::{AppService, CreateVaultParams};
+use axiomvault_app::{AppService, CreateVaultParams, OpenVaultParams};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::json;
 use tempfile::TempDir;
@@ -72,8 +72,11 @@ impl Fixture {
             .dir
             .path()
             .join(format!("agent-{}.sock", rand_suffix()));
-        let listener = bind_socket(&socket, 0o600).unwrap();
-        tokio::spawn(serve(listener, config));
+        let (listener, lock) = bind_socket(&socket, 0o600).unwrap();
+        tokio::spawn(async move {
+            let _lock = lock;
+            serve(listener, config).await
+        });
         socket
     }
 
@@ -113,6 +116,7 @@ async fn read_text(socket: &Path, path: &str) -> Result<String, ClientError> {
         socket,
         Request::ReadFile {
             path: path.into(),
+            offset: None,
             max_bytes: None,
         },
     )
@@ -394,31 +398,147 @@ async fn malformed_requests_are_refused_without_echo() {
 }
 
 #[tokio::test]
+async fn large_files_are_read_in_ranges_and_never_whole() {
+    let fx = fixture().await;
+    // A streamed file larger than one response can carry.
+    let data: Vec<u8> = (0..25 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let source = fx.dir.path().join("big.bin");
+    std::fs::write(&source, &data).unwrap();
+    let app = AppService::new();
+    app.open_vault(OpenVaultParams {
+        password: Zeroizing::new(PASSWORD.into()),
+        provider_type: "local".into(),
+        provider_config: json!({ "root": fx.vault_dir }),
+    })
+    .await
+    .unwrap();
+    app.import_file(source.to_str().unwrap(), "/big.bin")
+        .await
+        .unwrap();
+    app.close_vault().await.unwrap();
+    let socket = unlocked(&fx, ServerPolicy::default()).await;
+    let read = |offset, max_bytes| Request::ReadFile {
+        path: "/big.bin".into(),
+        offset,
+        max_bytes,
+    };
+
+    let (kind, message) = kind(req(&socket, read(None, None)).await);
+    assert_eq!(kind, ErrorKind::InvalidParams);
+    assert!(
+        message.contains(&format!("file is {} bytes", data.len())),
+        "{message}"
+    );
+
+    // Across the boundary between the third and fourth 64 KiB frames.
+    let offset = 3 * 64 * 1024 - 7;
+    for (offset, wanted) in [(None, 0..16), (Some(offset as u64), offset..offset + 20)] {
+        let max_bytes = Some(wanted.len() as u64);
+        match req(&socket, read(offset, max_bytes)).await.unwrap() {
+            Payload::File { content_b64, size } => {
+                assert_eq!(BASE64.decode(content_b64.0).unwrap(), &data[wanted]);
+                assert_eq!(size, data.len() as u64);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn socket_setup_refuses_a_live_agent_and_replaces_a_stale_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("run/agent.sock");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
-    let listener = bind_socket(&socket, 0o600).unwrap();
-    let parent_mode = std::fs::metadata(dir.path().join("run"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(parent_mode & 0o777, 0o700);
-    let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
+    // A directory created here would be 0700 and shut out the group that a
+    // 660 socket is shared with.
+    let err = bind_socket(&socket, 0o660).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(!dir.path().join("run").exists());
+
+    let (listener, lock) = bind_socket(&socket, 0o600).unwrap();
+    assert_eq!(mode(&dir.path().join("run")), 0o700);
+    assert_eq!(mode(&socket), 0o600);
+    assert_eq!(mode(&dir.path().join("run/agent.sock.lock")), 0o600);
 
     let err = bind_socket(&socket, 0o600).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(err.to_string().contains("another agent holds"), "{err}");
+    // The lock decides, not the socket file.
+    std::fs::remove_file(&socket).unwrap();
+    assert!(bind_socket(&socket, 0o600).is_err());
 
+    // Dropping the lock removes the socket and lets a new daemon start.
     drop(listener);
-    bind_socket(&socket, 0o660).unwrap();
-    let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o660);
+    drop(lock);
+    assert!(!socket.exists());
+    let (_listener, _lock) = bind_socket(&socket, 0o660).unwrap();
+    assert_eq!(mode(&socket), 0o660);
+
+    // A stale socket that no daemon holds a lock for is replaced.
+    let stale = dir.path().join("stale.sock");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    bind_socket(&stale, 0o600).unwrap();
 
     let file = dir.path().join("not-a-socket");
     std::fs::write(&file, b"keep").unwrap();
     bind_socket(&file, 0o600).unwrap_err();
     assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+}
+
+#[tokio::test]
+async fn untrusted_lock_files_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A symlink at the lock path is not followed.
+    let socket = dir.path().join("a.sock");
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("a.sock.lock")).unwrap();
+    let err = bind_socket(&socket, 0o600).unwrap_err();
+    assert!(err.to_string().contains("a.sock.lock"), "{err}");
+    assert!(!socket.exists());
+
+    // Nor is a lock file that others can write.
+    let socket = dir.path().join("b.sock");
+    let lock = dir.path().join("b.sock.lock");
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let err = bind_socket(&socket, 0o600).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(err.to_string().contains("mode 666"), "{err}");
+    assert!(!socket.exists());
+}
+
+/// Two daemons started together on a stale socket: both used to see it as
+/// stale, and the loser kept running on an unlinked socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_starts_leave_exactly_one_daemon() {
+    for _ in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let starts: Vec<_> = (0..2)
+            .map(|_| {
+                let (socket, barrier) = (socket.clone(), barrier.clone());
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    bind_socket(&socket, 0o600)
+                })
+            })
+            .collect();
+        let mut started = Vec::new();
+        for start in starts {
+            match start.await.unwrap() {
+                Ok(bound) => started.push(bound),
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}"),
+            }
+        }
+        assert_eq!(started.len(), 1);
+        // The socket on disk is the winner's.
+        std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    }
 }
 
 #[tokio::test]

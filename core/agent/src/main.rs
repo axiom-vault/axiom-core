@@ -1,9 +1,6 @@
 #[cfg(unix)]
-mod cli;
-
-#[cfg(unix)]
 fn main() -> anyhow::Result<()> {
-    cli::main()
+    axiomvault_agent::cli::run("axiom-agent", std::env::args_os().skip(1))
 }
 
 #[cfg(not(unix))]
