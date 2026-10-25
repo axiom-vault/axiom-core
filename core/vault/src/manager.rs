@@ -1,5 +1,6 @@
 //! Vault manager for creating and managing vaults.
 
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
@@ -80,6 +81,50 @@ fn needs_format_upgrade(config: &VaultConfig, allow_upgrade: bool) -> Result<boo
 
 fn is_oauth_cloud_provider(provider_type: &str) -> bool {
     matches!(provider_type, "gdrive" | "dropbox" | "onedrive")
+}
+
+/// A local provider's `root` as the filesystem resolves it: absolute, with
+/// symlinks, `.`, `..` and trailing slashes resolved. A root that does not
+/// exist yet, as for a vault being created, resolves through its nearest
+/// existing ancestor. A root that cannot be resolved is refused, never keyed
+/// as typed, since the anchor key must not depend on how the path is spelt.
+fn canonical_local_root(provider_config: &serde_json::Value) -> Result<String> {
+    let root = provider_config
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::InvalidInput("local provider config requires 'root'".to_string()))?;
+    let unresolvable = |detail: &dyn std::fmt::Display| {
+        Error::InvalidInput(format!("cannot resolve local vault root {root}: {detail}"))
+    };
+    let mut existing = Path::new(root).components();
+    let mut missing = Vec::new();
+    let resolved = loop {
+        let candidate = match existing.as_path() {
+            path if path.as_os_str().is_empty() => Path::new("."),
+            path => path,
+        };
+        match std::fs::canonicalize(candidate) {
+            Ok(resolved) => break resolved,
+            // A dangling symlink is not a directory still to be created.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(candidate).is_err() =>
+            {
+                match existing.next_back() {
+                    Some(Component::Normal(name)) => missing.push(name),
+                    _ => return Err(unresolvable(&error)),
+                }
+            }
+            Err(error) => return Err(unresolvable(&error)),
+        }
+    };
+    missing
+        .into_iter()
+        .rev()
+        .fold(resolved, |path, name| path.join(name))
+        .into_os_string()
+        .into_string()
+        .map_err(|_| unresolvable(&"not valid UTF-8"))
 }
 
 /// Resolves an opaque credential reference using local-only storage.
@@ -194,18 +239,37 @@ impl VaultManager {
         VaultId::new(format!("anchor-{}", digest(&material)))
     }
 
+    /// Anchor keys for a location, or for `vault_id` at it: the key to use,
+    /// and the one earlier builds derived from a local root as typed, when
+    /// that differs. A local root is keyed as the filesystem resolves it, so
+    /// every spelling of one directory finds the same anchor.
+    fn anchor_ids(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+        vault_id: Option<&VaultId>,
+    ) -> Result<(VaultId, Option<VaultId>)> {
+        let namespace = Some(self.ephemeral_namespace.as_str());
+        let as_typed =
+            Self::freshness_id_from(provider_type, provider_config, vault_id, namespace)?;
+        if provider_type != "local" {
+            return Ok((as_typed, None));
+        }
+        let resolved = serde_json::json!({ "root": canonical_local_root(provider_config)? });
+        let anchor_id = Self::freshness_id_from(provider_type, &resolved, vault_id, namespace)?;
+        let legacy_id = (as_typed != anchor_id).then_some(as_typed);
+        Ok((anchor_id, legacy_id))
+    }
+
     fn freshness_id(
         &self,
         provider_type: &str,
         provider_config: &serde_json::Value,
         vault_id: &VaultId,
     ) -> Result<VaultId> {
-        Self::freshness_id_from(
-            provider_type,
-            provider_config,
-            Some(vault_id),
-            Some(&self.ephemeral_namespace),
-        )
+        Ok(self
+            .anchor_ids(provider_type, provider_config, Some(vault_id))?
+            .0)
     }
 
     /// Anchor key for the provider location alone. `config.id` comes from the
@@ -216,12 +280,52 @@ impl VaultManager {
         provider_type: &str,
         provider_config: &serde_json::Value,
     ) -> Result<VaultId> {
-        Self::freshness_id_from(
-            provider_type,
-            provider_config,
-            None,
-            Some(&self.ephemeral_namespace),
-        )
+        Ok(self.anchor_ids(provider_type, provider_config, None)?.0)
+    }
+
+    /// The trusted state of `vault_id` at this location, and its anchor key.
+    /// A state that only the legacy as-typed key holds, or that is newer
+    /// there, is copied to the anchor key first: opening a vault through a
+    /// new spelling of its path must neither bootstrap a fresh anchor for it
+    /// (trust on first use) nor forget a higher generation.
+    fn load_anchor_state(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+        vault_id: &VaultId,
+    ) -> Result<(VaultId, Option<FreshnessState>)> {
+        let (anchor_id, legacy_id) =
+            self.anchor_ids(provider_type, provider_config, Some(vault_id))?;
+        let mut state = self.freshness_anchor.load_state(&anchor_id)?;
+        if let Some(legacy_id) = legacy_id {
+            if let Some(legacy) = self.freshness_anchor.load_state(&legacy_id)? {
+                if state
+                    .as_ref()
+                    .is_none_or(|current| legacy.generation > current.generation)
+                {
+                    self.freshness_anchor
+                        .store_state(&anchor_id, legacy.clone())?;
+                    state = Some(legacy);
+                }
+            }
+        }
+        Ok((anchor_id, state))
+    }
+
+    /// Whether this device has a location marker for this location, under
+    /// the anchor key or the legacy as-typed one.
+    fn location_anchored(
+        &self,
+        provider_type: &str,
+        provider_config: &serde_json::Value,
+    ) -> Result<bool> {
+        let (location_id, legacy_id) = self.anchor_ids(provider_type, provider_config, None)?;
+        for id in std::iter::once(location_id).chain(legacy_id) {
+            if self.freshness_anchor.load(&id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn mark_location_anchored(
@@ -313,8 +417,9 @@ impl VaultManager {
         provider_config: serde_json::Value,
         kdf_params: KdfParams,
     ) -> Result<VaultCreation> {
-        let anchor_id = self.freshness_id(provider_type, &provider_config, &vault_id)?;
-        if self.freshness_anchor.load(&anchor_id)?.is_some() {
+        let (anchor_id, anchored_state) =
+            self.load_anchor_state(provider_type, &provider_config, &vault_id)?;
+        if anchored_state.is_some() {
             return Err(Error::AlreadyExists(
                 "freshness anchor already exists for vault ID".to_string(),
             ));
@@ -456,8 +561,8 @@ impl VaultManager {
             }
             let mut config = snapshot_config;
             let upgrade = needs_format_upgrade(&config, allow_upgrade)?;
-            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
+            let (anchor_id, anchored_state) =
+                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(format!(
@@ -510,10 +615,9 @@ impl VaultManager {
         let config_bytes = provider.download(&config_path).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
 
-        let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-        let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
-        let location_id = self.location_freshness_id(provider_type, &provider_config)?;
-        let location_anchored = self.freshness_anchor.load(&location_id)?.is_some();
+        let (anchor_id, anchored_state) =
+            self.load_anchor_state(provider_type, &provider_config, &config.id)?;
+        let location_anchored = self.location_anchored(provider_type, &provider_config)?;
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
@@ -642,8 +746,8 @@ impl VaultManager {
             if upgrade {
                 config.verify_recovery_key_binding(&recovery_key, &master_key)?;
             }
-            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
+            let (anchor_id, anchored_state) =
+                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
             if let Some(accepted) = &anchored_state {
                 if manifest.generation < accepted.generation {
                     return Err(Error::Conflict(
@@ -672,10 +776,11 @@ impl VaultManager {
             let _ = provider.upload(&config_path, snapshot_config_bytes).await;
             (tree, manifest.generation, upgrade)
         } else {
-            let anchor_id = self.freshness_id(provider_type, &provider_config, &config.id)?;
-            let anchored_state = self.freshness_anchor.load_state(&anchor_id)?;
-            let location_id = self.location_freshness_id(provider_type, &provider_config)?;
-            if anchored_state.is_some() || self.freshness_anchor.load(&location_id)?.is_some() {
+            let (_, anchored_state) =
+                self.load_anchor_state(provider_type, &provider_config, &config.id)?;
+            if anchored_state.is_some()
+                || self.location_anchored(provider_type, &provider_config)?
+            {
                 return Err(Error::Conflict(
                     "snapshot manifest missing for a vault with trusted freshness state"
                         .to_string(),
@@ -5442,6 +5547,262 @@ mod tests {
                 "untagged-v1-1",
             )
             .await;
+        }
+    }
+
+    /// Freshness anchors of real local vaults, opened through different
+    /// spellings of their path.
+    #[cfg(unix)]
+    mod local_anchor {
+        use super::*;
+
+        /// A local vault created at `<tmp>/real/vault`, with spellings of its
+        /// root that all name the same directory.
+        struct LocalVault {
+            temp: tempfile::TempDir,
+            canonical: std::path::PathBuf,
+            id: VaultId,
+        }
+
+        impl LocalVault {
+            fn new(name: &str) -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let real = std::fs::canonicalize(temp.path()).unwrap().join("real");
+                std::fs::create_dir(&real).unwrap();
+                std::os::unix::fs::symlink(&real, temp.path().join("alias")).unwrap();
+                Self {
+                    canonical: real.join("vault"),
+                    temp,
+                    id: VaultId::new(name).unwrap(),
+                }
+            }
+
+            fn config(root: impl AsRef<Path>) -> serde_json::Value {
+                serde_json::json!({ "root": root.as_ref().to_str().unwrap() })
+            }
+
+            /// Through a symlinked parent directory.
+            fn alias(&self) -> serde_json::Value {
+                Self::config(self.temp.path().join("alias/vault"))
+            }
+
+            /// Relative to the working directory.
+            fn relative(&self) -> serde_json::Value {
+                let up = std::env::current_dir().unwrap().components().count() - 1;
+                let absolute = self.canonical.strip_prefix("/").unwrap();
+                Self::config(Path::new(&"../".repeat(up)).join(absolute))
+            }
+
+            fn trailing_slash(&self) -> serde_json::Value {
+                Self::config(format!("{}/", self.canonical.display()))
+            }
+
+            fn copy(&self, to: &str) -> std::path::PathBuf {
+                let target = self.temp.path().join(to);
+                copy_dir(&self.canonical, &target);
+                target
+            }
+
+            fn restore(&self, from: &Path) {
+                std::fs::remove_dir_all(&self.canonical).unwrap();
+                copy_dir(from, &self.canonical);
+            }
+        }
+
+        fn copy_dir(from: &Path, to: &Path) {
+            std::fs::create_dir(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &to.join(entry.file_name()));
+                } else {
+                    std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+
+        fn local_manager(anchor: Arc<dyn FreshnessAnchor>) -> VaultManager {
+            VaultManager::with_registry_and_anchor(create_default_registry(), anchor)
+        }
+
+        async fn add_file(session: &VaultSession, name: &str) {
+            crate::operations::VaultOperations::new(session)
+                .unwrap()
+                .create_file(&VaultPath::parse(name).unwrap(), b"content")
+                .await
+                .unwrap();
+        }
+
+        fn is_rollback(result: Result<VaultSession>) -> bool {
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("rollback detected"))
+        }
+
+        #[tokio::test]
+        async fn local_anchor_follows_the_directory_not_the_spelling_of_its_path() {
+            let vault = LocalVault::new("local-spellings");
+            let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = local_manager(anchor.clone());
+            let canonical = LocalVault::config(&vault.canonical);
+            let creation = manager
+                .create_vault(
+                    vault.id.clone(),
+                    b"password",
+                    "local",
+                    canonical.clone(),
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
+            add_file(&creation.session, "/one").await;
+            drop(creation);
+            let generation_two = vault.copy("generation-two");
+
+            let anchor_id = manager
+                .freshness_id("local", &canonical, &vault.id)
+                .unwrap();
+            for spelling in [vault.alias(), vault.relative(), vault.trailing_slash()] {
+                assert_eq!(
+                    manager.freshness_id("local", &spelling, &vault.id).unwrap(),
+                    anchor_id,
+                    "{spelling}"
+                );
+            }
+
+            let session = manager
+                .open_vault("local", vault.alias(), b"password")
+                .await
+                .unwrap();
+            add_file(&session, "/two").await;
+            drop(session);
+            assert_eq!(anchor.load(&anchor_id).unwrap(), Some(3));
+
+            vault.restore(&generation_two);
+            for spelling in [vault.alias(), vault.relative(), canonical] {
+                assert!(
+                    is_rollback(
+                        manager
+                            .open_vault("local", spelling.clone(), b"password")
+                            .await
+                    ),
+                    "{spelling}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn legacy_anchor_under_the_typed_root_is_honoured_and_migrated() {
+            let vault = LocalVault::new("local-legacy");
+            let creator = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = local_manager(creator.clone());
+            let canonical = LocalVault::config(&vault.canonical);
+            let creation = manager
+                .create_vault(
+                    vault.id.clone(),
+                    b"password",
+                    "local",
+                    canonical.clone(),
+                    KdfParams::moderate(),
+                )
+                .await
+                .unwrap();
+            add_file(&creation.session, "/one").await;
+            let generation_two = vault.copy("generation-two");
+            add_file(&creation.session, "/two").await;
+            drop(creation);
+            let generation_three = vault.copy("generation-three");
+
+            let anchor_id = manager
+                .freshness_id("local", &canonical, &vault.id)
+                .unwrap();
+            let current = creator.load_state(&anchor_id).unwrap().unwrap();
+            // What an older build stored after opening through the alias.
+            let legacy_id =
+                VaultManager::freshness_id_from("local", &vault.alias(), Some(&vault.id), None)
+                    .unwrap();
+            assert_ne!(legacy_id, anchor_id);
+
+            // Only the legacy key: honoured, and copied to the canonical key.
+            let device = Arc::new(InMemoryFreshnessAnchor::new());
+            device.store_state(&legacy_id, current.clone()).unwrap();
+            let manager = local_manager(device.clone());
+            vault.restore(&generation_two);
+            assert!(is_rollback(
+                manager
+                    .open_vault("local", vault.alias(), b"password")
+                    .await
+            ));
+            assert_eq!(
+                device.load_state(&anchor_id).unwrap(),
+                Some(current.clone())
+            );
+            assert!(is_rollback(
+                manager
+                    .open_vault("local", canonical.clone(), b"password")
+                    .await
+            ));
+
+            // Both keys: the higher generation wins.
+            let device = Arc::new(InMemoryFreshnessAnchor::new());
+            device.store(&anchor_id, current.generation - 1).unwrap();
+            device.store_state(&legacy_id, current.clone()).unwrap();
+            let manager = local_manager(device.clone());
+            assert!(is_rollback(
+                manager
+                    .open_vault("local", vault.alias(), b"password")
+                    .await
+            ));
+            vault.restore(&generation_three);
+            manager
+                .open_vault("local", vault.alias(), b"password")
+                .await
+                .unwrap();
+            assert_eq!(device.load_state(&anchor_id).unwrap(), Some(current));
+
+            // A legacy location marker still refuses a vault whose manifest is gone.
+            let device = Arc::new(InMemoryFreshnessAnchor::new());
+            let legacy_location =
+                VaultManager::freshness_id_from("local", &vault.alias(), None, None).unwrap();
+            device.store(&legacy_location, 0).unwrap();
+            std::fs::remove_file(vault.canonical.join(META_DIRNAME).join(MANIFEST_FILENAME))
+                .unwrap();
+            let error = local_manager(device)
+                .open_vault("local", vault.alias(), b"password")
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("snapshot manifest missing"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn unresolvable_local_roots_are_refused() {
+            let temp = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(temp.path().join("nowhere"), temp.path().join("dangling"))
+                .unwrap();
+            for root in [
+                temp.path().join("dangling/vault"),
+                temp.path().join("missing/.."),
+            ] {
+                assert!(
+                    canonical_local_root(&LocalVault::config(&root)).is_err(),
+                    "{}",
+                    root.display()
+                );
+            }
+            assert!(canonical_local_root(&serde_json::json!({})).is_err());
+            let nested = temp.path().join("a/b/vault");
+            assert_eq!(
+                canonical_local_root(&LocalVault::config(&nested)).unwrap(),
+                std::fs::canonicalize(temp.path())
+                    .unwrap()
+                    .join("a/b/vault")
+                    .to_str()
+                    .unwrap()
+            );
         }
     }
 }
