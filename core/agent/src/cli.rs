@@ -75,7 +75,9 @@ impl std::error::Error for HelpRequested {}
 /// (non-async) `main`. It builds its own Tokio runtime, so it refuses to
 /// run inside one, and installs a stderr tracing subscriber unless one is
 /// already set. `serve` makes the process non-dumpable, locks its memory
-/// when it can and stops on SIGINT or SIGTERM; `unlock` also makes the
+/// when it can, and installs SIGINT and SIGTERM handlers to stop on; those
+/// handlers stay registered in the process after `run` returns, so the
+/// signals no longer terminate it by default. `unlock` also makes the
 /// process non-dumpable. None of that is undone when `run` returns.
 pub fn run<I: IntoIterator<Item = OsString>>(program_name: &str, args: I) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() {
