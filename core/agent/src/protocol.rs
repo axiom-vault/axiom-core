@@ -34,10 +34,11 @@ pub enum Request {
     },
     /// Returns at most `max_bytes` of the file (all of it when absent),
     /// starting at byte `offset` (0 when absent), together with the full
-    /// size.
+    /// size. An absent `offset` is left off the wire, so daemons that
+    /// predate it still accept the request.
     ReadFile {
         path: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
         #[serde(default)]
         max_bytes: Option<u64>,
@@ -439,6 +440,20 @@ mod tests {
         assert_eq!(
             value,
             json!({ "op": "unlock", "password": "correct horse battery staple" })
+        );
+    }
+
+    #[test]
+    fn read_without_offset_omits_it_for_older_daemons() {
+        let value = serde_json::to_value(Request::ReadFile {
+            path: "/a".into(),
+            offset: None,
+            max_bytes: Some(5),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({ "op": "read_file", "path": "/a", "max_bytes": 5 })
         );
     }
 

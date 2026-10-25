@@ -350,11 +350,10 @@ impl AxiomMcpServer {
         Parameters(args): Parameters<ReadFileArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = Self::read_limit(args.max_bytes, MAX_READ_BYTES);
-        let offset = args.offset.unwrap_or(0);
         let (content, size) = match self
             .agent(Request::ReadFile {
                 path: args.path,
-                offset: Some(offset),
+                offset: args.offset,
                 max_bytes: Some(limit as u64),
             })
             .await?
@@ -365,7 +364,7 @@ impl AxiomMcpServer {
         let bytes = BASE64
             .decode(content.0)
             .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-        ok_json(&Self::read_buffer(&bytes, offset, size))
+        ok_json(&Self::read_buffer(&bytes, args.offset.unwrap_or(0), size))
     }
 
     #[tool(description = "Create a new file inside the vault")]
