@@ -81,6 +81,9 @@ struct FreshnessState {
     anchor: Arc<dyn FreshnessAnchor>,
     anchor_keys: AnchorKeys,
     generation: Mutex<u64>,
+    /// `vault.config` bytes this session last wrote, so publishing an
+    /// unchanged config does not rewrite and resync the cache every time.
+    written_config: StdMutex<Option<Vec<u8>>>,
 }
 
 impl VaultSession {
@@ -119,6 +122,7 @@ impl VaultSession {
                 anchor,
                 anchor_keys,
                 generation: Mutex::new(generation),
+                written_config: StdMutex::new(None),
             }),
         )
     }
@@ -699,7 +703,21 @@ impl VaultSession {
         }
         // Compatibility caches for health tooling and pre-manifest readers. They
         // are deliberately written after the manifest commit and never authoritative.
-        let _ = self.provider.upload(&config_path, config_bytes).await;
+        let config_written = freshness
+            .written_config
+            .lock()
+            .is_ok_and(|written| written.as_deref() == Some(config_bytes.as_slice()));
+        if !config_written
+            && self
+                .provider
+                .upload(&config_path, config_bytes.clone())
+                .await
+                .is_ok()
+        {
+            if let Ok(mut written) = freshness.written_config.lock() {
+                *written = Some(config_bytes);
+            }
+        }
         let _ = self.provider.upload(&tree_path, encrypted).await;
         if let Some(previous) = previous {
             if previous.version == 2 {
