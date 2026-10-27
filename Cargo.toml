@@ -53,6 +53,7 @@ clap_complete = "4.6"
 
 # Testing
 proptest = "1.0"
+criterion = { version = "0.5", default-features = false }
 tempfile = "3.8"
 
 # Utils
