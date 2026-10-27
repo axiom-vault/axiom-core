@@ -112,6 +112,9 @@ struct OpenFile {
     /// Any other access first saves what it has written.
     writer: Option<FileWriter>,
     dirty: bool,
+    /// Set when streaming a write failed. What was streamed is lost, so
+    /// every later operation fails instead of saving a partial file.
+    failed: bool,
 }
 
 /// Sequential reader of an open file, with the chunk it returned last kept
@@ -203,15 +206,23 @@ async fn finish_writer(
     session: &VaultSession,
     file: &mut OpenFile,
 ) -> std::result::Result<(), Errno> {
+    if file.failed {
+        return Err(Errno::EIO);
+    }
     let Some(writer) = file.writer.take() else {
         return Ok(());
     };
-    let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
-    let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
-    ops.finish_file_writer(&path, writer).await.map_err(|e| {
-        error!("Failed to write file: {}", e);
-        Errno::EIO
-    })?;
+    let result = async {
+        let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
+        let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
+        ops.finish_file_writer(&path, writer).await.map_err(|e| {
+            error!("Failed to write file: {}", e);
+            Errno::EIO
+        })
+    }
+    .await;
+    file.failed = result.is_err();
+    result?;
     file.reader = None;
     info!("File saved");
     Ok(())
@@ -630,6 +641,7 @@ impl Filesystem for VaultFilesystem {
                         reader: None,
                         writer: None,
                         dirty: truncate,
+                        failed: false,
                     },
                 );
             }
@@ -712,6 +724,10 @@ impl Filesystem for VaultFilesystem {
                 reply.error(Errno::EBADF);
                 return;
             };
+            if file.failed {
+                reply.error(Errno::EIO);
+                return;
+            }
             if file.writer.is_none() && offset == 0 {
                 if let Err(errno) = start_writer(&session, file).await {
                     reply.error(errno);
@@ -724,6 +740,7 @@ impl Filesystem for VaultFilesystem {
                         Ok(()) => reply.written(data.len() as u32),
                         Err(e) => {
                             error!("Failed to write file: {}", e);
+                            file.failed = true;
                             reply.error(Errno::EIO);
                         }
                     }
@@ -886,6 +903,7 @@ impl Filesystem for VaultFilesystem {
                         reader: None,
                         writer: None,
                         dirty: false,
+                        failed: false,
                     },
                 );
             }
@@ -1143,6 +1161,7 @@ impl Filesystem for VaultFilesystem {
                     reader: None,
                     writer: None,
                     dirty: false,
+                    failed: false,
                 };
                 let file = match handle.and_then(|fh| files.get_mut(&fh)) {
                     Some(file) => file,

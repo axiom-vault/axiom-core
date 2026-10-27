@@ -20,14 +20,45 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
+/// The storage behind a mount, for tests that tamper with or break it.
+struct Storage<'a> {
+    provider: &'a MemoryProvider,
+    runtime: &'a tokio::runtime::Runtime,
+}
+
+impl Storage<'_> {
+    /// Remove the metadata directory, so that saving the tree fails, or
+    /// bring it back.
+    fn set_metadata_dir(&self, present: bool) {
+        let dir = VaultPath::parse("/m").unwrap();
+        self.runtime.block_on(async {
+            if present {
+                self.provider.create_dir(&dir).await.unwrap();
+                return;
+            }
+            for entry in self.provider.list(&dir).await.unwrap() {
+                let path = dir.join(&entry.name).unwrap();
+                self.provider.delete(&path).await.unwrap();
+            }
+            self.provider.delete_dir(&dir).await.unwrap();
+        });
+    }
+}
+
 /// Mount a fresh vault and run `test` against the mount point, or skip
 /// when FUSE is not usable here.
 fn with_mount(test: impl FnOnce(&Path)) {
+    with_storage(|root, _| test(root));
+}
+
+/// Like [`with_mount`], also handing `test` the storage behind the mount.
+fn with_storage(test: impl FnOnce(&Path, &Storage)) {
     if !Path::new("/dev/fuse").exists() {
         eprintln!("skipping: /dev/fuse is not available");
         return;
     }
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    let provider = Arc::new(MemoryProvider::new());
     let session = runtime.block_on(async {
         let password = b"test-password";
         let creation = VaultConfig::new(
@@ -38,14 +69,19 @@ fn with_mount(test: impl FnOnce(&Path)) {
             KdfParams::moderate(),
         )
         .unwrap();
-        let provider = Arc::new(MemoryProvider::new());
         for dir in ["/d", "/m"] {
             provider
                 .create_dir(&VaultPath::parse(dir).unwrap())
                 .await
                 .unwrap();
         }
-        VaultSession::unlock(creation.config, password, provider, VaultTree::new()).unwrap()
+        VaultSession::unlock(
+            creation.config,
+            password,
+            provider.clone(),
+            VaultTree::new(),
+        )
+        .unwrap()
     });
     let mount_point = tempfile::tempdir().unwrap();
     let handle = mount(
@@ -59,7 +95,13 @@ fn with_mount(test: impl FnOnce(&Path)) {
         runtime.handle().clone(),
     )
     .unwrap();
-    test(mount_point.path());
+    test(
+        mount_point.path(),
+        &Storage {
+            provider: &provider,
+            runtime: &runtime,
+        },
+    );
     handle.unmount();
 }
 
@@ -177,5 +219,32 @@ fn sequential_write_then_random_access_on_one_handle() {
         drop(file);
 
         assert_eq!(fs::read(&path).unwrap(), content);
+    });
+}
+
+#[test]
+fn failed_streamed_write_poisons_the_handle() {
+    with_storage(|root, storage| {
+        let path = root.join("stream.bin");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&pattern(FILE_SIZE), 0).unwrap();
+
+        // A write elsewhere saves the streamed content first, which fails
+        // once the tree can't be saved.
+        storage.set_metadata_dir(false);
+        assert!(file.write_at(b"head", 0).is_err());
+        storage.set_metadata_dir(true);
+
+        // The stored file is still empty. Writing on must not save the
+        // tail after a zero-filled gap where the streamed content was.
+        assert!(file.write_at(b"tail", FILE_SIZE as u64).is_err());
+        assert!(file.sync_all().is_err());
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"");
     });
 }
