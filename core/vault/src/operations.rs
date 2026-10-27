@@ -133,6 +133,106 @@ impl Write for PlaintextWindow {
     }
 }
 
+/// `Write` adapter that hands decrypted plaintext to a [`FileReader`],
+/// dropping the first `skip` bytes.
+struct ReaderSender {
+    sender: tokio::sync::mpsc::Sender<Result<Zeroizing<Vec<u8>>>>,
+    skip: u64,
+}
+
+impl Write for ReaderSender {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip).map_or(bytes.len(), |skip| skip.min(bytes.len()));
+        self.skip -= skipped as u64;
+        if skipped < bytes.len() {
+            let chunk = Zeroizing::new(bytes[skipped..].to_vec());
+            self.sender.blocking_send(Ok(chunk)).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "file reader was dropped")
+            })?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sequential plaintext of a vault file, decrypted frame by frame as it is
+/// consumed. Dropping it stops the download and the decryption.
+pub struct FileReader {
+    receiver: tokio::sync::mpsc::Receiver<Result<Zeroizing<Vec<u8>>>>,
+    size: u64,
+}
+
+impl FileReader {
+    /// File size as recorded in the authenticated tree.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Next piece of plaintext, or `None` once the whole file has been
+    /// returned and its ciphertext matched the authenticated snapshot.
+    pub async fn next_chunk(&mut self) -> Option<Result<Zeroizing<Vec<u8>>>> {
+        self.receiver.recv().await
+    }
+}
+
+/// `Read` adapter that serves plaintext handed to a [`FileWriter`] to the
+/// encryptor, wiping each piece once it has been consumed.
+struct WriterReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Zeroizing<Vec<u8>>>,
+    pending: Zeroizing<Vec<u8>>,
+    offset: usize,
+}
+
+impl Read for WriterReceiver {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset == self.pending.len() {
+            match self.receiver.blocking_recv() {
+                Some(chunk) => {
+                    self.pending = chunk;
+                    self.offset = 0;
+                }
+                None => return Ok(0),
+            }
+        }
+        let count = buffer.len().min(self.pending.len() - self.offset);
+        buffer[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+/// New content for an existing vault file, encrypted and uploaded as it is
+/// written. Nothing changes in the vault until
+/// [`VaultOperations::finish_file_writer`]; a writer dropped before that
+/// leaves only an unreferenced blob behind.
+pub struct FileWriter {
+    sender: tokio::sync::mpsc::Sender<Zeroizing<Vec<u8>>>,
+    encrypt_task: tokio::task::JoinHandle<Result<String>>,
+    upload_task: tokio::task::JoinHandle<Result<axiomvault_storage::Metadata>>,
+    encrypted_name: String,
+    size: u64,
+}
+
+impl FileWriter {
+    /// Number of bytes written so far.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Append `data` to the new content.
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.sender
+            .send(Zeroizing::new(data.to_vec()))
+            .await
+            .map_err(|_| Error::Storage("encryption stopped consuming plaintext".to_string()))?;
+        self.size += data.len() as u64;
+        Ok(())
+    }
+}
+
 /// Encrypt a filename under `master_key`.
 fn encrypt_name_with(master_key: &MasterKey, name: &str) -> Result<String> {
     let dir_key = master_key.derive_directory_key(b"names");
@@ -800,6 +900,212 @@ impl<'a> VaultOperations<'a> {
         Ok((bytes, size))
     }
 
+    /// Open a file for sequential reading from `offset` on.
+    ///
+    /// Download and decryption run in the background, at most a few frames
+    /// ahead of the consumer, so memory stays bounded whatever the file
+    /// size. Each frame is authenticated before its plaintext is handed out,
+    /// and a truncated stream fails at its missing end frame. The ciphertext
+    /// digest can only be checked once the whole blob has been downloaded,
+    /// so a mismatch surfaces as an error in place of the end of the file.
+    /// Frames before `offset` are decrypted and dropped. Files written in
+    /// one piece (content version 0) are read whole.
+    pub async fn open_file_reader(&self, path: &VaultPath, offset: u64) -> Result<FileReader> {
+        let (encrypted_name, expected_digest, content_version, size) = {
+            let tree = self.session.tree().read().await;
+            let node = tree.get_node(path)?;
+            if !node.is_file() {
+                return Err(Error::InvalidInput("Not a file".to_string()));
+            }
+            (
+                node.metadata.encrypted_name.clone(),
+                node.metadata.content_digest.clone(),
+                node.metadata.content_version,
+                node.metadata.size.unwrap_or(0),
+            )
+        };
+        let (plain_sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        if offset >= size {
+            return Ok(FileReader { receiver, size });
+        }
+        if content_version != STREAM_CONTENT_VERSION {
+            let content = Zeroizing::new(self.read_file(path).await?);
+            let start = usize::try_from(offset).map_or(content.len(), |o| o.min(content.len()));
+            if start < content.len() {
+                let _ = plain_sender.try_send(Ok(Zeroizing::new(content[start..].to_vec())));
+            }
+            return Ok(FileReader { receiver, size });
+        }
+
+        let file_key = self
+            .session
+            .master_key()?
+            .derive_file_key(encrypted_name.as_bytes());
+        let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+        let mut stream = self
+            .session
+            .provider()
+            .download_stream(&storage_path)
+            .await?;
+
+        let (sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let mut output = ReaderSender {
+            sender: plain_sender.clone(),
+            skip: offset,
+        };
+        let decrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut input = ChunkReceiver {
+                receiver: cipher_receiver,
+                pending: Vec::new(),
+                offset: 0,
+            };
+            DecryptingStream::new(&key)?.decrypt_stream(&mut input, &mut output)?;
+            Ok(())
+        });
+        tokio::spawn(async move {
+            let mut hasher = DigestHasher::new();
+            let mut download_result = Ok(());
+            while let Some(chunk) = stream.next().await {
+                if plain_sender.is_closed() {
+                    return;
+                }
+                match chunk {
+                    Ok(chunk) => {
+                        hasher.update(&chunk);
+                        if sender.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        download_result = Err(error);
+                        break;
+                    }
+                }
+            }
+            drop(sender);
+            let result = match decrypt_task.await {
+                Err(error) => Err(Error::Storage(format!("decryption task failed: {}", error))),
+                Ok(decryption_result) => download_result.and(decryption_result).and_then(|()| {
+                    if expected_digest.is_some_and(|expected| expected != finish_digest(hasher)) {
+                        Err(Error::Crypto(
+                            "encrypted file does not match the authenticated snapshot".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            };
+            if let Err(error) = result {
+                let _ = plain_sender.send(Err(error)).await;
+            }
+        });
+        Ok(FileReader { receiver, size })
+    }
+
+    /// Start replacing the content of the file at `path` with a stream of
+    /// writes. Plaintext is encrypted and uploaded as it arrives, with at
+    /// most a few chunks in flight.
+    pub async fn open_file_writer(&self, path: &VaultPath) -> Result<FileWriter> {
+        let name = path
+            .name()
+            .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
+        if !self.session.tree().read().await.get_node(path)?.is_file() {
+            return Err(Error::InvalidInput("Not a file".to_string()));
+        }
+        let encrypted_name = self.encrypt_name(name)?;
+        let file_key = self
+            .session
+            .master_key()?
+            .derive_file_key(encrypted_name.as_bytes());
+        let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let (cipher_sender, mut cipher_receiver) =
+            tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut input = WriterReceiver {
+                receiver,
+                pending: Zeroizing::new(Vec::new()),
+                offset: 0,
+            };
+            let mut output = ChunkSender {
+                sender: cipher_sender,
+                buffer: Vec::new(),
+                hasher: DigestHasher::new(),
+            };
+            let result = EncryptingStream::new(&key)
+                .and_then(|stream| stream.encrypt_stream(&mut input, &mut output))
+                .and_then(|_| Ok(output.flush()?))
+                .map(|()| finish_digest(std::mem::take(&mut output.hasher)));
+            if let Err(error) = &result {
+                // Abort the upload so the provider discards its partial object.
+                let _ = output
+                    .sender
+                    .blocking_send(Err(Error::Storage(error.to_string())));
+            }
+            result
+        });
+        let provider = self.session.provider();
+        let upload_task = tokio::spawn(async move {
+            let encrypted_stream: ByteStream = Box::pin(futures::stream::poll_fn(move |cx| {
+                cipher_receiver.poll_recv(cx)
+            }));
+            provider
+                .upload_stream(&storage_path, encrypted_stream)
+                .await
+        });
+        Ok(FileWriter {
+            sender,
+            encrypt_task,
+            upload_task,
+            encrypted_name,
+            size: 0,
+        })
+    }
+
+    /// Finish a [`FileWriter`] and make its content the content of `path`.
+    pub async fn finish_file_writer(&self, path: &VaultPath, writer: FileWriter) -> Result<()> {
+        let FileWriter {
+            sender,
+            encrypt_task,
+            upload_task,
+            encrypted_name,
+            size,
+        } = writer;
+        drop(sender);
+        let encryption_result = encrypt_task
+            .await
+            .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
+        upload_task
+            .await
+            .map_err(|error| Error::Storage(format!("upload task failed: {}", error)))??;
+        let content_digest = encryption_result?;
+
+        let mut tree = self.session.tree().write().await;
+        let mut candidate = tree.clone();
+        let node = candidate.get_node_mut(path)?;
+        if !node.is_file() {
+            return Err(Error::InvalidInput("Not a file".to_string()));
+        }
+        let old_encrypted_name =
+            std::mem::replace(&mut node.metadata.encrypted_name, encrypted_name);
+        node.metadata.size = Some(size);
+        node.metadata.modified_at = chrono::Utc::now();
+        node.metadata.content_digest = Some(content_digest);
+        node.metadata.content_version = STREAM_CONTENT_VERSION;
+        self.session.save_tree_snapshot(&candidate).await?;
+        *tree = candidate;
+
+        let old_storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&old_encrypted_name)?;
+        if let Err(error) = self.session.provider().delete(&old_storage_path).await {
+            warn!(%error, "File updated but obsolete blob cleanup failed");
+        }
+        info!(size, "File written");
+        Ok(())
+    }
+
     /// Update file with new encrypted content.
     ///
     /// # Preconditions
@@ -832,7 +1138,10 @@ impl<'a> VaultOperations<'a> {
         let encrypted_name = self.encrypt_name(name)?;
         let master_key = self.session.master_key()?;
         let file_key = master_key.derive_file_key(encrypted_name.as_bytes());
-        let encrypted_content = encrypt(file_key.as_bytes(), content)?;
+        let stream = EncryptingStream::new(file_key.as_bytes())?;
+        let mut encrypted_content =
+            Vec::with_capacity(stream.encrypted_len(content.len() as u64) as usize);
+        stream.encrypt_stream(content, &mut encrypted_content)?;
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
         let old_storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&old_encrypted_name)?;
 
@@ -842,7 +1151,7 @@ impl<'a> VaultOperations<'a> {
         node.metadata.size = Some(content.len() as u64);
         node.metadata.modified_at = chrono::Utc::now();
         node.metadata.content_digest = Some(digest(&encrypted_content));
-        node.metadata.content_version = 0;
+        node.metadata.content_version = STREAM_CONTENT_VERSION;
 
         self.session
             .provider()
@@ -1547,6 +1856,72 @@ mod tests {
             .unwrap();
         let (bytes, _) = ops.read_file_range(&path, 0, 16).await.unwrap();
         assert_eq!(bytes, &data[..16]);
+    }
+
+    async fn read_to_end(reader: &mut FileReader) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = reader.next_chunk().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn file_readers_stream_from_an_offset_and_report_tampering() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/large.bin").unwrap();
+        let data = streamed_file(&ops, &path).await;
+
+        for offset in [0, 64 * 1024 - 1, data.len() - 5, data.len(), data.len() + 1] {
+            let mut reader = ops.open_file_reader(&path, offset as u64).await.unwrap();
+            assert_eq!(reader.size(), data.len() as u64);
+            let start = offset.min(data.len());
+            assert_eq!(read_to_end(&mut reader).await.unwrap(), &data[start..]);
+        }
+
+        // Rewritten files use the stream format too.
+        ops.update_file(&path, &data[..1000]).await.unwrap();
+        let mut reader = ops.open_file_reader(&path, 10).await.unwrap();
+        assert_eq!(read_to_end(&mut reader).await.unwrap(), &data[10..1000]);
+
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let stored = session.provider().list(&data_dir).await.unwrap();
+        let stored_path = data_dir.join(&stored[0].name).unwrap();
+        let mut ciphertext = session.provider().download(&stored_path).await.unwrap();
+        let near_end = ciphertext.len() - 200;
+        ciphertext[near_end] ^= 0x80;
+        session
+            .provider()
+            .upload(&stored_path, ciphertext)
+            .await
+            .unwrap();
+        let mut reader = ops.open_file_reader(&path, 0).await.unwrap();
+        assert!(read_to_end(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn file_writers_replace_content_only_when_finished() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/written.bin").unwrap();
+        ops.create_file(&path, b"old").await.unwrap();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = ops.open_file_writer(&path).await.unwrap();
+        writer.write(&data[..1000]).await.unwrap();
+        drop(writer);
+        assert_eq!(ops.read_file(&path).await.unwrap(), b"old");
+
+        let mut writer = ops.open_file_writer(&path).await.unwrap();
+        for piece in data.chunks(30_000) {
+            writer.write(piece).await.unwrap();
+        }
+        assert_eq!(writer.size(), data.len() as u64);
+        ops.finish_file_writer(&path, writer).await.unwrap();
+        assert_eq!(ops.read_file(&path).await.unwrap(), data);
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(data.len() as u64));
     }
 
     #[tokio::test]
