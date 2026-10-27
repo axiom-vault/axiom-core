@@ -19,7 +19,7 @@ use tracing::{debug, error, info};
 use zeroize::{Zeroize, Zeroizing};
 
 use axiomvault_common::VaultPath;
-use axiomvault_vault::{FileReader, VaultOperations, VaultSession};
+use axiomvault_vault::{FileReader, FileWriter, VaultOperations, VaultSession};
 
 /// Helper function to create FileAttr with common defaults.
 fn create_file_attr(ino: INodeNo, is_dir: bool, size: u64) -> FileAttr {
@@ -108,6 +108,9 @@ struct OpenFile {
     /// reads stream through `reader` and nothing else is held in memory.
     buffer: Option<Vec<u8>>,
     reader: Option<ReadCursor>,
+    /// Sequential writes into an empty file, encrypted as they arrive.
+    /// Any other access first saves what it has written.
+    writer: Option<FileWriter>,
     dirty: bool,
 }
 
@@ -195,8 +198,54 @@ async fn load_buffer(
     Ok(())
 }
 
+/// Save the content a handle has streamed so far, if it is streaming.
+async fn finish_writer(
+    session: &VaultSession,
+    file: &mut OpenFile,
+) -> std::result::Result<(), Errno> {
+    let Some(writer) = file.writer.take() else {
+        return Ok(());
+    };
+    let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
+    let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
+    ops.finish_file_writer(&path, writer).await.map_err(|e| {
+        error!("Failed to write file: {}", e);
+        Errno::EIO
+    })?;
+    file.reader = None;
+    info!("File saved");
+    Ok(())
+}
+
+/// Start streaming a write at offset 0 when the file is still empty, which
+/// is how `cp`, `dd` and most writers produce a whole file.
+async fn start_writer(
+    session: &VaultSession,
+    file: &mut OpenFile,
+) -> std::result::Result<(), Errno> {
+    let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
+    let path = VaultPath::parse(&file.path).map_err(|_| Errno::ENOENT)?;
+    let empty = match &file.buffer {
+        Some(buffer) => buffer.is_empty(),
+        None => matches!(ops.metadata(&path).await, Ok((_, false, Some(0)))),
+    };
+    if !empty {
+        return Ok(());
+    }
+    let writer = ops.open_file_writer(&path).await.map_err(|e| {
+        error!("Failed to open file for writing: {}", e);
+        Errno::EIO
+    })?;
+    file.writer = Some(writer);
+    file.buffer = None;
+    file.reader = None;
+    file.dirty = false;
+    Ok(())
+}
+
 /// Write a dirty handle's buffer back to the vault.
 async fn persist(session: &VaultSession, file: &mut OpenFile) -> std::result::Result<(), Errno> {
+    finish_writer(session, file).await?;
     let Some(buffer) = file.buffer.as_ref().filter(|_| file.dirty) else {
         return Ok(());
     };
@@ -400,8 +449,10 @@ impl Filesystem for VaultFilesystem {
                 .await
                 .values()
                 .filter(|file| file.path == path_str)
-                .find_map(|file| file.buffer.as_ref())
-                .map(|buffer| buffer.len() as u64);
+                .find_map(|file| match (&file.writer, &file.buffer) {
+                    (Some(writer), _) => Some(writer.size()),
+                    (None, buffer) => buffer.as_ref().map(|buffer| buffer.len() as u64),
+                });
 
             match ops.metadata(&path).await {
                 Ok((_, is_dir, size)) => {
@@ -577,6 +628,7 @@ impl Filesystem for VaultFilesystem {
                         path: path_str,
                         buffer: truncate.then(Vec::new),
                         reader: None,
+                        writer: None,
                         dirty: truncate,
                     },
                 );
@@ -613,6 +665,10 @@ impl Filesystem for VaultFilesystem {
                 reply.error(Errno::EBADF);
                 return;
             };
+            if let Err(errno) = finish_writer(&session, file).await {
+                reply.error(errno);
+                return;
+            }
             match &file.buffer {
                 Some(buffer) => {
                     let offset =
@@ -656,7 +712,29 @@ impl Filesystem for VaultFilesystem {
                 reply.error(Errno::EBADF);
                 return;
             };
-            if let Err(errno) = load_buffer(&session, file).await {
+            if file.writer.is_none() && offset == 0 {
+                if let Err(errno) = start_writer(&session, file).await {
+                    reply.error(errno);
+                    return;
+                }
+            }
+            if let Some(writer) = file.writer.as_mut() {
+                if offset == writer.size() {
+                    match writer.write(data).await {
+                        Ok(()) => reply.written(data.len() as u32),
+                        Err(e) => {
+                            error!("Failed to write file: {}", e);
+                            reply.error(Errno::EIO);
+                        }
+                    }
+                    return;
+                }
+            }
+            let loaded = match finish_writer(&session, file).await {
+                Ok(()) => load_buffer(&session, file).await,
+                Err(errno) => Err(errno),
+            };
+            if let Err(errno) = loaded {
                 reply.error(errno);
                 return;
             }
@@ -806,6 +884,7 @@ impl Filesystem for VaultFilesystem {
                         path: child_path,
                         buffer: Some(vec![]),
                         reader: None,
+                        writer: None,
                         dirty: false,
                     },
                 );
@@ -1062,12 +1141,14 @@ impl Filesystem for VaultFilesystem {
                     path: path_str,
                     buffer: (size == 0).then(Vec::new),
                     reader: None,
+                    writer: None,
                     dirty: false,
                 };
                 let file = match handle.and_then(|fh| files.get_mut(&fh)) {
                     Some(file) => file,
                     None => &mut detached,
                 };
+                finish_writer(&session, file).await?;
                 load_buffer(&session, file).await?;
                 if let Some(buffer) = file.buffer.as_mut() {
                     buffer.resize(size as usize, 0);

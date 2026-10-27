@@ -153,3 +153,29 @@ fn truncating_rewrite_replaces_content() {
         assert_eq!(fs::read(&path).unwrap(), b"sh");
     });
 }
+
+#[test]
+fn sequential_write_then_random_access_on_one_handle() {
+    with_mount(|root| {
+        let path = root.join("stream.bin");
+        let mut content = pattern(FILE_SIZE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        for (index, piece) in content.chunks(50_000).enumerate() {
+            file.write_all_at(piece, (index * 50_000) as u64).unwrap();
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), FILE_SIZE as u64);
+
+        assert_eq!(read_at(&file, 131_000, 1_000), &content[131_000..132_000]);
+        file.write_all_at(b"head", 0).unwrap();
+        content[..4].copy_from_slice(b"head");
+        assert_eq!(read_at(&file, 0, 8), &content[..8]);
+        drop(file);
+
+        assert_eq!(fs::read(&path).unwrap(), content);
+    });
+}
