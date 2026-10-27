@@ -19,6 +19,8 @@ pub struct MountOptions {
     /// Allow other users to access the mount.
     pub allow_other: bool,
     /// Enable auto unmount when process exits.
+    ///
+    /// fuser rejects this with owner-only access, so it requires `allow_other`.
     pub auto_unmount: bool,
     /// Read-only mount.
     pub read_only: bool,
@@ -30,7 +32,7 @@ impl Default for MountOptions {
     fn default() -> Self {
         Self {
             allow_other: false,
-            auto_unmount: true,
+            auto_unmount: false,
             read_only: false,
             default_permissions: true,
         }
@@ -61,14 +63,22 @@ impl MountOptions {
 /// and the FUSE request-servicing thread.
 pub struct MountHandle {
     mount_point: PathBuf,
-    /// Keeps the background FUSE thread alive. Dropping this unmounts.
-    _session: BackgroundSession,
+    /// Keeps the background FUSE thread alive. Taken and joined on drop.
+    session: Option<BackgroundSession>,
 }
 
 impl MountHandle {
     /// Get the mount point path.
     pub fn mount_point(&self) -> &Path {
         &self.mount_point
+    }
+
+    /// Whether the FUSE session has ended, e.g. because the filesystem was
+    /// unmounted externally (`fusermount3 -u`, `umount`).
+    pub fn is_finished(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.guard.is_finished())
     }
 
     /// Unmount the filesystem.
@@ -82,8 +92,21 @@ impl MountHandle {
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        info!("Unmounting vault");
-        // BackgroundSession::drop() joins the background thread and calls umount2.
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Join the background thread so the filesystem, and with it the vault
+        // session, is dropped (closing vault files and zeroizing keys) before
+        // the process can exit. Dropping a BackgroundSession alone detaches it.
+        let result = if session.guard.is_finished() {
+            session.join()
+        } else {
+            info!("Unmounting vault");
+            session.umount_and_join()
+        };
+        if let Err(e) = result {
+            error!("Failed to unmount vault: {}", e);
+        }
     }
 }
 
@@ -178,7 +201,7 @@ pub fn mount(
 
     Ok(MountHandle {
         mount_point,
-        _session: bg_session,
+        session: Some(bg_session),
     })
 }
 
@@ -240,7 +263,7 @@ mod tests {
     fn test_default_mount_options() {
         let opts = MountOptions::default();
         assert!(!opts.allow_other);
-        assert!(opts.auto_unmount);
+        assert!(!opts.auto_unmount);
         assert!(!opts.read_only);
         assert!(opts.default_permissions);
     }
@@ -275,5 +298,66 @@ mod tests {
     fn test_fuse_info() {
         let info = fuse_info();
         assert!(!info.is_empty());
+    }
+
+    /// An external `fusermount3 -u` must end the session, and dropping the
+    /// handle must then release the vault session. Skipped where FUSE is unusable.
+    #[test]
+    fn test_external_unmount_ends_session() {
+        use axiomvault_common::VaultId;
+        use axiomvault_crypto::KdfParams;
+        use axiomvault_storage::MemoryProvider;
+        use axiomvault_vault::{VaultConfig, VaultTree};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if !is_fuse_available() {
+            return;
+        }
+        let creation = VaultConfig::new(
+            VaultId::new("test").unwrap(),
+            b"test-password",
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::interactive(),
+        )
+        .unwrap();
+        let session = Arc::new(
+            VaultSession::unlock(
+                creation.config,
+                b"test-password",
+                Arc::new(MemoryProvider::new()),
+                VaultTree::new(),
+            )
+            .unwrap(),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let Ok(handle) = mount(
+            session.clone(),
+            dir.path(),
+            MountOptions::default(),
+            runtime.handle().clone(),
+        ) else {
+            return;
+        };
+        assert!(!handle.is_finished());
+
+        let unmounted = Command::new("fusermount3")
+            .arg("-u")
+            .arg(dir.path())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !unmounted {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(handle.is_finished());
+
+        handle.unmount();
+        assert_eq!(Arc::strong_count(&session), 1);
     }
 }
