@@ -21,6 +21,12 @@ use zeroize::{Zeroize, Zeroizing};
 use axiomvault_common::VaultPath;
 use axiomvault_vault::{FileReader, FileWriter, VaultOperations, VaultSession};
 
+/// Largest size a handle grows a file to outside a streamed write. Such
+/// writes and truncates hold the whole plaintext in one buffer, so a larger
+/// size could exhaust memory and abort the mount. Streamed writes are not
+/// bounded by it.
+const MAX_BUFFERED_SIZE: u64 = 1 << 30;
+
 /// Helper function to create FileAttr with common defaults.
 fn create_file_attr(ino: INodeNo, is_dir: bool, size: u64) -> FileAttr {
     let now = SystemTime::now();
@@ -112,6 +118,9 @@ struct OpenFile {
     /// Any other access first saves what it has written.
     writer: Option<FileWriter>,
     dirty: bool,
+    /// Set when streaming a write failed. What was streamed is lost, so
+    /// every later operation fails instead of saving a partial file.
+    failed: bool,
 }
 
 /// Sequential reader of an open file, with the chunk it returned last kept
@@ -155,6 +164,7 @@ async fn read_streamed(
 
     let mut data = Zeroizing::new(Vec::with_capacity(size));
     let mut position = offset;
+    let mut ended = false;
     while data.len() < size {
         let end = cursor.start + cursor.chunk.len() as u64;
         if position < end {
@@ -174,7 +184,27 @@ async fn read_streamed(
                 file.reader = None;
                 return Err(Errno::EIO);
             }
-            None => break,
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    // An integrity error is queued after the last byte. A read that ends
+    // exactly there must still see the stream end cleanly.
+    if !ended && position >= cursor.reader.size() {
+        match cursor.reader.next_chunk().await {
+            None => {}
+            Some(Ok(_)) => {
+                error!("Failed to read file: more content than its recorded size");
+                file.reader = None;
+                return Err(Errno::EIO);
+            }
+            Some(Err(e)) => {
+                error!("Failed to read file: {}", e);
+                file.reader = None;
+                return Err(Errno::EIO);
+            }
         }
     }
     Ok(data)
@@ -203,15 +233,23 @@ async fn finish_writer(
     session: &VaultSession,
     file: &mut OpenFile,
 ) -> std::result::Result<(), Errno> {
+    if file.failed {
+        return Err(Errno::EIO);
+    }
     let Some(writer) = file.writer.take() else {
         return Ok(());
     };
-    let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
-    let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
-    ops.finish_file_writer(&path, writer).await.map_err(|e| {
-        error!("Failed to write file: {}", e);
-        Errno::EIO
-    })?;
+    let result = async {
+        let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
+        let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
+        ops.finish_file_writer(&path, writer).await.map_err(|e| {
+            error!("Failed to write file: {}", e);
+            Errno::EIO
+        })
+    }
+    .await;
+    file.failed = result.is_err();
+    result?;
     file.reader = None;
     info!("File saved");
     Ok(())
@@ -630,6 +668,7 @@ impl Filesystem for VaultFilesystem {
                         reader: None,
                         writer: None,
                         dirty: truncate,
+                        failed: false,
                     },
                 );
             }
@@ -668,6 +707,20 @@ impl Filesystem for VaultFilesystem {
             if let Err(errno) = finish_writer(&session, file).await {
                 reply.error(errno);
                 return;
+            }
+            // Streaming can't seek back: a new reader downloads and decrypts
+            // the file from its start. To bound that to once per handle, a
+            // read behind the reader loads the whole file into the buffer,
+            // as before reads were streamed, trading memory for random access.
+            let behind = file
+                .reader
+                .as_ref()
+                .is_some_and(|cursor| offset < cursor.start);
+            if behind {
+                if let Err(errno) = load_buffer(&session, file).await {
+                    reply.error(errno);
+                    return;
+                }
             }
             match &file.buffer {
                 Some(buffer) => {
@@ -712,6 +765,10 @@ impl Filesystem for VaultFilesystem {
                 reply.error(Errno::EBADF);
                 return;
             };
+            if file.failed {
+                reply.error(Errno::EIO);
+                return;
+            }
             if file.writer.is_none() && offset == 0 {
                 if let Err(errno) = start_writer(&session, file).await {
                     reply.error(errno);
@@ -724,12 +781,20 @@ impl Filesystem for VaultFilesystem {
                         Ok(()) => reply.written(data.len() as u32),
                         Err(e) => {
                             error!("Failed to write file: {}", e);
+                            file.failed = true;
                             reply.error(Errno::EIO);
                         }
                     }
                     return;
                 }
             }
+            let Some(end) = offset
+                .checked_add(data.len() as u64)
+                .filter(|&end| end <= MAX_BUFFERED_SIZE)
+            else {
+                reply.error(Errno::EFBIG);
+                return;
+            };
             let loaded = match finish_writer(&session, file).await {
                 Ok(()) => load_buffer(&session, file).await,
                 Err(errno) => Err(errno),
@@ -744,7 +809,7 @@ impl Filesystem for VaultFilesystem {
             };
 
             let offset = offset as usize;
-            let end = offset + data.len();
+            let end = end as usize;
 
             // Extend buffer if necessary
             if end > buffer.len() {
@@ -886,6 +951,7 @@ impl Filesystem for VaultFilesystem {
                         reader: None,
                         writer: None,
                         dirty: false,
+                        failed: false,
                     },
                 );
             }
@@ -1117,6 +1183,10 @@ impl Filesystem for VaultFilesystem {
         debug!("setattr: ino={}, size={:?}", u64::from(ino), size);
 
         if let Some(size) = size {
+            if size > MAX_BUFFERED_SIZE {
+                reply.error(Errno::EFBIG);
+                return;
+            }
             let session = self.session.clone();
             let inodes = self.inodes.clone();
             let open_files = self.open_files.clone();
@@ -1143,13 +1213,21 @@ impl Filesystem for VaultFilesystem {
                     reader: None,
                     writer: None,
                     dirty: false,
+                    failed: false,
                 };
                 let file = match handle.and_then(|fh| files.get_mut(&fh)) {
                     Some(file) => file,
                     None => &mut detached,
                 };
                 finish_writer(&session, file).await?;
-                load_buffer(&session, file).await?;
+                if size == 0 {
+                    // Nothing of the old content survives, so don't decrypt it.
+                    file.reader = None;
+                    file.buffer.zeroize();
+                    file.buffer = Some(Vec::new());
+                } else {
+                    load_buffer(&session, file).await?;
+                }
                 if let Some(buffer) = file.buffer.as_mut() {
                     buffer.resize(size as usize, 0);
                 }

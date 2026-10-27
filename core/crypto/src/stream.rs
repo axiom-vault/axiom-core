@@ -288,9 +288,10 @@ impl<'a> DecryptingStream<'a> {
                 decrypted.zeroize();
                 return Err(Error::Crypto("Chunk order mismatch".to_string()));
             }
-            writer.write_all(&decrypted[8..])?;
+            let written = writer.write_all(&decrypted[8..]);
             total_bytes += (decrypted.len() - 8) as u64;
             decrypted.zeroize();
+            written?;
         }
         let mut trailing = [0u8; 1];
         if reader.read(&mut trailing)? != 0 {

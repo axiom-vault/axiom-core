@@ -774,10 +774,10 @@ impl<'a> VaultOperations<'a> {
         let content = match content_version {
             0 => decrypt(file_key.as_bytes(), &encrypted_content)?,
             STREAM_CONTENT_VERSION => {
-                let mut plaintext = Vec::new();
+                let mut plaintext = Zeroizing::new(Vec::with_capacity(encrypted_content.len()));
                 DecryptingStream::new(file_key.as_bytes())?
-                    .decrypt_stream(encrypted_content.as_slice(), &mut plaintext)?;
-                plaintext
+                    .decrypt_stream(encrypted_content.as_slice(), &mut *plaintext)?;
+                std::mem::take(&mut *plaintext)
             }
             other => {
                 return Err(Error::Crypto(format!(
@@ -1082,13 +1082,29 @@ impl<'a> VaultOperations<'a> {
             .await
             .map_err(|error| Error::Storage(format!("upload task failed: {}", error)))??;
         let content_digest = encryption_result?;
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
         let mut tree = self.session.tree().write().await;
         let mut candidate = tree.clone();
-        let node = candidate.get_node_mut(path)?;
-        if !node.is_file() {
-            return Err(Error::InvalidInput("Not a file".to_string()));
-        }
+        let node = candidate.get_node_mut(path).and_then(|node| {
+            if node.is_file() {
+                Ok(node)
+            } else {
+                Err(Error::InvalidInput("Not a file".to_string()))
+            }
+        });
+        let node = match node {
+            Ok(node) => node,
+            Err(error) => {
+                // Nothing refers to the new blob, as when the file was
+                // deleted while it was written. A failed snapshot save below
+                // keeps it, as the snapshot may have been published anyway.
+                if let Err(error) = self.session.provider().delete(&storage_path).await {
+                    warn!(%error, "File write failed and new blob cleanup failed");
+                }
+                return Err(error);
+            }
+        };
         let old_encrypted_name =
             std::mem::replace(&mut node.metadata.encrypted_name, encrypted_name);
         node.metadata.size = Some(size);
@@ -1922,6 +1938,25 @@ mod tests {
         assert_eq!(ops.read_file(&path).await.unwrap(), data);
         let (_, _, size) = ops.metadata(&path).await.unwrap();
         assert_eq!(size, Some(data.len() as u64));
+    }
+
+    #[tokio::test]
+    async fn finishing_a_writer_of_a_deleted_file_removes_its_blob() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/written.bin").unwrap();
+        ops.create_file(&path, b"old").await.unwrap();
+        let mut writer = ops.open_file_writer(&path).await.unwrap();
+        writer.write(b"new").await.unwrap();
+        ops.delete_file(&path).await.unwrap();
+
+        assert!(ops.finish_file_writer(&path, writer).await.is_err());
+        let blobs = session
+            .provider()
+            .list(&VaultPath::parse("/d").unwrap())
+            .await
+            .unwrap();
+        assert!(blobs.is_empty());
     }
 
     #[tokio::test]
