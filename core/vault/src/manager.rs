@@ -1215,6 +1215,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publishing_deletes_the_superseded_generation_objects() {
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let creation = manager
+            .create_vault(
+                VaultId::new("superseded-objects").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let ops = crate::VaultOperations::new(&creation.session).unwrap();
+        for name in ["/a", "/b", "/c"] {
+            ops.create_file(&VaultPath::parse(name).unwrap(), b"content")
+                .await
+                .unwrap();
+        }
+
+        let mut generation_objects: Vec<String> = provider
+            .list(&VaultPath::parse(META_DIRNAME).unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| {
+                (name.starts_with("tree.") && name.ends_with(".enc"))
+                    || (name.starts_with("config.") && name.ends_with(".json"))
+            })
+            .collect();
+        generation_objects.sort();
+        assert_eq!(generation_objects.len(), 2, "{generation_objects:?}");
+        assert!(generation_objects[0].starts_with("config.4."));
+        assert!(generation_objects[1].starts_with("tree.4."));
+    }
+
+    #[tokio::test]
     async fn create_persists_authenticated_generation_and_anchor() {
         let provider = Arc::new(MemoryProvider::new());
         let anchor = Arc::new(InMemoryFreshnessAnchor::new());

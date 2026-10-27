@@ -81,6 +81,9 @@ struct FreshnessState {
     anchor: Arc<dyn FreshnessAnchor>,
     anchor_keys: AnchorKeys,
     generation: Mutex<u64>,
+    /// `vault.config` bytes this session last wrote, so publishing an
+    /// unchanged config does not rewrite and resync the cache every time.
+    written_config: StdMutex<Option<Vec<u8>>>,
 }
 
 impl VaultSession {
@@ -119,6 +122,7 @@ impl VaultSession {
                 anchor,
                 anchor_keys,
                 generation: Mutex::new(generation),
+                written_config: StdMutex::new(None),
             }),
         )
     }
@@ -608,8 +612,8 @@ impl VaultSession {
         let anchored = freshness
             .anchor_keys
             .load_state(freshness.anchor.as_ref())?;
-        match (&anchored, &previous_manifest) {
-            (None, None) if *generation == 0 => {}
+        let previous = match (&anchored, &previous_manifest) {
+            (None, None) if *generation == 0 => None,
             (Some(state), Some(bytes))
                 if state.generation == *generation
                     && state
@@ -623,13 +627,14 @@ impl VaultSession {
                         "stored snapshot advanced; reopen the vault before mutating it".to_string(),
                     ));
                 }
+                Some(stored)
             }
             _ => {
                 return Err(Error::Conflict(
                     "trusted snapshot advanced; reopen the vault before mutating it".to_string(),
                 ));
             }
-        }
+        };
 
         let next_generation = generation
             .checked_add(1)
@@ -698,15 +703,30 @@ impl VaultSession {
         }
         // Compatibility caches for health tooling and pre-manifest readers. They
         // are deliberately written after the manifest commit and never authoritative.
-        let _ = self.provider.upload(&config_path, config_bytes).await;
+        let config_written = freshness
+            .written_config
+            .lock()
+            .is_ok_and(|written| written.as_deref() == Some(config_bytes.as_slice()));
+        if !config_written
+            && self
+                .provider
+                .upload(&config_path, config_bytes.clone())
+                .await
+                .is_ok()
+        {
+            if let Ok(mut written) = freshness.written_config.lock() {
+                *written = Some(config_bytes);
+            }
+        }
         let _ = self.provider.upload(&tree_path, encrypted).await;
-        if let Some(previous_bytes) = previous_manifest {
-            if let Ok(previous) = GenerationManifest::open(self.master_key()?, &previous_bytes) {
-                if previous.version == 2 {
-                    if let Ok((_, previous_config_path)) = previous.object_paths() {
-                        if previous_config_path != generation_config_path {
-                            let _ = self.provider.delete(&previous_config_path).await;
-                        }
+        if let Some(previous) = previous {
+            if previous.version == 2 {
+                if let Ok((previous_tree_path, previous_config_path)) = previous.object_paths() {
+                    if previous_tree_path != generation_tree_path {
+                        let _ = self.provider.delete(&previous_tree_path).await;
+                    }
+                    if previous_config_path != generation_config_path {
+                        let _ = self.provider.delete(&previous_config_path).await;
                     }
                 }
             }

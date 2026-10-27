@@ -5,9 +5,13 @@
 
 use std::io::{Read, Write};
 
-use zeroize::Zeroize;
+use chacha20poly1305::{
+    aead::{generic_array::GenericArray, AeadCore, AeadInPlace, KeyInit, OsRng},
+    XChaCha20Poly1305,
+};
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::aead::{decrypt, encrypt, NONCE_SIZE, TAG_SIZE};
+use crate::aead::{decrypt, NONCE_SIZE, TAG_SIZE};
 use crate::keys::KEY_LENGTH;
 use axiomvault_common::{Error, Result};
 
@@ -23,6 +27,7 @@ const LEGACY_STREAM_VERSION: u8 = 1;
 const LEGACY_HEADER_REMAINDER: usize = 12;
 const FRAME_METADATA_SIZE: usize = 13;
 const FRAME_LENGTH_SIZE: usize = 4;
+const FRAME_PREFIX_SIZE: usize = FRAME_LENGTH_SIZE + NONCE_SIZE + FRAME_METADATA_SIZE;
 const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const DATA_FRAME: u8 = 0;
 const END_FRAME: u8 = 1;
@@ -83,41 +88,63 @@ impl<'a> EncryptingStream<'a> {
         writer.write_all(&[STREAM_VERSION])?;
         writer.write_all(&chunk_size.to_le_bytes())?;
 
-        let mut buffer = vec![0u8; self.chunk_size];
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        // One frame buffer reused for every chunk: length || nonce || metadata || data || tag.
+        // Plaintext is read straight into place and sealed in place, so no chunk is copied.
+        let mut frame = Zeroizing::new(vec![0u8; FRAME_PREFIX_SIZE + self.chunk_size + TAG_SIZE]);
         let mut index = 0u64;
         let mut total_bytes = 0u64;
         loop {
-            let bytes_read = read_plaintext_chunk(&mut reader, &mut buffer)?;
+            let bytes_read = read_plaintext_chunk(
+                &mut reader,
+                &mut frame[FRAME_PREFIX_SIZE..FRAME_PREFIX_SIZE + self.chunk_size],
+            )?;
             if bytes_read == 0 {
                 break;
             }
-            self.write_frame(&mut writer, index, DATA_FRAME, &buffer[..bytes_read])?;
+            self.write_frame(
+                &cipher,
+                &mut writer,
+                &mut frame,
+                index,
+                DATA_FRAME,
+                bytes_read,
+            )?;
             total_bytes += bytes_read as u64;
             index += 1;
         }
-        buffer.zeroize();
-        self.write_frame(&mut writer, index, END_FRAME, &[])?;
+        self.write_frame(&cipher, &mut writer, &mut frame, index, END_FRAME, 0)?;
         Ok(total_bytes)
     }
 
+    /// Seal the `data_len` plaintext bytes that sit after the metadata in `frame`
+    /// and write the whole frame with a single call.
     fn write_frame<W: Write>(
         &self,
+        cipher: &XChaCha20Poly1305,
         writer: &mut W,
+        frame: &mut [u8],
         index: u64,
         kind: u8,
-        data: &[u8],
+        data_len: usize,
     ) -> Result<()> {
-        let mut plaintext = Vec::with_capacity(FRAME_METADATA_SIZE + data.len());
-        plaintext.extend_from_slice(&index.to_le_bytes());
-        plaintext.push(kind);
-        plaintext.extend_from_slice(&(self.chunk_size as u32).to_le_bytes());
-        plaintext.extend_from_slice(data);
-        let encrypted = encrypt(self.key, &plaintext)?;
-        plaintext.zeroize();
-        let frame_len = u32::try_from(encrypted.len())
+        let body_start = FRAME_LENGTH_SIZE + NONCE_SIZE;
+        let body_end = FRAME_PREFIX_SIZE + data_len;
+        let frame_end = body_end + TAG_SIZE;
+        let frame_len = u32::try_from(frame_end - FRAME_LENGTH_SIZE)
             .map_err(|_| Error::Crypto("Encrypted frame too large".to_string()))?;
-        writer.write_all(&frame_len.to_le_bytes())?;
-        writer.write_all(&encrypted)?;
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        frame[..FRAME_LENGTH_SIZE].copy_from_slice(&frame_len.to_le_bytes());
+        frame[FRAME_LENGTH_SIZE..body_start].copy_from_slice(&nonce);
+        frame[body_start..body_start + 8].copy_from_slice(&index.to_le_bytes());
+        frame[body_start + 8] = kind;
+        frame[body_start + 9..FRAME_PREFIX_SIZE]
+            .copy_from_slice(&(self.chunk_size as u32).to_le_bytes());
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut frame[body_start..body_end])
+            .map_err(|e| Error::Crypto(format!("Encryption failed: {}", e)))?;
+        frame[body_end..frame_end].copy_from_slice(&tag);
+        writer.write_all(&frame[..frame_end])?;
         Ok(())
     }
 }
@@ -161,6 +188,9 @@ impl<'a> DecryptingStream<'a> {
         validate_chunk_size(chunk_size)?;
 
         let max_frame = NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE + chunk_size;
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        // Frames are read into one reused buffer and opened in place.
+        let mut frame = Zeroizing::new(vec![0u8; max_frame]);
         let mut index = 0u64;
         let mut total_bytes = 0u64;
         loop {
@@ -172,13 +202,18 @@ impl<'a> DecryptingStream<'a> {
             if frame_len < NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE || frame_len > max_frame {
                 return Err(Error::Crypto("Invalid encrypted frame length".to_string()));
             }
-            let mut encrypted = vec![0u8; frame_len];
-            reader.read_exact(&mut encrypted)?;
-            let mut plaintext = decrypt(self.key, &encrypted)?;
-            if plaintext.len() < FRAME_METADATA_SIZE {
-                plaintext.zeroize();
-                return Err(Error::Crypto("Invalid frame metadata".to_string()));
-            }
+            let encrypted = &mut frame[..frame_len];
+            reader.read_exact(encrypted)?;
+            let (nonce, body) = encrypted.split_at_mut(NONCE_SIZE);
+            let (plaintext, tag) = body.split_at_mut(body.len() - TAG_SIZE);
+            cipher
+                .decrypt_in_place_detached(
+                    GenericArray::from_slice(nonce),
+                    b"",
+                    plaintext,
+                    GenericArray::from_slice(tag),
+                )
+                .map_err(|e| Error::Crypto(format!("Decryption failed: {}", e)))?;
             let frame_index = u64::from_le_bytes(
                 plaintext[..8]
                     .try_into()
@@ -191,7 +226,6 @@ impl<'a> DecryptingStream<'a> {
                     .map_err(|_| Error::Crypto("Invalid authenticated chunk size".to_string()))?,
             ) as usize;
             if frame_index != index || authenticated_chunk_size != chunk_size {
-                plaintext.zeroize();
                 return Err(Error::Crypto("Stream metadata mismatch".to_string()));
             }
             match kind {
@@ -199,10 +233,8 @@ impl<'a> DecryptingStream<'a> {
                     writer.write_all(&plaintext[FRAME_METADATA_SIZE..])?;
                     total_bytes += (plaintext.len() - FRAME_METADATA_SIZE) as u64;
                     index += 1;
-                    plaintext.zeroize();
                 }
                 END_FRAME if plaintext.len() == FRAME_METADATA_SIZE => {
-                    plaintext.zeroize();
                     let mut trailing = [0u8; 1];
                     if reader.read(&mut trailing)? != 0 {
                         return Err(Error::Crypto("Trailing data after end frame".to_string()));
@@ -210,7 +242,6 @@ impl<'a> DecryptingStream<'a> {
                     return Ok(total_bytes);
                 }
                 _ => {
-                    plaintext.zeroize();
                     return Err(Error::Crypto("Invalid frame type".to_string()));
                 }
             }
@@ -257,9 +288,10 @@ impl<'a> DecryptingStream<'a> {
                 decrypted.zeroize();
                 return Err(Error::Crypto("Chunk order mismatch".to_string()));
             }
-            writer.write_all(&decrypted[8..])?;
+            let written = writer.write_all(&decrypted[8..]);
             total_bytes += (decrypted.len() - 8) as u64;
             decrypted.zeroize();
+            written?;
         }
         let mut trailing = [0u8; 1];
         if reader.read(&mut trailing)? != 0 {
@@ -329,6 +361,7 @@ pub fn decrypt_bytes(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aead::encrypt;
     use proptest::prelude::*;
 
     proptest! {
@@ -659,5 +692,69 @@ mod tests {
         encrypted.truncate(encrypted.len() - (NONCE_SIZE + TAG_SIZE + 13));
 
         assert!(decrypt_bytes(&key, &encrypted).is_err());
+    }
+
+    /// Version-2 frames are `len || aead::encrypt(index || kind || chunk_size || data)`.
+    /// The in-place stream path must stay byte-compatible with that per-frame AEAD
+    /// construction in both directions.
+    #[test]
+    fn stream_frames_match_per_frame_aead() {
+        let key = [9u8; KEY_LENGTH];
+        for len in [
+            0,
+            1,
+            DEFAULT_CHUNK_SIZE,
+            DEFAULT_CHUNK_SIZE + 7,
+            3 * DEFAULT_CHUNK_SIZE,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            // Stream output opens frame by frame with aead::decrypt.
+            let encrypted = encrypt_bytes(&key, &data).unwrap();
+            assert_eq!(encrypted[0], STREAM_VERSION);
+            assert_eq!(
+                encrypted[1..HEADER_SIZE],
+                (DEFAULT_CHUNK_SIZE as u32).to_le_bytes()
+            );
+            let mut pos = HEADER_SIZE;
+            let mut index = 0u64;
+            let mut recovered = Vec::new();
+            loop {
+                let frame_len =
+                    u32::from_le_bytes(encrypted[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += FRAME_LENGTH_SIZE;
+                let plaintext = decrypt(&key, &encrypted[pos..pos + frame_len]).unwrap();
+                pos += frame_len;
+                assert_eq!(plaintext[..8], index.to_le_bytes());
+                assert_eq!(plaintext[9..13], (DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                if plaintext[8] == END_FRAME {
+                    assert_eq!(plaintext.len(), FRAME_METADATA_SIZE);
+                    break;
+                }
+                assert_eq!(plaintext[8], DATA_FRAME);
+                recovered.extend_from_slice(&plaintext[FRAME_METADATA_SIZE..]);
+                index += 1;
+            }
+            assert_eq!(pos, encrypted.len());
+            assert_eq!(recovered, data);
+
+            // Frames sealed with aead::encrypt decrypt through DecryptingStream.
+            let mut built = vec![STREAM_VERSION];
+            built.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+            let frames = data
+                .chunks(DEFAULT_CHUNK_SIZE)
+                .map(|chunk| (DATA_FRAME, chunk))
+                .chain(std::iter::once((END_FRAME, &[][..])));
+            for (index, (kind, chunk)) in frames.enumerate() {
+                let mut plaintext = (index as u64).to_le_bytes().to_vec();
+                plaintext.push(kind);
+                plaintext.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                plaintext.extend_from_slice(chunk);
+                let sealed = encrypt(&key, &plaintext).unwrap();
+                built.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+                built.extend_from_slice(&sealed);
+            }
+            assert_eq!(decrypt_bytes(&key, &built).unwrap(), data);
+        }
     }
 }

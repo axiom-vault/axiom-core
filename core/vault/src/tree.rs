@@ -275,8 +275,10 @@ impl VaultTree {
     }
 
     /// Serialize tree to JSON.
+    ///
+    /// Compact, since every mutation encrypts and publishes the whole index.
     pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(self).map_err(|e| Error::Serialization(e.to_string()))
+        serde_json::to_string(self).map_err(|e| Error::Serialization(e.to_string()))
     }
 
     /// Deserialize tree from JSON.
