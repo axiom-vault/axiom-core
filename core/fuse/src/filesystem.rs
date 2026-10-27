@@ -21,6 +21,12 @@ use zeroize::{Zeroize, Zeroizing};
 use axiomvault_common::VaultPath;
 use axiomvault_vault::{FileReader, FileWriter, VaultOperations, VaultSession};
 
+/// Largest size a handle grows a file to outside a streamed write. Such
+/// writes and truncates hold the whole plaintext in one buffer, so a larger
+/// size could exhaust memory and abort the mount. Streamed writes are not
+/// bounded by it.
+const MAX_BUFFERED_SIZE: u64 = 1 << 30;
+
 /// Helper function to create FileAttr with common defaults.
 fn create_file_attr(ino: INodeNo, is_dir: bool, size: u64) -> FileAttr {
     let now = SystemTime::now();
@@ -747,6 +753,13 @@ impl Filesystem for VaultFilesystem {
                     return;
                 }
             }
+            let Some(end) = offset
+                .checked_add(data.len() as u64)
+                .filter(|&end| end <= MAX_BUFFERED_SIZE)
+            else {
+                reply.error(Errno::EFBIG);
+                return;
+            };
             let loaded = match finish_writer(&session, file).await {
                 Ok(()) => load_buffer(&session, file).await,
                 Err(errno) => Err(errno),
@@ -761,7 +774,7 @@ impl Filesystem for VaultFilesystem {
             };
 
             let offset = offset as usize;
-            let end = offset + data.len();
+            let end = end as usize;
 
             // Extend buffer if necessary
             if end > buffer.len() {
@@ -1135,6 +1148,10 @@ impl Filesystem for VaultFilesystem {
         debug!("setattr: ino={}, size={:?}", u64::from(ino), size);
 
         if let Some(size) = size {
+            if size > MAX_BUFFERED_SIZE {
+                reply.error(Errno::EFBIG);
+                return;
+            }
             let session = self.session.clone();
             let inodes = self.inodes.clone();
             let open_files = self.open_files.clone();
@@ -1168,7 +1185,14 @@ impl Filesystem for VaultFilesystem {
                     None => &mut detached,
                 };
                 finish_writer(&session, file).await?;
-                load_buffer(&session, file).await?;
+                if size == 0 {
+                    // Nothing of the old content survives, so don't decrypt it.
+                    file.reader = None;
+                    file.buffer.zeroize();
+                    file.buffer = Some(Vec::new());
+                } else {
+                    load_buffer(&session, file).await?;
+                }
                 if let Some(buffer) = file.buffer.as_mut() {
                     buffer.resize(size as usize, 0);
                 }

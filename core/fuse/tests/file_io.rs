@@ -27,6 +27,28 @@ struct Storage<'a> {
 }
 
 impl Storage<'_> {
+    /// Paths of the stored content blobs.
+    fn blobs(&self) -> Vec<VaultPath> {
+        let dir = VaultPath::parse("/d").unwrap();
+        let entries = self.runtime.block_on(self.provider.list(&dir)).unwrap();
+        entries
+            .iter()
+            .map(|entry| dir.join(&entry.name).unwrap())
+            .collect()
+    }
+
+    /// Flip the last byte of every content blob, which lies in the end
+    /// frame, so that all data decrypts and only the end fails.
+    fn tamper_end_frames(&self) {
+        for blob in self.blobs() {
+            self.runtime.block_on(async {
+                let mut data = self.provider.download(&blob).await.unwrap();
+                *data.last_mut().unwrap() ^= 1;
+                self.provider.upload(&blob, data).await.unwrap();
+            });
+        }
+    }
+
     /// Remove the metadata directory, so that saving the tree fails, or
     /// bring it back.
     fn set_metadata_dir(&self, present: bool) {
@@ -246,5 +268,49 @@ fn failed_streamed_write_poisons_the_handle() {
         assert!(file.sync_all().is_err());
         drop(file);
         assert_eq!(fs::read(&path).unwrap(), b"");
+    });
+}
+
+#[test]
+fn truncating_overwrite_does_not_read_the_old_content() {
+    with_storage(|root, storage| {
+        let path = root.join("data.bin");
+        fs::write(&path, pattern(FILE_SIZE)).unwrap();
+        storage.tamper_end_frames();
+        fs::write(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+
+        fs::write(&path, pattern(FILE_SIZE)).unwrap();
+        storage.tamper_end_frames();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(read_at(&file, 0, 10), &pattern(10)[..]);
+        file.set_len(0).unwrap();
+        file.write_all_at(b"new", 0).unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    });
+}
+
+#[test]
+fn growing_past_the_buffer_limit_fails_with_efbig() {
+    with_mount(|root| {
+        let path = root.join("big.bin");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let efbig = Some(libc::EFBIG);
+        assert_eq!(file.set_len(1 << 40).unwrap_err().raw_os_error(), efbig);
+        assert_eq!(
+            file.write_at(b"x", 1 << 40).unwrap_err().raw_os_error(),
+            efbig
+        );
+        drop(file);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     });
 }
