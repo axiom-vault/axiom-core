@@ -608,8 +608,8 @@ impl VaultSession {
         let anchored = freshness
             .anchor_keys
             .load_state(freshness.anchor.as_ref())?;
-        match (&anchored, &previous_manifest) {
-            (None, None) if *generation == 0 => {}
+        let previous = match (&anchored, &previous_manifest) {
+            (None, None) if *generation == 0 => None,
             (Some(state), Some(bytes))
                 if state.generation == *generation
                     && state
@@ -623,13 +623,14 @@ impl VaultSession {
                         "stored snapshot advanced; reopen the vault before mutating it".to_string(),
                     ));
                 }
+                Some(stored)
             }
             _ => {
                 return Err(Error::Conflict(
                     "trusted snapshot advanced; reopen the vault before mutating it".to_string(),
                 ));
             }
-        }
+        };
 
         let next_generation = generation
             .checked_add(1)
@@ -700,13 +701,11 @@ impl VaultSession {
         // are deliberately written after the manifest commit and never authoritative.
         let _ = self.provider.upload(&config_path, config_bytes).await;
         let _ = self.provider.upload(&tree_path, encrypted).await;
-        if let Some(previous_bytes) = previous_manifest {
-            if let Ok(previous) = GenerationManifest::open(self.master_key()?, &previous_bytes) {
-                if previous.version == 2 {
-                    if let Ok((_, previous_config_path)) = previous.object_paths() {
-                        if previous_config_path != generation_config_path {
-                            let _ = self.provider.delete(&previous_config_path).await;
-                        }
+        if let Some(previous) = previous {
+            if previous.version == 2 {
+                if let Ok((_, previous_config_path)) = previous.object_paths() {
+                    if previous_config_path != generation_config_path {
+                        let _ = self.provider.delete(&previous_config_path).await;
                     }
                 }
             }

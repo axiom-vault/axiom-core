@@ -421,12 +421,13 @@ impl<'a> VaultOperations<'a> {
         let mut candidate = tree.clone();
         candidate.create_file(path, &encrypted_name, content.len() as u64)?;
 
+        let content_digest = digest(&encrypted_content);
         self.session
             .provider()
-            .upload(&storage_path, encrypted_content.clone())
+            .upload(&storage_path, encrypted_content)
             .await?;
 
-        candidate.get_node_mut(path)?.metadata.content_digest = Some(digest(&encrypted_content));
+        candidate.get_node_mut(path)?.metadata.content_digest = Some(content_digest);
         self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
 
