@@ -687,6 +687,20 @@ impl Filesystem for VaultFilesystem {
                 reply.error(errno);
                 return;
             }
+            // Streaming can't seek back: a new reader downloads and decrypts
+            // the file from its start. To bound that to once per handle, a
+            // read behind the reader loads the whole file into the buffer,
+            // as before reads were streamed, trading memory for random access.
+            let behind = file
+                .reader
+                .as_ref()
+                .is_some_and(|cursor| offset < cursor.start);
+            if behind {
+                if let Err(errno) = load_buffer(&session, file).await {
+                    reply.error(errno);
+                    return;
+                }
+            }
             match &file.buffer {
                 Some(buffer) => {
                     let offset =

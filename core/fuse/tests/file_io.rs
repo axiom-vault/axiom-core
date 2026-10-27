@@ -314,3 +314,21 @@ fn growing_past_the_buffer_limit_fails_with_efbig() {
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
     });
 }
+
+#[test]
+fn reads_behind_the_stream_return_the_right_data() {
+    with_mount(|root| {
+        let path = root.join("data.bin");
+        let content = pattern(FILE_SIZE);
+        fs::write(&path, &content).unwrap();
+
+        let file = fs::File::open(&path).unwrap();
+        for offset in [200_000, 10, 250_000, 70_000, 0] {
+            assert_eq!(
+                read_at(&file, offset as u64, 1_000),
+                &content[offset..offset + 1_000],
+                "offset {offset}"
+            );
+        }
+    });
+}
