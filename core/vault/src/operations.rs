@@ -773,10 +773,10 @@ impl<'a> VaultOperations<'a> {
         let content = match content_version {
             0 => decrypt(file_key.as_bytes(), &encrypted_content)?,
             STREAM_CONTENT_VERSION => {
-                let mut plaintext = Vec::new();
+                let mut plaintext = Zeroizing::new(Vec::with_capacity(encrypted_content.len()));
                 DecryptingStream::new(file_key.as_bytes())?
-                    .decrypt_stream(encrypted_content.as_slice(), &mut plaintext)?;
-                plaintext
+                    .decrypt_stream(encrypted_content.as_slice(), &mut *plaintext)?;
+                std::mem::take(&mut *plaintext)
             }
             other => {
                 return Err(Error::Crypto(format!(
