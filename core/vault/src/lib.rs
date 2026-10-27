@@ -29,6 +29,6 @@ pub use axiomvault_common::health::{DiagnosticResult, HealthReport, HealthStatus
 pub use health::{check_vault_health, check_vault_structure};
 pub use manager::{VaultCreation, VaultManager};
 pub use migration::{check_migration_needed, Migration, MigrationRegistry, MigrationStatus};
-pub use operations::{FileReader, VaultOperations};
+pub use operations::{FileReader, FileWriter, VaultOperations};
 pub use session::{SessionHandle, VaultSession};
 pub use tree::{NodeType, TreeNode, VaultTree};
