@@ -164,6 +164,7 @@ async fn read_streamed(
 
     let mut data = Zeroizing::new(Vec::with_capacity(size));
     let mut position = offset;
+    let mut ended = false;
     while data.len() < size {
         let end = cursor.start + cursor.chunk.len() as u64;
         if position < end {
@@ -183,7 +184,27 @@ async fn read_streamed(
                 file.reader = None;
                 return Err(Errno::EIO);
             }
-            None => break,
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    // An integrity error is queued after the last byte. A read that ends
+    // exactly there must still see the stream end cleanly.
+    if !ended && position >= cursor.reader.size() {
+        match cursor.reader.next_chunk().await {
+            None => {}
+            Some(Ok(_)) => {
+                error!("Failed to read file: more content than its recorded size");
+                file.reader = None;
+                return Err(Errno::EIO);
+            }
+            Some(Err(e)) => {
+                error!("Failed to read file: {}", e);
+                file.reader = None;
+                return Err(Errno::EIO);
+            }
         }
     }
     Ok(data)

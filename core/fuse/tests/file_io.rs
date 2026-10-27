@@ -332,3 +332,17 @@ fn reads_behind_the_stream_return_the_right_data() {
         }
     });
 }
+
+#[test]
+fn tampered_end_fails_a_read_that_ends_on_a_page() {
+    with_storage(|root, storage| {
+        let path = root.join("aligned.bin");
+        let content = pattern(2 * 65_536);
+        fs::write(&path, &content).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), content);
+
+        storage.tamper_end_frames();
+        let error = fs::read(&path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    });
+}
