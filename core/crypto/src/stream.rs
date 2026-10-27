@@ -692,4 +692,68 @@ mod tests {
 
         assert!(decrypt_bytes(&key, &encrypted).is_err());
     }
+
+    /// Version-2 frames are `len || aead::encrypt(index || kind || chunk_size || data)`.
+    /// The in-place stream path must stay byte-compatible with that per-frame AEAD
+    /// construction in both directions.
+    #[test]
+    fn stream_frames_match_per_frame_aead() {
+        let key = [9u8; KEY_LENGTH];
+        for len in [
+            0,
+            1,
+            DEFAULT_CHUNK_SIZE,
+            DEFAULT_CHUNK_SIZE + 7,
+            3 * DEFAULT_CHUNK_SIZE,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            // Stream output opens frame by frame with aead::decrypt.
+            let encrypted = encrypt_bytes(&key, &data).unwrap();
+            assert_eq!(encrypted[0], STREAM_VERSION);
+            assert_eq!(
+                encrypted[1..HEADER_SIZE],
+                (DEFAULT_CHUNK_SIZE as u32).to_le_bytes()
+            );
+            let mut pos = HEADER_SIZE;
+            let mut index = 0u64;
+            let mut recovered = Vec::new();
+            loop {
+                let frame_len =
+                    u32::from_le_bytes(encrypted[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += FRAME_LENGTH_SIZE;
+                let plaintext = decrypt(&key, &encrypted[pos..pos + frame_len]).unwrap();
+                pos += frame_len;
+                assert_eq!(plaintext[..8], index.to_le_bytes());
+                assert_eq!(plaintext[9..13], (DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                if plaintext[8] == END_FRAME {
+                    assert_eq!(plaintext.len(), FRAME_METADATA_SIZE);
+                    break;
+                }
+                assert_eq!(plaintext[8], DATA_FRAME);
+                recovered.extend_from_slice(&plaintext[FRAME_METADATA_SIZE..]);
+                index += 1;
+            }
+            assert_eq!(pos, encrypted.len());
+            assert_eq!(recovered, data);
+
+            // Frames sealed with aead::encrypt decrypt through DecryptingStream.
+            let mut built = vec![STREAM_VERSION];
+            built.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+            let frames = data
+                .chunks(DEFAULT_CHUNK_SIZE)
+                .map(|chunk| (DATA_FRAME, chunk))
+                .chain(std::iter::once((END_FRAME, &[][..])));
+            for (index, (kind, chunk)) in frames.enumerate() {
+                let mut plaintext = (index as u64).to_le_bytes().to_vec();
+                plaintext.push(kind);
+                plaintext.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                plaintext.extend_from_slice(chunk);
+                let sealed = encrypt(&key, &plaintext).unwrap();
+                built.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+                built.extend_from_slice(&sealed);
+            }
+            assert_eq!(decrypt_bytes(&key, &built).unwrap(), data);
+        }
+    }
 }
