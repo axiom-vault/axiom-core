@@ -721,7 +721,10 @@ impl VaultSession {
         let _ = self.provider.upload(&tree_path, encrypted).await;
         if let Some(previous) = previous {
             if previous.version == 2 {
-                if let Ok((_, previous_config_path)) = previous.object_paths() {
+                if let Ok((previous_tree_path, previous_config_path)) = previous.object_paths() {
+                    if previous_tree_path != generation_tree_path {
+                        let _ = self.provider.delete(&previous_tree_path).await;
+                    }
                     if previous_config_path != generation_config_path {
                         let _ = self.provider.delete(&previous_config_path).await;
                     }
