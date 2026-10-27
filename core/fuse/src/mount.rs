@@ -19,6 +19,8 @@ pub struct MountOptions {
     /// Allow other users to access the mount.
     pub allow_other: bool,
     /// Enable auto unmount when process exits.
+    ///
+    /// fuser rejects this with owner-only access, so it requires `allow_other`.
     pub auto_unmount: bool,
     /// Read-only mount.
     pub read_only: bool,
@@ -30,7 +32,7 @@ impl Default for MountOptions {
     fn default() -> Self {
         Self {
             allow_other: false,
-            auto_unmount: true,
+            auto_unmount: false,
             read_only: false,
             default_permissions: true,
         }
@@ -261,7 +263,7 @@ mod tests {
     fn test_default_mount_options() {
         let opts = MountOptions::default();
         assert!(!opts.allow_other);
-        assert!(opts.auto_unmount);
+        assert!(!opts.auto_unmount);
         assert!(!opts.read_only);
         assert!(opts.default_permissions);
     }
@@ -331,14 +333,10 @@ mod tests {
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let options = MountOptions {
-            auto_unmount: false,
-            ..Default::default()
-        };
         let Ok(handle) = mount(
             session.clone(),
             dir.path(),
-            options,
+            MountOptions::default(),
             runtime.handle().clone(),
         ) else {
             return;
