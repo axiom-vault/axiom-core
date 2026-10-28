@@ -654,12 +654,15 @@ impl VaultSession {
         let manifest_digest = digest(&manifest_bytes);
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
 
+        // Both objects live in the manifest's directory: sync it once, after
+        // both are in place and before the manifest that references them.
         self.provider
-            .upload(&generation_config_path, config_bytes.clone())
+            .upload_unsynced(&generation_config_path, config_bytes.clone())
             .await?;
         self.provider
-            .upload(&generation_tree_path, encrypted.clone())
+            .upload_unsynced(&generation_tree_path, encrypted.clone())
             .await?;
+        self.provider.sync_parent_dir(&generation_tree_path).await?;
 
         if let Err(error) = self
             .provider
@@ -703,6 +706,9 @@ impl VaultSession {
         }
         // Compatibility caches for health tooling and pre-manifest readers. They
         // are deliberately written after the manifest commit and never authoritative.
+        // A crash can leave the tree cache stale and superseded generation
+        // objects in place, as a crash right after the commit can, so their
+        // directory is synced by the next publication instead of here.
         let config_written = freshness
             .written_config
             .lock()
@@ -718,15 +724,15 @@ impl VaultSession {
                 *written = Some(config_bytes);
             }
         }
-        let _ = self.provider.upload(&tree_path, encrypted).await;
+        let _ = self.provider.upload_unsynced(&tree_path, encrypted).await;
         if let Some(previous) = previous {
             if previous.version == 2 {
                 if let Ok((previous_tree_path, previous_config_path)) = previous.object_paths() {
                     if previous_tree_path != generation_tree_path {
-                        let _ = self.provider.delete(&previous_tree_path).await;
+                        let _ = self.provider.delete_unsynced(&previous_tree_path).await;
                     }
                     if previous_config_path != generation_config_path {
-                        let _ = self.provider.delete(&previous_config_path).await;
+                        let _ = self.provider.delete_unsynced(&previous_config_path).await;
                     }
                 }
             }

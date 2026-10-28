@@ -215,6 +215,28 @@ pub trait StorageProvider: Send + Sync {
     /// - Not permitted (e.g., directory)
     async fn delete(&self, path: &VaultPath) -> Result<()>;
 
+    /// Like [`upload`](Self::upload), but the new directory entry may not be
+    /// durable until [`sync_parent_dir`](Self::sync_parent_dir) of the path,
+    /// or any later durable change in the same directory. The content itself
+    /// is durable. The default is a durable upload.
+    async fn upload_unsynced(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.upload(path, data).await
+    }
+
+    /// Like [`delete`](Self::delete), with the removal durable only as
+    /// [`upload_unsynced`](Self::upload_unsynced) describes. The default is a
+    /// durable delete.
+    async fn delete_unsynced(&self, path: &VaultPath) -> Result<()> {
+        self.delete(path).await
+    }
+
+    /// Make every directory entry change in the parent directory of `path`
+    /// durable. Providers whose mutations are durable when they return need
+    /// nothing here.
+    async fn sync_parent_dir(&self, _path: &VaultPath) -> Result<()> {
+        Ok(())
+    }
+
     /// List contents of a directory.
     ///
     /// # Preconditions

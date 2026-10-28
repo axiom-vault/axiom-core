@@ -243,8 +243,14 @@ impl LocalProvider {
         result
     }
 
-    /// Delete a file, optionally only if it is still at `expected` revision.
-    async fn delete_file(&self, path: &VaultPath, expected: Option<Option<&str>>) -> Result<()> {
+    /// Delete a file, optionally only if it is still at `expected` revision,
+    /// and sync the directory when `sync` is set.
+    async fn delete_file(
+        &self,
+        path: &VaultPath,
+        expected: Option<Option<&str>>,
+        sync: bool,
+    ) -> Result<()> {
         let fs_path = self.checked_fs_path(path)?;
         {
             let _guard = commit_lock();
@@ -261,16 +267,21 @@ impl LocalProvider {
             }
             std::fs::remove_file(&fs_path)?;
         }
-        Self::sync_parent(&fs_path).await
+        if sync {
+            Self::sync_parent(&fs_path).await?;
+        }
+        Ok(())
     }
 
     /// Write `data` to a synced temporary file in the target directory, then
-    /// commit it to `path` as `commit` allows.
+    /// commit it to `path` as `commit` allows, and sync the directory when
+    /// `sync` is set.
     async fn write_file(
         &self,
         path: &VaultPath,
         data: Vec<u8>,
         commit: Commit<'_>,
+        sync: bool,
     ) -> Result<Metadata> {
         let fs_path = self.checked_fs_path(path)?;
 
@@ -355,7 +366,9 @@ impl LocalProvider {
         };
         self.commit_temp(path, &fs_path, &tmp_path, commit)?;
 
-        Self::sync_parent(&fs_path).await?;
+        if sync {
+            Self::sync_parent(&fs_path).await?;
+        }
         Ok(metadata)
     }
 }
@@ -367,7 +380,19 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
-        self.write_file(path, data, Commit::Replace).await
+        self.write_file(path, data, Commit::Replace, true).await
+    }
+
+    async fn upload_unsynced(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.write_file(path, data, Commit::Replace, false).await
+    }
+
+    async fn delete_unsynced(&self, path: &VaultPath) -> Result<()> {
+        self.delete_file(path, None, false).await
+    }
+
+    async fn sync_parent_dir(&self, path: &VaultPath) -> Result<()> {
+        Self::sync_parent(&self.checked_fs_path(path)?).await
     }
 
     async fn upload_if_match(
@@ -376,12 +401,12 @@ impl StorageProvider for LocalProvider {
         data: Vec<u8>,
         expected_etag: Option<&str>,
     ) -> Result<Metadata> {
-        self.write_file(path, data, Commit::IfMatch(expected_etag))
+        self.write_file(path, data, Commit::IfMatch(expected_etag), true)
             .await
     }
 
     async fn delete_if_match(&self, path: &VaultPath, expected_etag: Option<&str>) -> Result<()> {
-        self.delete_file(path, Some(expected_etag)).await
+        self.delete_file(path, Some(expected_etag), true).await
     }
 
     async fn upload_stream(&self, path: &VaultPath, mut stream: ByteStream) -> Result<Metadata> {
@@ -479,7 +504,7 @@ impl StorageProvider for LocalProvider {
     }
 
     async fn delete(&self, path: &VaultPath) -> Result<()> {
-        self.delete_file(path, None).await
+        self.delete_file(path, None, true).await
     }
 
     async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
@@ -700,6 +725,31 @@ impl StorageProvider for LocalProvider {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn unsynced_writes_and_deletes_commit_like_synced_ones() {
+        let temp = TempDir::new().unwrap();
+        let provider = LocalProvider::new(temp.path()).unwrap();
+        let dir = VaultPath::parse("/m").unwrap();
+        provider.create_dir(&dir).await.unwrap();
+        let path = dir.join("object").unwrap();
+
+        provider
+            .upload_unsynced(&path, b"first".to_vec())
+            .await
+            .unwrap();
+        provider
+            .upload_unsynced(&path, b"second".to_vec())
+            .await
+            .unwrap();
+        provider.sync_parent_dir(&path).await.unwrap();
+        assert_eq!(provider.download(&path).await.unwrap(), b"second");
+        assert_eq!(provider.list(&dir).await.unwrap().len(), 1);
+
+        provider.delete_unsynced(&path).await.unwrap();
+        assert!(!provider.exists(&path).await.unwrap());
+        assert!(provider.delete_unsynced(&path).await.is_err());
+    }
 
     #[cfg(unix)]
     #[test]
