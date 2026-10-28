@@ -5846,5 +5846,65 @@ mod tests {
                     .unwrap()
             );
         }
+
+        #[tokio::test]
+        async fn recreating_a_deleted_vault_needs_a_new_id() {
+            let vault = LocalVault::new("recreated");
+            let manager = local_manager(Arc::new(InMemoryFreshnessAnchor::new()));
+            let config = LocalVault::config(&vault.canonical);
+            let create = |id| {
+                manager.create_vault(
+                    id,
+                    b"password",
+                    "local",
+                    config.clone(),
+                    KdfParams::moderate(),
+                )
+            };
+            drop(create(vault.id.clone()).await.unwrap());
+            std::fs::remove_dir_all(&vault.canonical).unwrap();
+
+            // The anchor outlives the deleted storage, so the old ID is refused.
+            assert!(matches!(
+                create(vault.id.clone()).await.err(),
+                Some(Error::AlreadyExists(_))
+            ));
+            let fresh = VaultId::unique("recreated").unwrap();
+            drop(create(fresh.clone()).await.unwrap());
+            let session = manager
+                .open_vault("local", config.clone(), b"password")
+                .await
+                .unwrap();
+            assert_eq!(session.vault_id(), &fresh);
+        }
+
+        #[tokio::test]
+        async fn same_id_at_two_locations_keeps_separate_anchors() {
+            let first = LocalVault::new("same-name");
+            let second = LocalVault::new("same-name");
+            let anchor = Arc::new(InMemoryFreshnessAnchor::new());
+            let manager = local_manager(anchor.clone());
+            let mut sessions = Vec::new();
+            for vault in [&first, &second] {
+                let creation = manager
+                    .create_vault(
+                        vault.id.clone(),
+                        b"password",
+                        "local",
+                        LocalVault::config(&vault.canonical),
+                        KdfParams::moderate(),
+                    )
+                    .await
+                    .unwrap();
+                sessions.push(creation.session);
+            }
+            add_file(&sessions[0], "/one").await;
+
+            let first_key = key(&LocalVault::config(&first.canonical), &first.id);
+            let second_key = key(&LocalVault::config(&second.canonical), &second.id);
+            assert_ne!(first_key, second_key);
+            assert_eq!(anchor.load(&first_key).unwrap(), Some(2));
+            assert_eq!(anchor.load(&second_key).unwrap(), Some(1));
+        }
     }
 }
