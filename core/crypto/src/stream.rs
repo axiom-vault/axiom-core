@@ -190,7 +190,9 @@ impl<'a> DecryptingStream<'a> {
         let max_frame = NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE + chunk_size;
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
         // Frames are read into one reused buffer and opened in place.
-        let mut frame = Zeroizing::new(vec![0u8; max_frame]);
+        // It grows to the largest frame seen, so a small file neither
+        // allocates nor wipes a whole chunk.
+        let mut frame = Zeroizing::new(Vec::new());
         let mut index = 0u64;
         let mut total_bytes = 0u64;
         loop {
@@ -201,6 +203,10 @@ impl<'a> DecryptingStream<'a> {
             let frame_len = u32::from_le_bytes(length) as usize;
             if frame_len < NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE || frame_len > max_frame {
                 return Err(Error::Crypto("Invalid encrypted frame length".to_string()));
+            }
+            if frame.len() < frame_len {
+                // Replacing the buffer wipes the old one, which holds plaintext.
+                frame = Zeroizing::new(vec![0u8; frame_len]);
             }
             let encrypted = &mut frame[..frame_len];
             reader.read_exact(encrypted)?;

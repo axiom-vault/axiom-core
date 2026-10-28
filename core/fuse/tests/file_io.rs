@@ -346,3 +346,26 @@ fn tampered_end_fails_a_read_that_ends_on_a_page() {
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
     });
 }
+
+#[test]
+fn small_files_read_whole_serve_every_offset() {
+    with_storage(|root, storage| {
+        let path = root.join("small.bin");
+        let content = pattern(4096);
+        fs::write(&path, &content).unwrap();
+
+        let file = fs::File::open(&path).unwrap();
+        for offset in [100, 0, 4000, 4096] {
+            let end = (offset + 1_000).min(content.len());
+            assert_eq!(
+                read_at(&file, offset as u64, 1_000),
+                &content[offset..end],
+                "offset {offset}"
+            );
+        }
+
+        storage.tamper_end_frames();
+        let error = fs::read(&path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    });
+}

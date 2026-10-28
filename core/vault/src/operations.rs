@@ -27,6 +27,12 @@ const UPLOAD_CHANNEL_CAPACITY: usize = 4;
 /// Plaintext written to a [`FileWriter`] is handed to the encryptor in
 /// batches of this size, so small writes don't each wake another thread.
 const WRITE_BATCH_SIZE: usize = 1024 * 1024;
+/// Files up to this size (four 64 KiB stream frames) are read in one piece
+/// rather than streamed. Setting up a stream (blocking tasks, channels, a
+/// chunked download) costs more than reading such a file, and its plaintext
+/// and ciphertext together take no more memory than the frames a stream
+/// keeps in flight anyway.
+const STREAM_READ_THRESHOLD: u64 = 256 * 1024;
 
 /// `Write` adapter that batches ciphertext into chunks for a provider upload
 /// stream while hashing everything it forwards.
@@ -932,7 +938,9 @@ impl<'a> VaultOperations<'a> {
     /// digest can only be checked once the whole blob has been downloaded,
     /// so a mismatch surfaces as an error in place of the end of the file.
     /// Frames before `offset` are decrypted and dropped. Files written in
-    /// one piece (content version 0) are read whole.
+    /// one piece (content version 0) and files of at most
+    /// `STREAM_READ_THRESHOLD` bytes are read, verified and decrypted whole
+    /// before this returns.
     pub async fn open_file_reader(&self, path: &VaultPath, offset: u64) -> Result<FileReader> {
         let (encrypted_name, expected_digest, content_version, size) = {
             let tree = self.session.tree().read().await;
@@ -951,7 +959,7 @@ impl<'a> VaultOperations<'a> {
         if offset >= size {
             return Ok(FileReader { receiver, size });
         }
-        if content_version != STREAM_CONTENT_VERSION {
+        if content_version != STREAM_CONTENT_VERSION || size <= STREAM_READ_THRESHOLD {
             let content = Zeroizing::new(self.read_file(path).await?);
             let start = usize::try_from(offset).map_or(content.len(), |o| o.min(content.len()));
             if start < content.len() {
@@ -1927,11 +1935,6 @@ mod tests {
             assert_eq!(read_to_end(&mut reader).await.unwrap(), &data[start..]);
         }
 
-        // Rewritten files use the stream format too.
-        ops.update_file(&path, &data[..1000]).await.unwrap();
-        let mut reader = ops.open_file_reader(&path, 10).await.unwrap();
-        assert_eq!(read_to_end(&mut reader).await.unwrap(), &data[10..1000]);
-
         let data_dir = VaultPath::parse("/d").unwrap();
         let stored = session.provider().list(&data_dir).await.unwrap();
         let stored_path = data_dir.join(&stored[0].name).unwrap();
@@ -1945,6 +1948,42 @@ mod tests {
             .unwrap();
         let mut reader = ops.open_file_reader(&path, 0).await.unwrap();
         assert!(read_to_end(&mut reader).await.is_err());
+
+        // Rewritten files use the stream format too.
+        ops.update_file(&path, &data[..1000]).await.unwrap();
+        let mut reader = ops.open_file_reader(&path, 10).await.unwrap();
+        assert_eq!(read_to_end(&mut reader).await.unwrap(), &data[10..1000]);
+    }
+
+    #[tokio::test]
+    async fn small_file_readers_verify_the_whole_file_up_front() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/small.bin").unwrap();
+        let data: Vec<u8> = (0..STREAM_READ_THRESHOLD)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        ops.create_file(&path, b"").await.unwrap();
+        ops.update_file(&path, &data).await.unwrap();
+
+        let mut reader = ops.open_file_reader(&path, 100).await.unwrap();
+        assert_eq!(reader.size(), data.len() as u64);
+        let chunk = reader.next_chunk().await.unwrap().unwrap();
+        assert_eq!(chunk.as_slice(), &data[100..]);
+        assert!(reader.next_chunk().await.is_none());
+
+        // A truncated blob fails before any of its plaintext is handed out.
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let stored = session.provider().list(&data_dir).await.unwrap();
+        let stored_path = data_dir.join(&stored[0].name).unwrap();
+        let mut ciphertext = session.provider().download(&stored_path).await.unwrap();
+        ciphertext.truncate(ciphertext.len() - 10);
+        session
+            .provider()
+            .upload(&stored_path, ciphertext)
+            .await
+            .unwrap();
+        assert!(ops.open_file_reader(&path, 0).await.is_err());
     }
 
     #[tokio::test]
