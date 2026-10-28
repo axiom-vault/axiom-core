@@ -2606,6 +2606,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writers_opened_before_a_rotation_are_not_published() {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MemoryProvider::new());
+        let manager =
+            manager_with_storage(provider.clone(), Arc::new(InMemoryFreshnessAnchor::new()));
+        let mut creation = manager
+            .create_vault(
+                VaultId::new("writer-rotation").unwrap(),
+                b"old-password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        let files = write_rotation_fixture(&creation.session).await;
+        let replaced = files[0].0.clone();
+        let created = VaultPath::parse("/new.txt").unwrap();
+        let (mut replacing, mut creating) = {
+            let ops = VaultOperations::new(&creation.session).unwrap();
+            (
+                ops.open_file_writer(&replaced).await.unwrap(),
+                ops.create_file_writer(&created).await.unwrap(),
+            )
+        };
+        replacing.write(b"replacement").await.unwrap();
+        creating.write(b"created").await.unwrap();
+
+        creation
+            .session
+            .change_password(b"old-password", b"new-password")
+            .unwrap();
+        manager.save_config(&mut creation.session).await.unwrap();
+        let tree_before = serde_json::to_vec(&*creation.session.tree().read().await).unwrap();
+
+        let ops = VaultOperations::new(&creation.session).unwrap();
+        assert!(matches!(
+            ops.finish_file_writer(&replaced, replacing).await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            ops.finish_file_writer(&created, creating).await,
+            Err(Error::Conflict(_))
+        ));
+        let tree = creation.session.tree().read().await;
+        assert_eq!(serde_json::to_vec(&*tree).unwrap(), tree_before);
+        assert_eq!(
+            object_names(provider.as_ref(), DATA_DIRNAME).await,
+            crate::operations::file_object_names(&tree)
+                .into_iter()
+                .collect()
+        );
+        drop(tree);
+        assert_fixture(&creation.session, &files).await;
+        drop(creation);
+
+        let reopened = manager
+            .open_vault("test", serde_json::Value::Null, b"new-password")
+            .await
+            .unwrap();
+        assert_fixture(&reopened, &files).await;
+    }
+
+    #[tokio::test]
     async fn authenticated_first_open_bootstraps_a_new_local_anchor() {
         let provider = Arc::new(MemoryProvider::new());
         let creator =

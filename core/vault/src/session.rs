@@ -3,6 +3,7 @@
 //! Sessions hold decrypted keys in memory and provide access to vault operations.
 //! Keys are automatically zeroized when the session is dropped.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -20,6 +21,9 @@ use axiomvault_storage::StorageProvider;
 
 /// Context tag for tree index key derivation. Changing this invalidates all existing vaults.
 pub(crate) const TREE_KEY_CONTEXT: &[u8] = b"vault_tree_index_v1";
+
+/// Source of process-unique master key identities.
+static NEXT_MASTER_KEY_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Session handle for tracking active sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -64,6 +68,8 @@ pub struct VaultSession {
     committed_config: StdMutex<VaultConfig>,
     /// Master key (zeroized on drop).
     master_key: Option<MasterKey>,
+    /// Process-unique identity of `master_key`, replaced with it on rotation.
+    master_key_id: u64,
     /// Replacement master key staged by a password change or reset. It
     /// becomes `master_key` only once the re-encrypted vault is committed.
     pending_master_key: Option<MasterKey>,
@@ -146,6 +152,7 @@ impl VaultSession {
             committed_config: StdMutex::new(config.clone()),
             config,
             master_key: Some(master_key),
+            master_key_id: NEXT_MASTER_KEY_ID.fetch_add(1, Ordering::Relaxed),
             pending_master_key: None,
             provider,
             tree: Arc::new(RwLock::new(tree)),
@@ -280,6 +287,12 @@ impl VaultSession {
                 .ok_or_else(|| Error::Vault("Master key not available".to_string())),
             SessionState::Locked => Err(Error::NotPermitted("Session is locked".to_string())),
         }
+    }
+
+    /// Identity of the master key, so work started under one key can be
+    /// refused if it would be published under another.
+    pub(crate) fn master_key_id(&self) -> u64 {
+        self.master_key_id
     }
 
     /// Get the current session state.
@@ -447,6 +460,7 @@ impl VaultSession {
 
         // Committed: switch the session over and zeroize the old key.
         self.master_key = Some(new_key);
+        self.master_key_id = NEXT_MASTER_KEY_ID.fetch_add(1, Ordering::Relaxed);
         self.pending_master_key = None;
         drop(old_key);
         *self.tree.write().await = rotated.clone();

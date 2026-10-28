@@ -285,6 +285,8 @@ pub struct FileWriter {
     /// Yields the digest of the uploaded ciphertext.
     upload_task: tokio::task::JoinHandle<Result<String>>,
     encrypted_name: String,
+    /// Session master key the name and content are encrypted under.
+    master_key_id: u64,
     size: u64,
     /// Written plaintext not yet handed to the encryptor. Never grows past
     /// its capacity, so it is never reallocated with unwiped contents.
@@ -1170,6 +1172,7 @@ impl<'a> VaultOperations<'a> {
             encrypt_task,
             upload_task,
             encrypted_name,
+            master_key_id: self.session.master_key_id(),
             size: 0,
             batch: Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
             consumed,
@@ -1189,6 +1192,7 @@ impl<'a> VaultOperations<'a> {
             encrypt_task,
             upload_task,
             encrypted_name,
+            master_key_id,
             size,
             batch: _,
             consumed: _,
@@ -1207,7 +1211,12 @@ impl<'a> VaultOperations<'a> {
 
         let mut tree = self.session.tree().write().await;
         let mut candidate = tree.clone();
-        let node = if create {
+        let node = if master_key_id != self.session.master_key_id() {
+            // Published under another key, the file would be unreadable.
+            Err(Error::Conflict(
+                "the master key changed while the file was written".to_string(),
+            ))
+        } else if create {
             candidate.create_file(path, &encrypted_name, size)
         } else {
             Ok(())
