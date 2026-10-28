@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::provider::{check_precondition, ByteStream, Metadata, StorageProvider};
+use crate::provider::{check_precondition, too_long, ByteStream, Metadata, StorageProvider};
 use axiomvault_common::{Error, Result, VaultPath};
 
 /// Serialises every commit that replaces or removes a file in this process,
@@ -498,6 +498,38 @@ impl StorageProvider for LocalProvider {
         Ok(Box::pin(stream))
     }
 
+    async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        let fs_path = self.checked_fs_path(path)?;
+        if !fs_path.exists() {
+            return Err(Error::NotFound(format!("File not found: {}", path)));
+        }
+        if fs_path.is_dir() {
+            return Err(Error::InvalidInput("Cannot download directory".to_string()));
+        }
+        // One blocking-pool hop for the whole object: a stream takes one per
+        // chunk plus the open, which dominates the cost of small reads.
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&fs_path)?;
+            let len = file.metadata()?.len();
+            if len > max_len {
+                return Err(too_long(&path, max_len));
+            }
+            let mut data = Vec::with_capacity(len as usize);
+            // The file may have grown since the stat.
+            file.take(max_len.saturating_add(1))
+                .read_to_end(&mut data)?;
+            if data.len() as u64 > max_len {
+                return Err(too_long(&path, max_len));
+            }
+            Ok(data)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("spawn_blocking join error: {}", e)))?
+    }
+
     async fn exists(&self, path: &VaultPath) -> Result<bool> {
         let fs_path = self.checked_fs_path(path)?;
         Ok(fs_path.exists())
@@ -822,6 +854,61 @@ mod tests {
         let downloaded = provider.download(&path).await.unwrap();
 
         assert_eq!(downloaded, data);
+    }
+
+    fn is_too_long(error: &Error) -> bool {
+        matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::FileTooLarge)
+    }
+
+    #[tokio::test]
+    async fn download_bounded_reads_only_objects_within_the_bound() {
+        let temp = TempDir::new().unwrap();
+        let provider = LocalProvider::new(temp.path()).unwrap();
+        let path = VaultPath::parse("/blob").unwrap();
+        provider.upload(&path, vec![7; 4096]).await.unwrap();
+
+        for max_len in [4096, 4097, 1 << 30] {
+            let data = provider.download_bounded(&path, max_len).await.unwrap();
+            assert_eq!(data, vec![7; 4096]);
+            // Sized from the file, not from the bound.
+            assert_eq!(data.capacity(), 4096);
+        }
+        for max_len in [0, 4095] {
+            let error = provider.download_bounded(&path, max_len).await.unwrap_err();
+            assert!(is_too_long(&error), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_bounded_stops_at_the_bound_when_the_file_outgrows_its_stat() {
+        use std::io::Write;
+
+        // A FIFO stats as empty and then yields whatever is written to it.
+        let temp = TempDir::new().unwrap();
+        let provider = LocalProvider::new(temp.path()).unwrap();
+        let fifo = temp.path().join("growing");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let writer = std::thread::spawn(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fifo)
+                .unwrap()
+                .write_all(&vec![0; 16 * 1024 * 1024])
+        });
+
+        let error = provider
+            .download_bounded(&VaultPath::parse("/growing").unwrap(), 4096)
+            .await
+            .unwrap_err();
+        assert!(is_too_long(&error), "{error}");
+        // The reader hung up long before the writer was done.
+        let write = writer.join().unwrap();
+        assert_eq!(write.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]

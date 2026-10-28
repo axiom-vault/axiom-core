@@ -554,17 +554,12 @@ async fn download_exact(
 ) -> Result<Vec<u8>> {
     let mismatch =
         || Error::Crypto("encrypted file does not match the authenticated snapshot".to_string());
-    let expected_len = usize::try_from(expected_len).map_err(|_| mismatch())?;
-    let mut download = provider.download_stream(path).await?;
-    let mut data = Vec::with_capacity(expected_len);
-    while let Some(chunk) = download.next().await {
-        let chunk = chunk?;
-        if chunk.len() > expected_len - data.len() {
-            return Err(mismatch());
-        }
-        data.extend_from_slice(&chunk);
-    }
-    if data.len() != expected_len {
+    let len = usize::try_from(expected_len).map_err(|_| mismatch())?;
+    let data = match provider.download_bounded(path, expected_len).await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => return Err(mismatch()),
+        result => result?,
+    };
+    if data.len() != len {
         return Err(mismatch());
     }
     Ok(data)
@@ -2176,14 +2171,14 @@ mod tests {
             let mut oversized = blob.clone();
             oversized.resize(16 * 1024 * 1024, 0);
             provider.serve_data_blob(oversized);
-            assert!(ops.read_file(path).await.is_err());
+            assert!(matches!(ops.read_file(path).await, Err(Error::Crypto(_))));
             // Cut off within one chunk of the expected length.
             assert!(provider.streamed.load(Ordering::SeqCst) <= expected_len + 4096);
             assert!(ops.open_file_reader(path, 0).await.is_err());
             assert!(provider.streamed.load(Ordering::SeqCst) <= 2 * (expected_len + 4096));
 
             provider.serve_data_blob(blob[..blob.len() - 1].to_vec());
-            assert!(ops.read_file(path).await.is_err());
+            assert!(matches!(ops.read_file(path).await, Err(Error::Crypto(_))));
 
             provider.serve_data_blob(blob);
             assert_eq!(ops.read_file(path).await.unwrap(), data);
@@ -2208,7 +2203,7 @@ mod tests {
             &mut Vec::new(),
         )
         .await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Crypto(_))));
         assert!(provider.streamed.load(Ordering::SeqCst) <= 4096 + 24 + 16 + 4096);
     }
 

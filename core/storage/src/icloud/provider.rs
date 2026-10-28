@@ -81,6 +81,10 @@ impl StorageProvider for ICloudProvider {
         self.local.download_stream(path).await
     }
 
+    async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+        self.local.download_bounded(path, max_len).await
+    }
+
     async fn exists(&self, path: &VaultPath) -> Result<bool> {
         self.local.exists(path).await
     }
