@@ -121,6 +121,10 @@ struct OpenFile {
     /// Set when streaming a write failed. What was streamed is lost, so
     /// every later operation fails instead of saving a partial file.
     failed: bool,
+    /// Created by this handle and not in the vault until it is first saved,
+    /// so that a new file is published once, with its content. A crash
+    /// before then loses the file.
+    created: bool,
 }
 
 /// Sequential reader of an open file, with the chunk it returned last kept
@@ -251,6 +255,7 @@ async fn finish_writer(
     file.failed = result.is_err();
     result?;
     file.reader = None;
+    file.created = false;
     info!("File saved");
     Ok(())
 }
@@ -270,7 +275,12 @@ async fn start_writer(
     if !empty {
         return Ok(());
     }
-    let writer = ops.open_file_writer(&path).await.map_err(|e| {
+    let writer = if file.created {
+        ops.create_file_writer(&path).await
+    } else {
+        ops.open_file_writer(&path).await
+    };
+    let writer = writer.map_err(|e| {
         error!("Failed to open file for writing: {}", e);
         Errno::EIO
     })?;
@@ -284,6 +294,9 @@ async fn start_writer(
 /// Write a dirty handle's buffer back to the vault.
 async fn persist(session: &VaultSession, file: &mut OpenFile) -> std::result::Result<(), Errno> {
     finish_writer(session, file).await?;
+    if file.created {
+        return create(session, file).await;
+    }
     let Some(buffer) = file.buffer.as_ref().filter(|_| file.dirty) else {
         return Ok(());
     };
@@ -305,6 +318,47 @@ async fn persist(session: &VaultSession, file: &mut OpenFile) -> std::result::Re
 
     file.dirty = false;
     info!("File saved");
+    Ok(())
+}
+
+/// Publish a file a handle created, with the content it has buffered.
+async fn create(session: &VaultSession, file: &mut OpenFile) -> std::result::Result<(), Errno> {
+    let ops = VaultOperations::new(session).map_err(|_| Errno::EIO)?;
+    let path = VaultPath::parse(&file.path).map_err(|_| Errno::EIO)?;
+    let content = file.buffer.as_deref().unwrap_or_default();
+    ops.create_file(&path, content).await.map_err(|e| {
+        error!("Failed to create file: {}", e);
+        Errno::EIO
+    })?;
+    file.created = false;
+    file.dirty = false;
+    info!("File created");
+    Ok(())
+}
+
+/// Size of the file a handle created at `path` and has not saved yet.
+fn created_size(files: &HashMap<FileHandle, OpenFile>, path: &str) -> Option<u64> {
+    files
+        .values()
+        .find(|file| file.created && file.path == path)
+        .map(|file| match (&file.writer, &file.buffer) {
+            (Some(writer), _) => writer.size(),
+            (None, buffer) => buffer.as_ref().map_or(0, |buffer| buffer.len() as u64),
+        })
+}
+
+/// Save the not yet saved files that handles created at paths `matches`
+/// accepts, before an operation that needs them in the vault.
+async fn save_created(
+    session: &VaultSession,
+    files: &mut HashMap<FileHandle, OpenFile>,
+    matches: impl Fn(&str) -> bool,
+) -> std::result::Result<(), Errno> {
+    for file in files.values_mut() {
+        if file.created && matches(&file.path) {
+            persist(session, file).await?;
+        }
+    }
     Ok(())
 }
 
@@ -382,6 +436,7 @@ impl Filesystem for VaultFilesystem {
 
         let session = self.session.clone();
         let inodes = self.inodes.clone();
+        let open_files = self.open_files.clone();
         let ttl = self.ttl;
 
         self.runtime.block_on(async move {
@@ -419,7 +474,14 @@ impl Filesystem for VaultFilesystem {
             };
 
             if !ops.exists(&path).await {
-                reply.error(Errno::ENOENT);
+                match created_size(&*open_files.read().await, &child_path) {
+                    Some(size) => {
+                        let ino = inodes.write().await.get_or_create_inode(&child_path);
+                        let attr = create_file_attr(ino, false, size);
+                        reply.entry(&ttl, &attr, Generation(0));
+                    }
+                    None => reply.error(Errno::ENOENT),
+                }
                 return;
             }
 
@@ -497,6 +559,10 @@ impl Filesystem for VaultFilesystem {
                     let attr = create_file_attr(ino, is_dir, open_size.or(size).unwrap_or(0));
                     reply.attr(&ttl, &attr);
                 }
+                Err(_) if created_size(&*open_files.read().await, &path_str).is_some() => {
+                    let attr = create_file_attr(ino, false, open_size.unwrap_or(0));
+                    reply.attr(&ttl, &attr);
+                }
                 Err(e) => {
                     error!("Failed to get metadata: {}", e);
                     reply.error(Errno::EIO);
@@ -517,6 +583,7 @@ impl Filesystem for VaultFilesystem {
 
         let session = self.session.clone();
         let inodes = self.inodes.clone();
+        let open_files = self.open_files.clone();
 
         self.runtime.block_on(async move {
             let path_str = {
@@ -546,7 +613,7 @@ impl Filesystem for VaultFilesystem {
                 }
             };
 
-            let entries = match ops.list_directory(&path).await {
+            let mut entries = match ops.list_directory(&path).await {
                 Ok(e) => e,
                 Err(e) => {
                     error!("Failed to list directory: {}", e);
@@ -554,6 +621,23 @@ impl Filesystem for VaultFilesystem {
                     return;
                 }
             };
+
+            // Files created here and not saved yet, after the saved ones.
+            let mut created: Vec<_> = open_files
+                .read()
+                .await
+                .values()
+                .filter(|file| file.created)
+                .filter_map(|file| {
+                    let (parent, name) = file.path.rsplit_once('/')?;
+                    let parent = if parent.is_empty() { "/" } else { parent };
+                    (parent == path_str && !entries.iter().any(|(n, _, _)| n == name))
+                        .then(|| (name.to_string(), false, None))
+                })
+                .collect();
+            created.sort();
+            created.dedup();
+            entries.extend(created);
 
             let mut i = offset as usize;
 
@@ -626,6 +710,7 @@ impl Filesystem for VaultFilesystem {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         debug!("open: ino={}, flags={:?}", ino, flags);
 
+        let session = self.session.clone();
         let inodes = self.inodes.clone();
         let open_files = self.open_files.clone();
         let next_fh = self.next_fh.clone();
@@ -644,6 +729,17 @@ impl Filesystem for VaultFilesystem {
 
             if VaultPath::parse(&path_str).is_err() {
                 reply.error(Errno::ENOENT);
+                return;
+            }
+
+            // Another handle reads and writes the file in the vault, so the
+            // creating handle saves it first with what it has written.
+            let saved = save_created(&session, &mut *open_files.write().await, |path| {
+                path == path_str
+            })
+            .await;
+            if let Err(errno) = saved {
+                reply.error(errno);
                 return;
             }
 
@@ -669,6 +765,7 @@ impl Filesystem for VaultFilesystem {
                         writer: None,
                         dirty: truncate,
                         failed: false,
+                        created: false,
                     },
                 );
             }
@@ -922,10 +1019,11 @@ impl Filesystem for VaultFilesystem {
                 }
             };
 
-            // Create empty file
-            if let Err(e) = ops.create_file(&path, &[]).await {
-                error!("Failed to create file: {}", e);
-                reply.error(Errno::EIO);
+            // The file is saved, with its content, when the handle is first
+            // flushed or released. Until then lookups find it in `open_files`.
+            let mut files = open_files.write().await;
+            if ops.exists(&path).await || created_size(&files, &child_path).is_some() {
+                reply.error(Errno::EEXIST);
                 return;
             }
 
@@ -941,20 +1039,18 @@ impl Filesystem for VaultFilesystem {
                 handle
             };
 
-            {
-                let mut files = open_files.write().await;
-                files.insert(
-                    fh,
-                    OpenFile {
-                        path: child_path,
-                        buffer: Some(vec![]),
-                        reader: None,
-                        writer: None,
-                        dirty: false,
-                        failed: false,
-                    },
-                );
-            }
+            files.insert(
+                fh,
+                OpenFile {
+                    path: child_path,
+                    buffer: Some(vec![]),
+                    reader: None,
+                    writer: None,
+                    dirty: false,
+                    failed: false,
+                    created: true,
+                },
+            );
 
             let attr = create_file_attr(ino, false, 0);
 
@@ -983,6 +1079,7 @@ impl Filesystem for VaultFilesystem {
 
         let session = self.session.clone();
         let inodes = self.inodes.clone();
+        let open_files = self.open_files.clone();
         let ttl = self.ttl;
 
         self.runtime.block_on(async move {
@@ -1019,6 +1116,11 @@ impl Filesystem for VaultFilesystem {
                 }
             };
 
+            if created_size(&*open_files.read().await, &child_path).is_some() {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+
             if let Err(e) = ops.create_directory(&path).await {
                 error!("Failed to create directory: {}", e);
                 reply.error(Errno::EIO);
@@ -1049,6 +1151,7 @@ impl Filesystem for VaultFilesystem {
 
         let session = self.session.clone();
         let inodes = self.inodes.clone();
+        let open_files = self.open_files.clone();
 
         self.runtime.block_on(async move {
             let parent_path = {
@@ -1083,6 +1186,15 @@ impl Filesystem for VaultFilesystem {
                     return;
                 }
             };
+
+            let saved = save_created(&session, &mut *open_files.write().await, |path| {
+                path == child_path
+            })
+            .await;
+            if let Err(errno) = saved {
+                reply.error(errno);
+                return;
+            }
 
             if let Err(e) = ops.delete_file(&path).await {
                 error!("Failed to delete file: {}", e);
@@ -1112,6 +1224,7 @@ impl Filesystem for VaultFilesystem {
 
         let session = self.session.clone();
         let inodes = self.inodes.clone();
+        let open_files = self.open_files.clone();
 
         self.runtime.block_on(async move {
             let parent_path = {
@@ -1146,6 +1259,17 @@ impl Filesystem for VaultFilesystem {
                     return;
                 }
             };
+
+            // A directory holding a created file is not empty.
+            let prefix = format!("{child_path}/");
+            let saved = save_created(&session, &mut *open_files.write().await, |path| {
+                path.starts_with(&prefix)
+            })
+            .await;
+            if let Err(errno) = saved {
+                reply.error(errno);
+                return;
+            }
 
             if let Err(e) = ops.delete_directory(&path).await {
                 error!("Failed to delete directory: {}", e);
@@ -1214,6 +1338,7 @@ impl Filesystem for VaultFilesystem {
                     writer: None,
                     dirty: false,
                     failed: false,
+                    created: false,
                 };
                 let file = match handle.and_then(|fh| files.get_mut(&fh)) {
                     Some(file) => file,
