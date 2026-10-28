@@ -19,6 +19,7 @@ use crate::manifest::{digest, finish_digest, DigestHasher};
 use crate::session::VaultSession;
 use crate::tree::{TreeNode, VaultTree};
 use axiomvault_common::{Error, Result, VaultPath};
+use axiomvault_crypto::aead::{NONCE_SIZE, TAG_SIZE};
 use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream, MasterKey};
 use axiomvault_storage::StorageProvider;
 
@@ -36,6 +37,9 @@ const WRITE_BATCH_SIZE: usize = 1024 * 1024;
 /// and ciphertext together take no more memory than the frames a stream
 /// keeps in flight anyway.
 const STREAM_READ_THRESHOLD: u64 = 256 * 1024;
+/// Bytes the one-shot AEAD encoding (content version 0) adds to the
+/// plaintext: the nonce in front of it and the tag behind it.
+const ONE_SHOT_OVERHEAD: u64 = (NONCE_SIZE + TAG_SIZE) as u64;
 
 /// `Write` adapter that batches ciphertext into chunks for a provider upload
 /// stream; the [`HashingStream`] on the other end hashes them.
@@ -415,7 +419,8 @@ pub(crate) async fn reencrypt_tree(
         written.push(new_path.clone());
         let new_digest = match content_version {
             0 => {
-                let ciphertext = provider.download(&old_path).await?;
+                let ciphertext =
+                    download_exact(provider.as_ref(), &old_path, size + ONE_SHOT_OVERHEAD).await?;
                 if expected_digest.is_some_and(|expected| expected != digest(&ciphertext)) {
                     return Err(Error::Crypto(
                         "encrypted file does not match the authenticated snapshot".to_string(),
@@ -536,6 +541,33 @@ async fn reencrypt_stream(
     upload_result?;
     encryption_result?;
     content_digest.await
+}
+
+/// Download the object at `path`, which the authenticated snapshot says is
+/// `expected_len` bytes long. A longer object fails as soon as it runs past
+/// that length, so the backend can't make this hold more than the snapshot
+/// allows; a shorter one fails at its end.
+async fn download_exact(
+    provider: &dyn StorageProvider,
+    path: &VaultPath,
+    expected_len: u64,
+) -> Result<Vec<u8>> {
+    let mismatch =
+        || Error::Crypto("encrypted file does not match the authenticated snapshot".to_string());
+    let expected_len = usize::try_from(expected_len).map_err(|_| mismatch())?;
+    let mut download = provider.download_stream(path).await?;
+    let mut data = Vec::with_capacity(expected_len);
+    while let Some(chunk) = download.next().await {
+        let chunk = chunk?;
+        if chunk.len() > expected_len - data.len() {
+            return Err(mismatch());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.len() != expected_len {
+        return Err(mismatch());
+    }
+    Ok(data)
 }
 
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
@@ -845,7 +877,7 @@ impl<'a> VaultOperations<'a> {
     pub async fn read_file(&self, path: &VaultPath) -> Result<Vec<u8>> {
         debug!("Reading encrypted file");
 
-        let (encrypted_name, expected_digest, content_version) = {
+        let (encrypted_name, expected_digest, content_version, size) = {
             let tree = self.session.tree().read().await;
             let node = tree.get_node(path)?;
             if !node.is_file() {
@@ -855,32 +887,45 @@ impl<'a> VaultOperations<'a> {
                 node.metadata.encrypted_name.clone(),
                 node.metadata.content_digest.clone(),
                 node.metadata.content_version,
+                // Every writer records the size; a node without one is read
+                // as empty, as the streamed paths do.
+                node.metadata.size.unwrap_or(0),
             )
         };
 
-        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let encrypted_content = self.session.provider().download(&storage_path).await?;
-        if expected_digest.is_some_and(|expected| expected != digest(&encrypted_content)) {
-            return Err(Error::Crypto(
-                "encrypted file does not match the authenticated snapshot".to_string(),
-            ));
-        }
-
         let master_key = self.session.master_key()?;
         let file_key = master_key.derive_file_key(encrypted_name.as_bytes());
-        let content = match content_version {
-            0 => decrypt(file_key.as_bytes(), &encrypted_content)?,
+        let encrypted_len = match content_version {
+            0 => size + ONE_SHOT_OVERHEAD,
             STREAM_CONTENT_VERSION => {
-                let mut plaintext = Zeroizing::new(Vec::with_capacity(encrypted_content.len()));
-                DecryptingStream::new(file_key.as_bytes())?
-                    .decrypt_stream(encrypted_content.as_slice(), &mut *plaintext)?;
-                std::mem::take(&mut *plaintext)
+                EncryptingStream::new(file_key.as_bytes())?.encrypted_len(size)
             }
             other => {
                 return Err(Error::Crypto(format!(
                     "Unsupported file content version: {other}"
                 )))
             }
+        };
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+        let encrypted_content = download_exact(
+            self.session.provider().as_ref(),
+            &storage_path,
+            encrypted_len,
+        )
+        .await?;
+        if expected_digest.is_some_and(|expected| expected != digest(&encrypted_content)) {
+            return Err(Error::Crypto(
+                "encrypted file does not match the authenticated snapshot".to_string(),
+            ));
+        }
+
+        let content = if content_version == 0 {
+            decrypt(file_key.as_bytes(), &encrypted_content)?
+        } else {
+            let mut plaintext = Zeroizing::new(Vec::with_capacity(encrypted_content.len()));
+            DecryptingStream::new(file_key.as_bytes())?
+                .decrypt_stream(encrypted_content.as_slice(), &mut *plaintext)?;
+            std::mem::take(&mut *plaintext)
         };
 
         debug!(size = content.len(), "File read");
@@ -1478,17 +1523,20 @@ mod tests {
     use crate::tree::VaultTree;
     use async_trait::async_trait;
     use axiomvault_common::VaultId;
+    use axiomvault_crypto::stream::DEFAULT_CHUNK_SIZE;
     use axiomvault_crypto::KdfParams;
     use axiomvault_storage::provider::ByteStream;
     use axiomvault_storage::{MemoryProvider, Metadata, StorageProvider};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     struct FailingProvider {
         inner: MemoryProvider,
         fail_data_upload: AtomicBool,
         fail_tree_upload: AtomicBool,
         fail_delete: AtomicBool,
+        served_blob: Mutex<Option<Vec<u8>>>,
+        streamed: Arc<AtomicUsize>,
     }
 
     impl FailingProvider {
@@ -1498,7 +1546,16 @@ mod tests {
                 fail_data_upload: AtomicBool::new(false),
                 fail_tree_upload: AtomicBool::new(false),
                 fail_delete: AtomicBool::new(false),
+                served_blob: Mutex::new(None),
+                streamed: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        /// Stream `blob` in 4 KiB chunks for every data object from now on,
+        /// counting the bytes the reader takes.
+        fn serve_data_blob(&self, blob: Vec<u8>) {
+            self.streamed.store(0, Ordering::SeqCst);
+            *self.served_blob.lock().unwrap() = Some(blob);
         }
 
         fn fail_next_data_upload(&self) {
@@ -1543,7 +1600,18 @@ mod tests {
         }
 
         async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
-            self.inner.download_stream(path).await
+            let served = self.served_blob.lock().unwrap().clone();
+            match served {
+                Some(blob) if path.to_string_path().starts_with("/d/") => {
+                    let streamed = self.streamed.clone();
+                    let chunks: Vec<Vec<u8>> = blob.chunks(4096).map(<[u8]>::to_vec).collect();
+                    Ok(Box::pin(futures::stream::iter(chunks).map(move |chunk| {
+                        streamed.fetch_add(chunk.len(), Ordering::SeqCst);
+                        Ok(chunk)
+                    })))
+                }
+                _ => self.inner.download_stream(path).await,
+            }
         }
 
         async fn exists(&self, path: &VaultPath) -> Result<bool> {
@@ -2083,6 +2151,118 @@ mod tests {
             .await
             .unwrap();
         assert!(ops.open_file_reader(&path, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_download_only_the_authenticated_ciphertext_length() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let data = vec![0x42; 4096];
+        let one_shot = VaultPath::parse("/one-shot.bin").unwrap();
+        ops.create_file(&one_shot, &data).await.unwrap();
+        let streamed = VaultPath::parse("/streamed.bin").unwrap();
+        ops.create_file(&streamed, b"").await.unwrap();
+        ops.update_file(&streamed, &data).await.unwrap();
+
+        // Nonce and tag; header, one data frame and the end frame.
+        for (path, expected_len) in [(&one_shot, 4096 + 24 + 16), (&streamed, 5 + 4096 + 2 * 57)] {
+            let tree = session.tree().read().await;
+            let name = &tree.get_node(path).unwrap().metadata.encrypted_name;
+            let blob_path = VaultPath::parse(DATA_DIRNAME).unwrap().join(name).unwrap();
+            drop(tree);
+            let blob = provider.download(&blob_path).await.unwrap();
+            assert_eq!(blob.len(), expected_len);
+
+            let mut oversized = blob.clone();
+            oversized.resize(16 * 1024 * 1024, 0);
+            provider.serve_data_blob(oversized);
+            assert!(ops.read_file(path).await.is_err());
+            // Cut off within one chunk of the expected length.
+            assert!(provider.streamed.load(Ordering::SeqCst) <= expected_len + 4096);
+            assert!(ops.open_file_reader(path, 0).await.is_err());
+            assert!(provider.streamed.load(Ordering::SeqCst) <= 2 * (expected_len + 4096));
+
+            provider.serve_data_blob(blob[..blob.len() - 1].to_vec());
+            assert!(ops.read_file(path).await.is_err());
+
+            provider.serve_data_blob(blob);
+            assert_eq!(ops.read_file(path).await.unwrap(), data);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_rotation_downloads_only_the_authenticated_ciphertext_length() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/one-shot.bin").unwrap();
+        ops.create_file(&path, &[0x42; 4096]).await.unwrap();
+        provider.serve_data_blob(vec![0; 16 * 1024 * 1024]);
+
+        let tree = session.tree().read().await.clone();
+        let dyn_provider: Arc<dyn StorageProvider> = provider.clone();
+        let result = reencrypt_tree(
+            &dyn_provider,
+            session.master_key().unwrap(),
+            &MasterKey::from_bytes([7; 32]),
+            &tree,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(provider.streamed.load(Ordering::SeqCst) <= 4096 + 24 + 16 + 4096);
+    }
+
+    #[tokio::test]
+    async fn reads_of_every_size_and_version_round_trip() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let creation = VaultConfig::new(
+            VaultId::new("test").unwrap(),
+            b"test-password",
+            "local",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        // Local files stream in 64 KiB chunks, so reads span chunk edges.
+        let provider = Arc::new(axiomvault_storage::LocalProvider::new(temp.path()).unwrap());
+        for dir in ["/d", "/m"] {
+            provider
+                .create_dir(&VaultPath::parse(dir).unwrap())
+                .await
+                .unwrap();
+        }
+        let session = VaultSession::unlock(
+            creation.config,
+            b"test-password",
+            provider,
+            VaultTree::new(),
+        )
+        .unwrap();
+        let ops = VaultOperations::new(&session).unwrap();
+        let threshold = STREAM_READ_THRESHOLD as usize;
+        for size in [
+            0,
+            1,
+            4096,
+            DEFAULT_CHUNK_SIZE - 1,
+            DEFAULT_CHUNK_SIZE,
+            DEFAULT_CHUNK_SIZE + 1,
+            threshold - 1,
+            threshold,
+            threshold + 1,
+        ] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let one_shot = VaultPath::parse(&format!("/one-shot-{size}")).unwrap();
+            ops.create_file(&one_shot, &data).await.unwrap();
+            let streamed = VaultPath::parse(&format!("/streamed-{size}")).unwrap();
+            ops.create_file(&streamed, b"").await.unwrap();
+            ops.update_file(&streamed, &data).await.unwrap();
+            for path in [&one_shot, &streamed] {
+                assert_eq!(ops.read_file(path).await.unwrap(), data, "{path}");
+                let mut reader = ops.open_file_reader(path, 0).await.unwrap();
+                assert_eq!(read_to_end(&mut reader).await.unwrap(), data, "{path}");
+            }
+        }
     }
 
     #[tokio::test]
