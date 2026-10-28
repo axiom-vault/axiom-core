@@ -1,13 +1,16 @@
 //! Vault file operations with encryption/decryption.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use blake2::Digest;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use tracing::{debug, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -17,7 +20,7 @@ use crate::session::VaultSession;
 use crate::tree::{TreeNode, VaultTree};
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream, MasterKey};
-use axiomvault_storage::{ByteStream, StorageProvider};
+use axiomvault_storage::StorageProvider;
 
 const STREAM_CONTENT_VERSION: u8 = 2;
 /// Ciphertext is handed to the provider in chunks of about this size.
@@ -35,11 +38,10 @@ const WRITE_BATCH_SIZE: usize = 1024 * 1024;
 const STREAM_READ_THRESHOLD: u64 = 256 * 1024;
 
 /// `Write` adapter that batches ciphertext into chunks for a provider upload
-/// stream while hashing everything it forwards.
+/// stream; the [`HashingStream`] on the other end hashes them.
 struct ChunkSender {
     sender: tokio::sync::mpsc::Sender<Result<Vec<u8>>>,
     buffer: Vec<u8>,
-    hasher: DigestHasher,
 }
 
 impl Write for ChunkSender {
@@ -56,13 +58,68 @@ impl Write for ChunkSender {
             return Ok(());
         }
         let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(UPLOAD_CHUNK_SIZE));
-        self.hasher.update(&chunk);
         self.sender.blocking_send(Ok(chunk)).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "upload stopped consuming encrypted data",
             )
         })
+    }
+}
+
+/// Provider upload stream over the chunks of a [`ChunkSender`]. It hashes
+/// each chunk as the provider takes it, so the hash runs on the upload side
+/// instead of the encrypt thread. Once dropped, it hands over the digest of
+/// everything it yielded, unless ciphertext was left that the provider never
+/// took.
+struct HashingStream {
+    receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>,
+    hasher: DigestHasher,
+    digest: Option<tokio::sync::oneshot::Sender<String>>,
+}
+
+impl HashingStream {
+    /// Returns the stream and a future of its digest.
+    fn new(
+        receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>,
+    ) -> (Self, impl Future<Output = Result<String>>) {
+        let (sender, digest) = tokio::sync::oneshot::channel();
+        let stream = Self {
+            receiver,
+            hasher: DigestHasher::new(),
+            digest: Some(sender),
+        };
+        let digest = async move {
+            digest.await.map_err(|_| {
+                Error::Storage("upload stopped before taking all encrypted data".to_string())
+            })
+        };
+        (stream, digest)
+    }
+}
+
+impl Stream for HashingStream {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = ready!(self.receiver.poll_recv(cx));
+        if let Some(Ok(chunk)) = &item {
+            self.hasher.update(chunk);
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for HashingStream {
+    fn drop(&mut self) {
+        // Closing first means the encryptor can't send anything after the
+        // check; if it is still running, it fails instead.
+        self.receiver.close();
+        if self.receiver.try_recv().is_err() {
+            if let Some(sender) = self.digest.take() {
+                let _ = sender.send(finish_digest(std::mem::take(&mut self.hasher)));
+            }
+        }
     }
 }
 
@@ -224,8 +281,9 @@ impl Read for WriterReceiver {
 /// that leaves only an unreferenced blob behind.
 pub struct FileWriter {
     sender: tokio::sync::mpsc::Sender<Zeroizing<Vec<u8>>>,
-    encrypt_task: tokio::task::JoinHandle<Result<String>>,
-    upload_task: tokio::task::JoinHandle<Result<axiomvault_storage::Metadata>>,
+    encrypt_task: tokio::task::JoinHandle<Result<()>>,
+    /// Yields the digest of the uploaded ciphertext.
+    upload_task: tokio::task::JoinHandle<Result<String>>,
     encrypted_name: String,
     size: u64,
     /// Written plaintext not yet handed to the encryptor. Never grows past
@@ -408,7 +466,7 @@ async fn reencrypt_stream(
     let mut download = provider.download_stream(from).await?;
     let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
     let (plain_sender, plain_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
-    let (upload_sender, mut upload_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+    let (upload_sender, upload_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
 
     let decrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
         let input = ChunkReceiver {
@@ -419,7 +477,7 @@ async fn reencrypt_stream(
         DecryptingStream::new(&old_key)?.decrypt_stream(input, PlaintextSender(plain_sender))?;
         Ok(())
     });
-    let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+    let encrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
         let input = ChunkReceiver {
             receiver: plain_receiver,
             pending: Vec::new(),
@@ -428,14 +486,10 @@ async fn reencrypt_stream(
         let mut output = ChunkSender {
             sender: upload_sender,
             buffer: Vec::new(),
-            hasher: DigestHasher::new(),
         };
         let result = EncryptingStream::new(&new_key)
             .and_then(|stream| stream.encrypt_stream(input, &mut output))
-            .and_then(|_| {
-                output.flush()?;
-                Ok(finish_digest(std::mem::take(&mut output.hasher)))
-            });
+            .and_then(|_| Ok(output.flush()?));
         if let Err(error) = &result {
             // Abort the upload so the provider discards its partial object.
             let _ = output
@@ -457,12 +511,10 @@ async fn reencrypt_stream(
         }
         Ok::<_, Error>(finish_digest(hasher))
     };
-    let encrypted_stream: ByteStream = Box::pin(futures::stream::poll_fn(move |cx| {
-        upload_receiver.poll_recv(cx)
-    }));
+    let (encrypted_stream, content_digest) = HashingStream::new(upload_receiver);
     let (read_digest, upload_result) = tokio::join!(
         feed,
-        provider.upload_sized_stream(to, encrypted_stream, encrypted_size)
+        provider.upload_sized_stream(to, Box::pin(encrypted_stream), encrypted_size)
     );
     let decryption_result = decrypt_task
         .await
@@ -480,7 +532,8 @@ async fn reencrypt_stream(
         ));
     }
     upload_result?;
-    encryption_result
+    encryption_result?;
+    content_digest.await
 }
 
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
@@ -604,19 +657,17 @@ impl<'a> VaultOperations<'a> {
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
         let encrypted_size = EncryptingStream::new(&key)?.encrypted_len(size);
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
-        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut output = ChunkSender {
                 sender,
                 buffer: Vec::new(),
-                hasher: DigestHasher::new(),
             };
             let result = std::fs::File::open(source)
                 .map_err(Error::from)
                 .and_then(|mut input| {
                     EncryptingStream::new(&key)?.encrypt_stream(&mut input, &mut output)?;
-                    output.flush()?;
-                    Ok(finish_digest(std::mem::take(&mut output.hasher)))
+                    Ok(output.flush()?)
                 });
             if let Err(error) = &result {
                 // Abort the upload so the provider discards its partial object.
@@ -626,20 +677,20 @@ impl<'a> VaultOperations<'a> {
             }
             result
         });
-        let encrypted_stream: ByteStream =
-            Box::pin(futures::stream::poll_fn(move |cx| receiver.poll_recv(cx)));
+        let (encrypted_stream, content_digest) = HashingStream::new(receiver);
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
         let mut tree = self.session.tree().write().await;
         let upload_result = self
             .session
             .provider()
-            .upload_sized_stream(&storage_path, encrypted_stream, encrypted_size)
+            .upload_sized_stream(&storage_path, Box::pin(encrypted_stream), encrypted_size)
             .await;
         let encryption_result = encrypt_task
             .await
             .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
         upload_result?;
-        let content_digest = encryption_result?;
+        encryption_result?;
+        let content_digest = content_digest.await?;
 
         let mut candidate = tree.clone();
         candidate.create_file(path, &encrypted_name, size)?;
@@ -1083,9 +1134,8 @@ impl<'a> VaultOperations<'a> {
 
         let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
         let (consumed_sender, consumed) = tokio::sync::mpsc::unbounded_channel();
-        let (cipher_sender, mut cipher_receiver) =
-            tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
-        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
+        let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut input = WriterReceiver {
                 receiver,
                 consumed: consumed_sender,
@@ -1095,12 +1145,10 @@ impl<'a> VaultOperations<'a> {
             let mut output = ChunkSender {
                 sender: cipher_sender,
                 buffer: Vec::new(),
-                hasher: DigestHasher::new(),
             };
             let result = EncryptingStream::new(&key)
                 .and_then(|stream| stream.encrypt_stream(&mut input, &mut output))
-                .and_then(|_| Ok(output.flush()?))
-                .map(|()| finish_digest(std::mem::take(&mut output.hasher)));
+                .and_then(|_| Ok(output.flush()?));
             if let Err(error) = &result {
                 // Abort the upload so the provider discards its partial object.
                 let _ = output
@@ -1111,12 +1159,11 @@ impl<'a> VaultOperations<'a> {
         });
         let provider = self.session.provider();
         let upload_task = tokio::spawn(async move {
-            let encrypted_stream: ByteStream = Box::pin(futures::stream::poll_fn(move |cx| {
-                cipher_receiver.poll_recv(cx)
-            }));
+            let (encrypted_stream, content_digest) = HashingStream::new(cipher_receiver);
             provider
-                .upload_stream(&storage_path, encrypted_stream)
-                .await
+                .upload_stream(&storage_path, Box::pin(encrypted_stream))
+                .await?;
+            content_digest.await
         });
         Ok(FileWriter {
             sender,
@@ -1151,10 +1198,10 @@ impl<'a> VaultOperations<'a> {
         let encryption_result = encrypt_task
             .await
             .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
-        upload_task
+        let content_digest = upload_task
             .await
             .map_err(|error| Error::Storage(format!("upload task failed: {}", error)))??;
-        let content_digest = encryption_result?;
+        encryption_result?;
         sent?;
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
@@ -2054,6 +2101,39 @@ mod tests {
         assert_eq!(ops.read_file(&path).await.unwrap(), data);
         let (_, _, size) = ops.metadata(&path).await.unwrap();
         assert_eq!(size, Some(data.len() as u64));
+    }
+
+    #[tokio::test]
+    async fn streamed_writes_record_the_digest_of_the_stored_blob() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let imported = VaultPath::parse("/imported.bin").unwrap();
+        let data = streamed_file(&ops, &imported).await;
+        let written = VaultPath::parse("/written.bin").unwrap();
+        let mut writer = ops.create_file_writer(&written).await.unwrap();
+        writer.write(&data).await.unwrap();
+        ops.finish_file_writer(&written, writer).await.unwrap();
+
+        let data_dir = VaultPath::parse("/d").unwrap();
+        let tree = session.tree().read().await;
+        for path in [&imported, &written] {
+            let metadata = &tree.get_node(path).unwrap().metadata;
+            let blob_path = data_dir.join(&metadata.encrypted_name).unwrap();
+            let blob = session.provider().download(&blob_path).await.unwrap();
+            assert_eq!(metadata.content_digest, Some(digest(&blob)));
+        }
+    }
+
+    #[tokio::test]
+    async fn hashing_streams_cut_short_yield_no_digest() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let (mut stream, digest) = HashingStream::new(receiver);
+        sender.send(Ok(b"taken".to_vec())).await.unwrap();
+        sender.send(Ok(b"left".to_vec())).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"taken");
+        drop(stream);
+        assert!(digest.await.is_err());
+        assert!(sender.send(Ok(Vec::new())).await.is_err());
     }
 
     #[tokio::test]
