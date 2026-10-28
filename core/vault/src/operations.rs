@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use blake2::Digest;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::DATA_DIRNAME;
 use crate::manifest::{digest, finish_digest, DigestHasher};
@@ -188,9 +188,11 @@ impl FileReader {
 }
 
 /// `Read` adapter that serves plaintext handed to a [`FileWriter`] to the
-/// encryptor, wiping each piece once it has been consumed.
+/// encryptor and hands each piece back once it has been consumed, so the
+/// writer wipes and reuses it off the encryption thread.
 struct WriterReceiver {
     receiver: tokio::sync::mpsc::Receiver<Zeroizing<Vec<u8>>>,
+    consumed: tokio::sync::mpsc::UnboundedSender<Zeroizing<Vec<u8>>>,
     pending: Zeroizing<Vec<u8>>,
     offset: usize,
 }
@@ -200,7 +202,10 @@ impl Read for WriterReceiver {
         while self.offset == self.pending.len() {
             match self.receiver.blocking_recv() {
                 Some(chunk) => {
-                    self.pending = chunk;
+                    // A writer that has gone away drops the piece, which wipes it.
+                    let _ = self
+                        .consumed
+                        .send(std::mem::replace(&mut self.pending, chunk));
                     self.offset = 0;
                 }
                 None => return Ok(0),
@@ -226,6 +231,8 @@ pub struct FileWriter {
     /// Written plaintext not yet handed to the encryptor. Never grows past
     /// its capacity, so it is never reallocated with unwiped contents.
     batch: Zeroizing<Vec<u8>>,
+    /// Batches the encryptor has consumed, still holding their plaintext.
+    consumed: tokio::sync::mpsc::UnboundedReceiver<Zeroizing<Vec<u8>>>,
     /// Finishing creates the file instead of replacing its content.
     create: bool,
 }
@@ -251,12 +258,18 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Hand the batched plaintext to the encryptor.
+    /// Hand the batched plaintext to the encryptor, continuing in a wiped
+    /// batch it has already consumed if there is one.
     async fn send_batch(&mut self) -> Result<()> {
-        let batch = std::mem::replace(
-            &mut self.batch,
-            Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
-        );
+        let next = match self.consumed.try_recv() {
+            // The encryptor's initial empty piece has no room for a batch.
+            Ok(mut used) if used.capacity() >= WRITE_BATCH_SIZE => {
+                used.zeroize();
+                used
+            }
+            _ => Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
+        };
+        let batch = std::mem::replace(&mut self.batch, next);
         self.sender
             .send(batch)
             .await
@@ -1069,11 +1082,13 @@ impl<'a> VaultOperations<'a> {
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
         let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let (consumed_sender, consumed) = tokio::sync::mpsc::unbounded_channel();
         let (cipher_sender, mut cipher_receiver) =
             tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
         let encrypt_task = tokio::task::spawn_blocking(move || -> Result<String> {
             let mut input = WriterReceiver {
                 receiver,
+                consumed: consumed_sender,
                 pending: Zeroizing::new(Vec::new()),
                 offset: 0,
             };
@@ -1110,6 +1125,7 @@ impl<'a> VaultOperations<'a> {
             encrypted_name,
             size: 0,
             batch: Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
+            consumed,
             create,
         })
     }
@@ -1128,6 +1144,7 @@ impl<'a> VaultOperations<'a> {
             encrypted_name,
             size,
             batch: _,
+            consumed: _,
             create,
         } = writer;
         drop(sender);
