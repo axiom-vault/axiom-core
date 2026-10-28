@@ -213,10 +213,10 @@ impl Read for WriterReceiver {
     }
 }
 
-/// New content for an existing vault file, encrypted and uploaded as it is
-/// written. Nothing changes in the vault until
-/// [`VaultOperations::finish_file_writer`]; a writer dropped before that
-/// leaves only an unreferenced blob behind.
+/// New content for an existing vault file, or the content of a new one,
+/// encrypted and uploaded as it is written. Nothing changes in the vault
+/// until [`VaultOperations::finish_file_writer`]; a writer dropped before
+/// that leaves only an unreferenced blob behind.
 pub struct FileWriter {
     sender: tokio::sync::mpsc::Sender<Zeroizing<Vec<u8>>>,
     encrypt_task: tokio::task::JoinHandle<Result<String>>,
@@ -226,6 +226,8 @@ pub struct FileWriter {
     /// Written plaintext not yet handed to the encryptor. Never grows past
     /// its capacity, so it is never reallocated with unwiped contents.
     batch: Zeroizing<Vec<u8>>,
+    /// Finishing creates the file instead of replacing its content.
+    create: bool,
 }
 
 impl FileWriter {
@@ -1038,12 +1040,26 @@ impl<'a> VaultOperations<'a> {
     /// writes. Plaintext is encrypted and uploaded as it arrives, with at
     /// most a few chunks in flight.
     pub async fn open_file_writer(&self, path: &VaultPath) -> Result<FileWriter> {
-        let name = path
-            .name()
-            .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
         if !self.session.tree().read().await.get_node(path)?.is_file() {
             return Err(Error::InvalidInput("Not a file".to_string()));
         }
+        self.start_file_writer(path, false)
+    }
+
+    /// Start writing a new file at `path`, which must not exist yet. The
+    /// file appears in the vault, with all its content, only when the writer
+    /// is finished, so a new file costs one snapshot publication.
+    pub async fn create_file_writer(&self, path: &VaultPath) -> Result<FileWriter> {
+        if self.session.tree().read().await.get_node(path).is_ok() {
+            return Err(Error::AlreadyExists(format!("{path} already exists")));
+        }
+        self.start_file_writer(path, true)
+    }
+
+    fn start_file_writer(&self, path: &VaultPath, create: bool) -> Result<FileWriter> {
+        let name = path
+            .name()
+            .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
         let encrypted_name = self.encrypt_name(name)?;
         let file_key = self
             .session
@@ -1094,6 +1110,7 @@ impl<'a> VaultOperations<'a> {
             encrypted_name,
             size: 0,
             batch: Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
+            create,
         })
     }
 
@@ -1111,6 +1128,7 @@ impl<'a> VaultOperations<'a> {
             encrypted_name,
             size,
             batch: _,
+            create,
         } = writer;
         drop(sender);
         let encryption_result = encrypt_task
@@ -1125,7 +1143,13 @@ impl<'a> VaultOperations<'a> {
 
         let mut tree = self.session.tree().write().await;
         let mut candidate = tree.clone();
-        let node = candidate.get_node_mut(path).and_then(|node| {
+        let node = if create {
+            candidate.create_file(path, &encrypted_name, size)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| candidate.get_node_mut(path))
+        .and_then(|node| {
             if node.is_file() {
                 Ok(node)
             } else {
@@ -1153,9 +1177,11 @@ impl<'a> VaultOperations<'a> {
         self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
 
-        let old_storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&old_encrypted_name)?;
-        if let Err(error) = self.session.provider().delete(&old_storage_path).await {
-            warn!(%error, "File updated but obsolete blob cleanup failed");
+        if !create {
+            let old_storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&old_encrypted_name)?;
+            if let Err(error) = self.session.provider().delete(&old_storage_path).await {
+                warn!(%error, "File updated but obsolete blob cleanup failed");
+            }
         }
         info!(size, "File written");
         Ok(())

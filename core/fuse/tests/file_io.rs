@@ -49,6 +49,12 @@ impl Storage<'_> {
         }
     }
 
+    /// Whether a tree has been saved, which every vault mutation does.
+    fn has_tree(&self) -> bool {
+        let path = VaultPath::parse("/m/tree.json").unwrap();
+        self.runtime.block_on(self.provider.exists(&path)).unwrap()
+    }
+
     /// Remove the metadata directory, so that saving the tree fails, or
     /// bring it back.
     fn set_metadata_dir(&self, present: bool) {
@@ -141,6 +147,16 @@ fn read_at(file: &fs::File, offset: u64, len: usize) -> Vec<u8> {
     }
     buffer.truncate(filled);
     buffer
+}
+
+/// Sorted names in the directory at `path`.
+fn names(path: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
@@ -262,12 +278,90 @@ fn failed_streamed_write_poisons_the_handle() {
         assert!(file.write_at(b"head", 0).is_err());
         storage.set_metadata_dir(true);
 
-        // The stored file is still empty. Writing on must not save the
-        // tail after a zero-filled gap where the streamed content was.
+        // The new file was never saved. Writing on must not save the tail
+        // after a zero-filled gap where the streamed content was. Until the
+        // kernel drops its cached entry the file may still read as empty.
         assert!(file.write_at(b"tail", FILE_SIZE as u64).is_err());
         assert!(file.sync_all().is_err());
         drop(file);
+        assert!(fs::read(&path).map_or(true, |content| content.is_empty()));
+    });
+}
+
+#[test]
+fn created_file_is_saved_once_with_its_content() {
+    with_storage(|root, storage| {
+        let path = root.join("new.txt");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(b"hello", 0).unwrap();
+
+        // Visible through the mount before the vault changes.
+        assert_eq!(fs::metadata(&path).unwrap().len(), 5);
+        assert_eq!(names(root), ["new.txt"]);
+        assert!(!storage.has_tree());
+
+        drop(file);
+        assert_eq!(storage.blobs().len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    });
+}
+
+#[test]
+fn created_file_closed_without_writes_is_empty() {
+    with_storage(|root, storage| {
+        let path = root.join("empty");
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert_eq!(storage.blobs().len(), 1);
         assert_eq!(fs::read(&path).unwrap(), b"");
+    });
+}
+
+#[test]
+fn opening_a_created_file_again_saves_it_first() {
+    with_mount(|root| {
+        let path = root.join("shared");
+        let writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all_at(b"first", 0).unwrap();
+
+        let reader = fs::File::open(&path).unwrap();
+        assert_eq!(read_at(&reader, 0, 16), b"first");
+        writer.write_all_at(b" second", 5).unwrap();
+        drop(writer);
+        drop(reader);
+        assert_eq!(fs::read(&path).unwrap(), b"first second");
+    });
+}
+
+#[test]
+fn created_file_keeps_its_directory_and_can_be_removed() {
+    with_mount(|root| {
+        let dir = root.join("dir");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("file");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        assert!(fs::remove_dir(&dir).is_err());
+        fs::remove_file(&path).unwrap();
+        drop(file);
+        assert!(names(&dir).is_empty());
+        fs::remove_dir(&dir).unwrap();
     });
 }
 
