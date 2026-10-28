@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::path::Path;
 
 use axiomvault_app::{AppService, CreateVaultParams, OpenVaultParams, RecoverVaultParams};
+use axiomvault_common::VaultId;
 use axiomvault_vault::{
     check_migration_needed, check_vault_health, check_vault_structure, MigrationRegistry,
     MigrationStatus, VaultConfig, VaultManager as CoreVaultManager, VaultVersion,
@@ -40,13 +41,15 @@ pub async fn create_vault(path: &str, password: Zeroizing<String>) -> FFIResult<
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("vault");
+    let vault_id = VaultId::unique(vault_name)
+        .map_err(|e| FFIError::VaultError(format!("Invalid input: {}", e)))?;
 
     let provider_config = serde_json::json!({ "root": abs_path });
 
     let service = AppService::new();
     let result = service
         .create_vault(CreateVaultParams {
-            vault_id: vault_name.to_string(),
+            vault_id: vault_id.to_string(),
             password,
             provider_type: "local".to_string(),
             provider_config,

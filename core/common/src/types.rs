@@ -36,6 +36,19 @@ impl VaultId {
         Ok(Self(id))
     }
 
+    /// Create a new VaultId that no other vault has: `name` followed by a
+    /// random 128-bit suffix.
+    ///
+    /// Freshness anchors are keyed by vault ID and location and outlive the
+    /// vault's storage, so a new vault needs an ID of its own.
+    ///
+    /// # Errors
+    /// - Returns error if `name` is not a valid VaultId
+    pub fn unique(name: &str) -> crate::Result<Self> {
+        let name = Self::new(name)?;
+        Self::new(format!("{}-{}", name.0, uuid::Uuid::new_v4().simple()))
+    }
+
     /// Get the inner string value.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -310,6 +323,17 @@ mod tests {
     #[test]
     fn test_vault_id_empty_fails() {
         assert!(VaultId::new("").is_err());
+    }
+
+    #[test]
+    fn test_unique_vault_id_keeps_name_and_differs() {
+        let first = VaultId::unique("my-vault").unwrap();
+        let second = VaultId::unique("my-vault").unwrap();
+        assert!(first.as_str().starts_with("my-vault-"));
+        assert_eq!(first.as_str().len(), "my-vault-".len() + 32);
+        assert_ne!(first, second);
+        assert!(VaultId::unique("").is_err());
+        assert!(VaultId::unique("a/b").is_err());
     }
 
     #[test]
