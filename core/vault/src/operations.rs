@@ -21,9 +21,12 @@ use axiomvault_storage::{ByteStream, StorageProvider};
 
 const STREAM_CONTENT_VERSION: u8 = 2;
 /// Ciphertext is handed to the provider in chunks of about this size.
-const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
+const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 /// Chunks in flight between the blocking crypto task and the async provider.
 const UPLOAD_CHANNEL_CAPACITY: usize = 4;
+/// Plaintext written to a [`FileWriter`] is handed to the encryptor in
+/// batches of this size, so small writes don't each wake another thread.
+const WRITE_BATCH_SIZE: usize = 1024 * 1024;
 
 /// `Write` adapter that batches ciphertext into chunks for a provider upload
 /// stream while hashing everything it forwards.
@@ -35,10 +38,10 @@ struct ChunkSender {
 
 impl Write for ChunkSender {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() >= UPLOAD_CHUNK_SIZE {
+        if self.buffer.len() + bytes.len() > UPLOAD_CHUNK_SIZE {
             self.flush()?;
         }
+        self.buffer.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -46,7 +49,7 @@ impl Write for ChunkSender {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::take(&mut self.buffer);
+        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(UPLOAD_CHUNK_SIZE));
         self.hasher.update(&chunk);
         self.sender.blocking_send(Ok(chunk)).map_err(|_| {
             std::io::Error::new(
@@ -214,6 +217,9 @@ pub struct FileWriter {
     upload_task: tokio::task::JoinHandle<Result<axiomvault_storage::Metadata>>,
     encrypted_name: String,
     size: u64,
+    /// Written plaintext not yet handed to the encryptor. Never grows past
+    /// its capacity, so it is never reallocated with unwiped contents.
+    batch: Zeroizing<Vec<u8>>,
 }
 
 impl FileWriter {
@@ -224,12 +230,29 @@ impl FileWriter {
 
     /// Append `data` to the new content.
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.sender
-            .send(Zeroizing::new(data.to_vec()))
-            .await
-            .map_err(|_| Error::Storage("encryption stopped consuming plaintext".to_string()))?;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let take = rest.len().min(WRITE_BATCH_SIZE - self.batch.len());
+            self.batch.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.batch.len() == WRITE_BATCH_SIZE {
+                self.send_batch().await?;
+            }
+        }
         self.size += data.len() as u64;
         Ok(())
+    }
+
+    /// Hand the batched plaintext to the encryptor.
+    async fn send_batch(&mut self) -> Result<()> {
+        let batch = std::mem::replace(
+            &mut self.batch,
+            Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
+        );
+        self.sender
+            .send(batch)
+            .await
+            .map_err(|_| Error::Storage("encryption stopped consuming plaintext".to_string()))
     }
 }
 
@@ -1062,17 +1085,24 @@ impl<'a> VaultOperations<'a> {
             upload_task,
             encrypted_name,
             size: 0,
+            batch: Zeroizing::new(Vec::with_capacity(WRITE_BATCH_SIZE)),
         })
     }
 
     /// Finish a [`FileWriter`] and make its content the content of `path`.
-    pub async fn finish_file_writer(&self, path: &VaultPath, writer: FileWriter) -> Result<()> {
+    pub async fn finish_file_writer(&self, path: &VaultPath, mut writer: FileWriter) -> Result<()> {
+        let sent = if writer.batch.is_empty() {
+            Ok(())
+        } else {
+            writer.send_batch().await
+        };
         let FileWriter {
             sender,
             encrypt_task,
             upload_task,
             encrypted_name,
             size,
+            batch: _,
         } = writer;
         drop(sender);
         let encryption_result = encrypt_task
@@ -1082,6 +1112,7 @@ impl<'a> VaultOperations<'a> {
             .await
             .map_err(|error| Error::Storage(format!("upload task failed: {}", error)))??;
         let content_digest = encryption_result?;
+        sent?;
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
         let mut tree = self.session.tree().write().await;
@@ -1922,7 +1953,10 @@ mod tests {
         let ops = VaultOperations::new(&session).unwrap();
         let path = VaultPath::parse("/written.bin").unwrap();
         ops.create_file(&path, b"old").await.unwrap();
-        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        // Spans several write batches, with writes that straddle them.
+        let data: Vec<u8> = (0..2 * WRITE_BATCH_SIZE + 200_000)
+            .map(|i| (i % 251) as u8)
+            .collect();
 
         let mut writer = ops.open_file_writer(&path).await.unwrap();
         writer.write(&data[..1000]).await.unwrap();
