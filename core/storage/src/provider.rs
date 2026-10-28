@@ -72,6 +72,16 @@ pub(crate) fn check_precondition(current: Option<&Metadata>, expected: Option<&s
     }
 }
 
+/// The error [`StorageProvider::download_bounded`] returns for an object
+/// longer than `max_len`.
+pub(crate) fn too_long(path: &VaultPath, max_len: u64) -> axiomvault_common::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("{path} is longer than {max_len} bytes"),
+    )
+    .into()
+}
+
 /// Storage provider trait for different backends.
 ///
 /// All operations are async and use streams for large data transfers.
@@ -204,6 +214,32 @@ pub trait StorageProvider: Send + Sync {
     ///
     /// For large files, this allows streaming without loading entire file into memory.
     async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream>;
+
+    /// Download an object that must be at most `max_len` bytes long.
+    ///
+    /// Returns the complete object, or an `Error::Io` of kind
+    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) as soon as the
+    /// object is known to be longer, so a backend can't make the caller hold
+    /// more than `max_len` bytes plus one read-ahead chunk. A shorter object
+    /// is returned as is; callers that expect an exact length check it.
+    ///
+    /// The default reads [`download_stream`](Self::download_stream) into a
+    /// buffer preallocated to `max_len` and stops at the first chunk that runs
+    /// past it. Providers that can read a small object in one step should
+    /// override it.
+    async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+        use futures::StreamExt;
+        let mut download = self.download_stream(path).await?;
+        let mut data = Vec::with_capacity(usize::try_from(max_len).unwrap_or(0));
+        while let Some(chunk) = download.next().await {
+            let chunk = chunk?;
+            if chunk.len() as u64 > max_len - data.len() as u64 {
+                return Err(too_long(path, max_len));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
+    }
 
     /// Check if a path exists.
     async fn exists(&self, path: &VaultPath) -> Result<bool>;
