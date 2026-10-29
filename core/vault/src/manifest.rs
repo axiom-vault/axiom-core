@@ -1,7 +1,6 @@
 //! Authenticated snapshot generation manifest.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::{decrypt, encrypt, MasterKey};
@@ -221,19 +220,15 @@ impl GenerationManifest {
     }
 }
 
+/// Incremental hasher producing the same digests as [`digest`].
+pub(crate) type DigestHasher = Blake2b<U32>;
+
 pub(crate) fn digest(bytes: &[u8]) -> String {
-    digest_reader(bytes).expect("reading a byte slice cannot fail")
+    let mut hasher = DigestHasher::new();
+    hasher.update(bytes);
+    finish_digest(hasher)
 }
 
-pub(crate) fn digest_reader(mut reader: impl Read) -> Result<String> {
-    let mut hasher = Blake2b::<U32>::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(URL_SAFE_NO_PAD.encode(hasher.finalize()))
+pub(crate) fn finish_digest(hasher: DigestHasher) -> String {
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
 }

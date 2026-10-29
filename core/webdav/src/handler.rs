@@ -10,7 +10,6 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use http_body_util::BodyExt;
 use tracing::debug;
 
 use axiomvault_common::VaultPath;
@@ -312,18 +311,22 @@ async fn handle_put(state: &AppState, req: axum::extract::Request, path: &str) -
         Err(status) => return error_response(status, "Invalid path"),
     };
 
-    // Read request body with size limit
-    let body = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    // Bounded read: stops at max_body_size instead of buffering the whole body.
+    let body = match axum::body::to_bytes(req.into_body(), state.max_body_size).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // to_bytes reports only a boxed error; an over-limit body is a LengthLimitError source.
+            let too_large = std::error::Error::source(&e)
+                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>());
+            if too_large {
+                return Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            return error_response(StatusCode::BAD_REQUEST, &e.to_string());
+        }
     };
-
-    if body.len() > state.max_body_size {
-        return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Request body exceeds maximum size",
-        );
-    }
 
     let ops = match VaultOperations::new(&state.session) {
         Ok(ops) => ops,

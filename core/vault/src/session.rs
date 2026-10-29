@@ -3,21 +3,27 @@
 //! Sessions hold decrypted keys in memory and provide access to vault operations.
 //! Keys are automatically zeroized when the session is dropped.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::config::{VaultConfig, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
-use crate::freshness::{publication_lock, FreshnessAnchor, FreshnessState as AnchorFreshnessState};
+use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME};
+use crate::freshness::{
+    publication_lock, AnchorKeys, FreshnessAnchor, FreshnessState as AnchorFreshnessState,
+};
 use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::RecoveryKey;
-use axiomvault_crypto::{decrypt, derive_key, encrypt, MasterKey};
+use axiomvault_crypto::{decrypt, encrypt, MasterKey};
 use axiomvault_storage::StorageProvider;
 
 /// Context tag for tree index key derivation. Changing this invalidates all existing vaults.
-const TREE_KEY_CONTEXT: &[u8] = b"vault_tree_index_v1";
+pub(crate) const TREE_KEY_CONTEXT: &[u8] = b"vault_tree_index_v1";
+
+/// Source of process-unique master key identities.
+static NEXT_MASTER_KEY_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Session handle for tracking active sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -62,6 +68,11 @@ pub struct VaultSession {
     committed_config: StdMutex<VaultConfig>,
     /// Master key (zeroized on drop).
     master_key: Option<MasterKey>,
+    /// Process-unique identity of `master_key`, replaced with it on rotation.
+    master_key_id: u64,
+    /// Replacement master key staged by a password change or reset. It
+    /// becomes `master_key` only once the re-encrypted vault is committed.
+    pending_master_key: Option<MasterKey>,
     /// Storage provider.
     provider: Arc<dyn StorageProvider>,
     /// Cached vault tree.
@@ -74,8 +85,11 @@ pub struct VaultSession {
 
 struct FreshnessState {
     anchor: Arc<dyn FreshnessAnchor>,
-    anchor_id: VaultId,
+    anchor_keys: AnchorKeys,
     generation: Mutex<u64>,
+    /// `vault.config` bytes this session last wrote, so publishing an
+    /// unchanged config does not rewrite and resync the cache every time.
+    written_config: StdMutex<Option<Vec<u8>>>,
 }
 
 impl VaultSession {
@@ -102,7 +116,7 @@ impl VaultSession {
         provider: Arc<dyn StorageProvider>,
         tree: VaultTree,
         anchor: Arc<dyn FreshnessAnchor>,
-        anchor_id: VaultId,
+        anchor_keys: AnchorKeys,
         generation: u64,
     ) -> Result<Self> {
         Self::from_master_key_internal(
@@ -112,8 +126,9 @@ impl VaultSession {
             tree,
             Some(FreshnessState {
                 anchor,
-                anchor_id,
+                anchor_keys,
                 generation: Mutex::new(generation),
+                written_config: StdMutex::new(None),
             }),
         )
     }
@@ -137,6 +152,8 @@ impl VaultSession {
             committed_config: StdMutex::new(config.clone()),
             config,
             master_key: Some(master_key),
+            master_key_id: NEXT_MASTER_KEY_ID.fetch_add(1, Ordering::Relaxed),
+            pending_master_key: None,
             provider,
             tree: Arc::new(RwLock::new(tree)),
             state: SessionState::Active,
@@ -162,6 +179,12 @@ impl VaultSession {
     }
 
     /// Load and decrypt the vault tree index from storage.
+    ///
+    /// A missing tree index yields an empty tree only when the vault holds
+    /// nothing else: no object under `d/` and none under `m/` (which includes
+    /// the snapshot manifest and generation objects). Otherwise the index was
+    /// lost or withheld, and opening it as empty would let the next save
+    /// publish an empty tree over the real one, orphaning every object.
     pub async fn load_and_decrypt_tree(
         provider: &Arc<dyn StorageProvider>,
         master_key: &MasterKey,
@@ -169,6 +192,15 @@ impl VaultSession {
         let tree_path = VaultPath::parse(META_DIRNAME)?.join(TREE_FILENAME)?;
 
         if !provider.exists(&tree_path).await? {
+            for dirname in [DATA_DIRNAME, META_DIRNAME] {
+                let dir = VaultPath::parse(dirname)?;
+                if provider.exists(&dir).await? && !provider.list(&dir).await?.is_empty() {
+                    return Err(Error::Vault(format!(
+                        "tree index {META_DIRNAME}/{TREE_FILENAME} is missing but {dirname}/ is not empty; \
+                         refusing to open the vault as empty"
+                    )));
+                }
+            }
             return Ok(VaultTree::new());
         }
 
@@ -227,6 +259,7 @@ impl VaultSession {
     }
 
     pub(crate) fn restore_committed_config(&mut self) -> Result<()> {
+        self.pending_master_key = None;
         self.config = self
             .committed_config
             .lock()
@@ -256,6 +289,12 @@ impl VaultSession {
         }
     }
 
+    /// Identity of the master key, so work started under one key can be
+    /// refused if it would be published under another.
+    pub(crate) fn master_key_id(&self) -> u64 {
+        self.master_key_id
+    }
+
     /// Get the current session state.
     pub fn state(&self) -> SessionState {
         self.state
@@ -271,26 +310,30 @@ impl VaultSession {
         if let Some(key) = self.master_key.take() {
             drop(key);
         }
+        self.pending_master_key = None;
         self.state = SessionState::Locked;
     }
 
     /// Change the vault password.
     ///
-    /// Re-wraps the stable master key with a new password-derived KEK.
-    /// The master key itself never changes, so all existing encrypted data
-    /// (files, tree index, filenames) remains decryptable.
-    /// Recovery key data remains unchanged.
+    /// Stages a new master key wrapped under the new password and under the
+    /// vault's existing recovery key, so the recovery words keep working. The
+    /// change takes effect when it is saved (`VaultManager::save_config`),
+    /// which re-encrypts every object under the new key and publishes it as
+    /// a new generation; an old `vault.config` and the old password then
+    /// decrypt nothing written after the change. Until then the session keeps
+    /// the current key and refuses other mutations.
     ///
     /// # Errors
     /// - Session is locked
     /// - Old password is incorrect
     /// - New password is empty
+    /// - A password change is already staged
+    /// - The stored recovery key is missing or does not verify
     /// - Cryptographic operation fails
     /// - Self-verification of the new wrapping fails (should never happen;
     ///   indicates a serious bug)
     pub fn change_password(&mut self, old_password: &[u8], new_password: &[u8]) -> Result<()> {
-        use axiomvault_crypto::recovery::{unwrap_key, wrap_key};
-
         if self.state != SessionState::Active {
             return Err(Error::NotPermitted("Session is locked".to_string()));
         }
@@ -300,9 +343,12 @@ impl VaultSession {
                 "New password cannot be empty".to_string(),
             ));
         }
+        if self.pending_master_key.is_some() {
+            return Err(Error::Conflict(
+                "a password change is already staged; save or reopen first".to_string(),
+            ));
+        }
 
-        // Retrieve the master key from the session. This is the stable,
-        // randomly-generated key that all data is encrypted under.
         let master_key = self.master_key()?.clone();
 
         // Verify the old password is correct before proceeding.
@@ -310,48 +356,35 @@ impl VaultSession {
             .verify_password(old_password)?
             .ok_or_else(|| Error::NotPermitted("Invalid old password".to_string()))?;
 
-        // Generate new salt and derive new password KEK.
-        let new_salt = axiomvault_crypto::Salt::generate();
-        let new_kek = derive_key(new_password, &new_salt, &self.config.kdf_params)?;
-
-        // Re-wrap the master key with the new KEK.
-        let new_wrapped = wrap_key(&master_key, new_kek.as_bytes())?;
-
-        // Self-verify: unwrap with the new KEK and confirm the master key
-        // round-trips correctly. This prevents a corrupted config from being
-        // persisted, which would strand all existing data.
-        let verified = unwrap_key(&new_wrapped, new_kek.as_bytes())?;
-        if verified.as_bytes() != master_key.as_bytes() {
+        // Keep the recovery words: wrap the new key under the same recovery key.
+        let recovery_key = self.config.decrypt_recovery_key(&master_key)?;
+        if self.config.verify_recovery_key(&recovery_key)?.is_none() {
             return Err(Error::Crypto(
-                "Master key verification failed after re-wrapping; aborting password change"
-                    .to_string(),
+                "stored recovery key does not match its verification data".to_string(),
             ));
         }
 
-        // Re-create password verification.
-        let verification_plaintext = b"AXIOMVAULT_KEY_VERIFICATION_V1";
-        let new_verification = encrypt(new_kek.as_bytes(), verification_plaintext)?;
-
-        self.config.salt = new_salt;
-        self.config.key_verification = new_verification;
-        self.config.wrapped_master_key = Some(new_wrapped);
-        self.config.modified_at = chrono::Utc::now();
-
-        // The master key in self.master_key is unchanged -- all existing
-        // encrypted data remains decryptable without re-encryption.
-
+        let mut config = self.config.clone();
+        let new_master_key = config.rotate_master_key(&recovery_key, new_password)?;
+        self.config = config;
+        self.pending_master_key = Some(new_master_key);
         Ok(())
     }
 
     /// Reset password using a recovery key.
     ///
-    /// Unwraps the master key using the recovery key and re-wraps it
-    /// with a new password-derived KEK.
+    /// Stages a new master key exactly as [`VaultSession::change_password`]
+    /// does; the reset takes effect when it is saved.
     pub fn reset_password_with_recovery(
         &mut self,
         recovery_key: &RecoveryKey,
         new_password: &[u8],
     ) -> Result<()> {
+        if self.pending_master_key.is_some() {
+            return Err(Error::Conflict(
+                "a password change is already staged; save or reopen first".to_string(),
+            ));
+        }
         // Get the master key from recovery before resetting password.
         // This avoids a second Argon2id round after reset_password.
         let master_key = self
@@ -359,11 +392,171 @@ impl VaultSession {
             .verify_recovery_key(recovery_key)?
             .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
 
-        self.config.reset_password(recovery_key, new_password)?;
+        let mut config = self.config.clone();
+        let new_master_key = config.reset_password(recovery_key, new_password)?;
+        self.config = config;
         self.master_key = Some(master_key);
+        self.pending_master_key = Some(new_master_key);
         self.state = SessionState::Active;
 
         Ok(())
+    }
+
+    /// Stage `new_master_key`, already wrapped by `config`, for the next save.
+    pub(crate) fn stage_master_key_rotation(&mut self, new_master_key: MasterKey) {
+        self.pending_master_key = Some(new_master_key);
+    }
+
+    /// Re-encrypt the vault under the staged master key and commit it.
+    ///
+    /// Every object is written under a new name, so the current generation
+    /// stays intact until the manifest commit. After the commit the session
+    /// switches to the new key, the old key is zeroized, and the objects of
+    /// the old key are deleted on a best-effort basis. Returns how many old
+    /// objects could not be deleted (a failed listing counts as one).
+    pub(crate) async fn commit_master_key_rotation(&mut self) -> Result<usize> {
+        let new_key = self
+            .pending_master_key
+            .clone()
+            .ok_or_else(|| Error::Vault("no master key rotation is staged".to_string()))?;
+        if self.freshness.is_none() {
+            // Without a manifest there is no atomic commit point, and this path
+            // never persists the config.
+            return Err(Error::NotPermitted(
+                "a password change must be published through a manager-opened session".to_string(),
+            ));
+        }
+        let old_key = self.master_key()?.clone();
+        let old_tree = self.tree.read().await.clone();
+
+        let mut written = Vec::new();
+        let rotated = match crate::operations::reencrypt_tree(
+            &self.provider,
+            &old_key,
+            &new_key,
+            &old_tree,
+            &mut written,
+        )
+        .await
+        {
+            Ok(tree) => tree,
+            Err(error) => {
+                self.delete_best_effort(&written).await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self
+            .save_tree_snapshot_internal(&rotated, true, Some(&new_key))
+            .await
+        {
+            // The new objects are garbage only while the old generation is
+            // still current; if the new manifest may have landed, keep them.
+            if self.old_generation_is_current(&old_key).await {
+                self.delete_best_effort(&written).await;
+            }
+            return Err(error);
+        }
+
+        // Committed: switch the session over and zeroize the old key.
+        self.master_key = Some(new_key);
+        self.master_key_id = NEXT_MASTER_KEY_ID.fetch_add(1, Ordering::Relaxed);
+        self.pending_master_key = None;
+        drop(old_key);
+        *self.tree.write().await = rotated.clone();
+
+        Ok(self.delete_superseded_objects(&rotated).await)
+    }
+
+    /// Whether storage still holds the generation sealed under `key` (or no
+    /// manifest at all), so nothing published under a new key is current.
+    async fn old_generation_is_current(&self, key: &MasterKey) -> bool {
+        let Ok(path) = VaultPath::parse(META_DIRNAME).and_then(|m| m.join(MANIFEST_FILENAME))
+        else {
+            return false;
+        };
+        match self.provider.download(&path).await {
+            Ok(bytes) => GenerationManifest::open(key, &bytes).is_ok(),
+            Err(_) => !self.provider.exists(&path).await.unwrap_or(true),
+        }
+    }
+
+    async fn delete_best_effort(&self, paths: &[VaultPath]) {
+        for path in paths {
+            if let Err(error) = self.provider.delete(path).await {
+                tracing::warn!(%error, "could not delete an uncommitted re-encrypted object");
+            }
+        }
+    }
+
+    /// Delete every data object `tree` does not reference and every
+    /// generation object except the current one. Returns the number left.
+    async fn delete_superseded_objects(&self, tree: &VaultTree) -> usize {
+        let mut remaining = 0;
+        let keep_meta = match self.current_generation_objects().await {
+            Ok(names) => Some(names),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the committed manifest; old generation objects kept");
+                remaining += 1;
+                None
+            }
+        };
+        let keep_data = crate::operations::file_object_names(tree);
+        for dirname in [DATA_DIRNAME, META_DIRNAME] {
+            let Ok(dir) = VaultPath::parse(dirname) else {
+                remaining += 1;
+                continue;
+            };
+            let entries = match self.provider.list(&dir).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(%error, dirname, "could not list objects of the old master key");
+                    remaining += 1;
+                    continue;
+                }
+            };
+            for entry in entries {
+                let superseded = if dirname == DATA_DIRNAME {
+                    !keep_data.contains(&entry.name)
+                } else {
+                    let generation_object = (entry.name.starts_with("tree.")
+                        && entry.name.ends_with(".enc"))
+                        || (entry.name.starts_with("config.") && entry.name.ends_with(".json"));
+                    match &keep_meta {
+                        Some(keep) => generation_object && !keep.contains(&entry.name),
+                        None => false,
+                    }
+                };
+                if !superseded {
+                    continue;
+                }
+                let deleted = match dir.join(&entry.name) {
+                    Ok(path) => self.provider.delete(&path).await.is_ok(),
+                    Err(_) => false,
+                };
+                if !deleted {
+                    remaining += 1;
+                }
+            }
+        }
+        if remaining > 0 {
+            tracing::warn!(
+                remaining,
+                "password change committed, but objects of the old master key remain in storage"
+            );
+        }
+        remaining
+    }
+
+    async fn current_generation_objects(&self) -> Result<Vec<String>> {
+        let path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
+        let manifest =
+            GenerationManifest::open(self.master_key()?, &self.provider.download(&path).await?)?;
+        let (tree_object, config_object) = manifest.object_paths()?;
+        Ok([tree_object, config_object]
+            .iter()
+            .filter_map(|path| path.name().map(str::to_string))
+            .collect())
     }
 
     /// Persist a supplied tree snapshot to storage (encrypted).
@@ -371,13 +564,18 @@ impl VaultSession {
     /// Callers can build and validate a candidate tree without exposing it
     /// in-memory, then publish it only after this write succeeds.
     pub(crate) async fn save_tree_snapshot(&self, tree: &VaultTree) -> Result<()> {
-        self.save_tree_snapshot_internal(tree, false).await
+        self.save_tree_snapshot_internal(tree, false, None).await
     }
 
+    /// Publish `tree` and the session config as the next generation.
+    ///
+    /// The stored generation is opened with the session's current key; the
+    /// new one is encrypted and sealed under `rotate_to` when given.
     async fn save_tree_snapshot_internal(
         &self,
         tree: &VaultTree,
         allow_config_change: bool,
+        rotate_to: Option<&MasterKey>,
     ) -> Result<()> {
         if !allow_config_change {
             let committed = self
@@ -394,15 +592,19 @@ impl VaultSession {
         let publication = self
             .freshness
             .as_ref()
-            .map(|freshness| publication_lock(&freshness.anchor_id))
+            .map(|freshness| publication_lock(freshness.anchor_keys.lock_id()))
             .transpose()?;
         let _publication_guard = match &publication {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         let tree_json = tree.to_json()?;
+        let sealing_key = match rotate_to {
+            Some(key) => key,
+            None => self.master_key()?,
+        };
 
-        let tree_key = self.master_key()?.derive_file_key(TREE_KEY_CONTEXT);
+        let tree_key = sealing_key.derive_file_key(TREE_KEY_CONTEXT);
         let encrypted = encrypt(tree_key.as_bytes(), tree_json.as_bytes())
             .map_err(|e| Error::Crypto(format!("Failed to encrypt tree index: {}", e)))?;
 
@@ -421,9 +623,11 @@ impl VaultSession {
             None
         };
 
-        let anchored = freshness.anchor.load_state(&freshness.anchor_id)?;
-        match (&anchored, &previous_manifest) {
-            (None, None) if *generation == 0 => {}
+        let anchored = freshness
+            .anchor_keys
+            .load_state(freshness.anchor.as_ref())?;
+        let previous = match (&anchored, &previous_manifest) {
+            (None, None) if *generation == 0 => None,
             (Some(state), Some(bytes))
                 if state.generation == *generation
                     && state
@@ -437,18 +641,21 @@ impl VaultSession {
                         "stored snapshot advanced; reopen the vault before mutating it".to_string(),
                     ));
                 }
+                Some(stored)
             }
             _ => {
                 return Err(Error::Conflict(
                     "trusted snapshot advanced; reopen the vault before mutating it".to_string(),
                 ));
             }
-        }
+        };
 
         let next_generation = generation
             .checked_add(1)
             .ok_or_else(|| Error::Vault("snapshot generation counter exhausted".to_string()))?;
-        let config_bytes = self.config.to_bytes()?;
+        // Tagged under the key that seals this generation, so a rotation
+        // re-tags the config under the new master key.
+        let config_bytes = self.config.to_authenticated_bytes(sealing_key)?;
         let manifest = GenerationManifest::new(
             self.config.id.clone(),
             next_generation,
@@ -457,16 +664,19 @@ impl VaultSession {
             tree.object_digests(),
         );
         let (generation_tree_path, generation_config_path) = manifest.object_paths()?;
-        let manifest_bytes = manifest.seal(self.master_key()?)?;
+        let manifest_bytes = manifest.seal(sealing_key)?;
         let manifest_digest = digest(&manifest_bytes);
         let config_path = VaultPath::parse(CONFIG_FILENAME)?;
 
+        // Both objects live in the manifest's directory: sync it once, after
+        // both are in place and before the manifest that references them.
         self.provider
-            .upload(&generation_config_path, config_bytes.clone())
+            .upload_unsynced(&generation_config_path, config_bytes.clone())
             .await?;
         self.provider
-            .upload(&generation_tree_path, encrypted.clone())
+            .upload_unsynced(&generation_tree_path, encrypted.clone())
             .await?;
+        self.provider.sync_parent_dir(&generation_tree_path).await?;
 
         if let Err(error) = self
             .provider
@@ -496,12 +706,12 @@ impl VaultSession {
             manifest_digest: Some(manifest_digest),
         };
         if let Err(error) = freshness
-            .anchor
-            .store_state(&freshness.anchor_id, next_state.clone())
+            .anchor_keys
+            .store_state(freshness.anchor.as_ref(), &next_state)
         {
             freshness
-                .anchor
-                .store_state(&freshness.anchor_id, next_state)
+                .anchor_keys
+                .store_state(freshness.anchor.as_ref(), &next_state)
                 .map_err(|retry| {
                     Error::Storage(format!(
                         "freshness anchor update failed ({error}); durability retry failed ({retry})"
@@ -510,15 +720,33 @@ impl VaultSession {
         }
         // Compatibility caches for health tooling and pre-manifest readers. They
         // are deliberately written after the manifest commit and never authoritative.
-        let _ = self.provider.upload(&config_path, config_bytes).await;
-        let _ = self.provider.upload(&tree_path, encrypted).await;
-        if let Some(previous_bytes) = previous_manifest {
-            if let Ok(previous) = GenerationManifest::open(self.master_key()?, &previous_bytes) {
-                if previous.version == 2 {
-                    if let Ok((_, previous_config_path)) = previous.object_paths() {
-                        if previous_config_path != generation_config_path {
-                            let _ = self.provider.delete(&previous_config_path).await;
-                        }
+        // A crash can leave the tree cache stale and superseded generation
+        // objects in place, as a crash right after the commit can, so their
+        // directory is synced by the next publication instead of here.
+        let config_written = freshness
+            .written_config
+            .lock()
+            .is_ok_and(|written| written.as_deref() == Some(config_bytes.as_slice()));
+        if !config_written
+            && self
+                .provider
+                .upload(&config_path, config_bytes.clone())
+                .await
+                .is_ok()
+        {
+            if let Ok(mut written) = freshness.written_config.lock() {
+                *written = Some(config_bytes);
+            }
+        }
+        let _ = self.provider.upload_unsynced(&tree_path, encrypted).await;
+        if let Some(previous) = previous {
+            if previous.version == 2 {
+                if let Ok((previous_tree_path, previous_config_path)) = previous.object_paths() {
+                    if previous_tree_path != generation_tree_path {
+                        let _ = self.provider.delete_unsynced(&previous_tree_path).await;
+                    }
+                    if previous_config_path != generation_config_path {
+                        let _ = self.provider.delete_unsynced(&previous_config_path).await;
                     }
                 }
             }
@@ -538,9 +766,15 @@ impl VaultSession {
         self.save_tree_snapshot(&tree).await
     }
 
-    pub(crate) async fn save_tree_with_config(&self) -> Result<()> {
+    /// Publish the session config. A staged password change or reset is
+    /// committed as a master key rotation.
+    pub(crate) async fn save_tree_with_config(&mut self) -> Result<()> {
+        if self.pending_master_key.is_some() {
+            self.commit_master_key_rotation().await?;
+            return Ok(());
+        }
         let tree = self.tree.read().await;
-        self.save_tree_snapshot_internal(&tree, true).await
+        self.save_tree_snapshot_internal(&tree, true, None).await
     }
 }
 
@@ -636,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_change_password_preserves_master_key() {
+    fn test_change_password_stages_a_new_master_key() {
         let (mut session, _) = create_test_session();
         let old_password = b"test-password";
         let new_password = b"new-password";
@@ -646,21 +880,22 @@ mod tests {
 
         session.change_password(old_password, new_password).unwrap();
 
-        // Master key in the session must be identical.
+        // The session keeps the current key until the rotation is committed.
         let mk_after = session.master_key().unwrap().as_bytes().to_owned();
-        assert_eq!(mk_before, mk_after, "master key must not change");
+        assert_eq!(mk_before, mk_after, "master key changes only on commit");
 
-        // Unwrapping with the new password must yield the same master key.
+        // The new password unwraps the staged key, not the current one.
         let mk_from_new = session
             .config()
             .verify_password(new_password)
             .unwrap()
             .expect("new password should verify");
+        assert_ne!(mk_before, mk_from_new.as_bytes().to_owned());
         assert_eq!(
-            mk_before,
-            mk_from_new.as_bytes().to_owned(),
-            "unwrapped master key must match original"
+            session.pending_master_key.as_ref().unwrap().as_bytes(),
+            mk_from_new.as_bytes()
         );
+        assert!(session.change_password(new_password, b"third").is_err());
     }
 
     #[test]
@@ -669,20 +904,25 @@ mod tests {
         let old_password = b"test-password";
         let new_password = b"new-password";
 
-        let mk_before = session.master_key().unwrap().as_bytes().to_owned();
         session.change_password(old_password, new_password).unwrap();
+        let staged = session
+            .pending_master_key
+            .as_ref()
+            .unwrap()
+            .as_bytes()
+            .to_owned();
 
         // Serialize and deserialize the config (simulates save_config + reopen).
         let json = session.config().to_json().unwrap();
         let restored = VaultConfig::from_json(&json).unwrap();
 
         // The restored config must accept the new password and yield
-        // the same master key.
+        // the staged master key.
         let mk_restored = restored
             .verify_password(new_password)
             .unwrap()
             .expect("new password should work after config round-trip");
-        assert_eq!(mk_before, mk_restored.as_bytes().to_owned());
+        assert_eq!(staged, mk_restored.as_bytes().to_owned());
 
         // The old password must be rejected.
         assert!(restored.verify_password(old_password).unwrap().is_none());
@@ -703,18 +943,79 @@ mod tests {
             .change_password(b"test-password", b"rotated")
             .unwrap();
 
-        // Recovery key must still unwrap the same master key.
+        // The same recovery words unwrap the new master key, and the stored
+        // recovery key is re-encrypted under it.
         let rk = axiomvault_crypto::recovery::RecoveryKey::from_mnemonic(&recovery_words).unwrap();
         let mk_from_recovery = session
             .config()
             .verify_recovery_key(&rk)
             .unwrap()
             .expect("recovery key should still work after password change");
-        assert_eq!(mk_before, mk_from_recovery.as_bytes().to_owned());
+        assert_ne!(mk_before, mk_from_recovery.as_bytes().to_owned());
+        assert_eq!(
+            session.pending_master_key.as_ref().unwrap().as_bytes(),
+            mk_from_recovery.as_bytes()
+        );
+        assert_eq!(
+            *session
+                .config()
+                .decrypt_recovery_key(&mk_from_recovery)
+                .unwrap()
+                .to_mnemonic()
+                .unwrap(),
+            *recovery_words
+        );
     }
 
     #[tokio::test]
-    async fn test_change_password_data_remains_decryptable() {
+    async fn missing_tree_is_empty_only_when_the_vault_holds_nothing() {
+        let (creation, provider) = create_test_config();
+        let storage: Arc<dyn StorageProvider> = provider.clone();
+        let key = creation.master_key;
+
+        // No `d/` or `m/` at all, then both present but empty.
+        assert_eq!(
+            VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .unwrap()
+                .count_files(),
+            0
+        );
+        for dir in [DATA_DIRNAME, META_DIRNAME] {
+            provider
+                .create_dir(&VaultPath::parse(dir).unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .unwrap()
+                .count_files(),
+            0
+        );
+
+        for (dir, object) in [
+            (DATA_DIRNAME, "object"),
+            (META_DIRNAME, "generation.manifest"),
+        ] {
+            let path = VaultPath::parse(dir).unwrap().join(object).unwrap();
+            provider.upload(&path, b"x".to_vec()).await.unwrap();
+            let error = VaultSession::load_and_decrypt_tree(&storage, &key)
+                .await
+                .expect_err("a missing tree beside stored objects must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("but {dir}/ is not empty")),
+                "unexpected error: {error}"
+            );
+            provider.delete(&path).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_change_password_data_remains_decryptable_until_commit() {
         use crate::operations::VaultOperations;
 
         let (creation, provider) = create_test_config();
@@ -759,31 +1060,14 @@ mod tests {
             assert_eq!(ops.read_file(&file_b).await.unwrap(), content_b);
         }
 
-        // Simulate closing and reopening the vault with the new password:
-        // serialize the config, build a fresh session, and verify files.
-        let config_json = session.config().to_json().unwrap();
-        drop(session);
-
-        let config2 = VaultConfig::from_json(&config_json).unwrap();
-        let mk2 = config2
-            .verify_password(b"rotated-pw")
-            .unwrap()
-            .expect("new password must verify");
-        let tree2 = VaultSession::load_and_decrypt_tree(&(provider.clone() as Arc<_>), &mk2)
-            .await
-            .unwrap();
-        let session2 = VaultSession::from_master_key(config2, mk2, provider, tree2).unwrap();
-
-        let ops2 = VaultOperations::new(&session2).unwrap();
-        assert_eq!(
-            ops2.read_file(&file_a).await.unwrap(),
-            content_a,
-            "file A must be decryptable after reopen with new password"
-        );
-        assert_eq!(
-            ops2.read_file(&file_b).await.unwrap(),
-            content_b,
-            "file B must be decryptable after reopen with new password"
-        );
+        // A session without a manifest has no atomic commit point, so it
+        // refuses to publish the rotation and leaves storage untouched.
+        let tree_path = VaultPath::parse("/m/tree.json").unwrap();
+        let stored_tree = provider.download(&tree_path).await.unwrap();
+        assert!(session.save_tree_with_config().await.is_err());
+        assert_eq!(provider.download(&tree_path).await.unwrap(), stored_tree);
+        let ops = VaultOperations::new(&session).unwrap();
+        assert_eq!(ops.read_file(&file_a).await.unwrap(), content_a);
+        assert_eq!(ops.read_file(&file_b).await.unwrap(), content_b);
     }
 }

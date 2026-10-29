@@ -8,7 +8,9 @@ use std::fmt;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME};
+use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
+use crate::manifest::{GenerationManifest, MANIFEST_FILENAME};
+use crate::session::VaultSession;
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::{recovery::RecoveryKey, MasterKey};
 use axiomvault_storage::StorageProvider;
@@ -170,6 +172,9 @@ impl MigrationRegistry {
         let original_master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
+        if config.is_legacy_format() {
+            prove_legacy_master_key(provider, &original_master_key).await?;
+        }
         let mut recovery_words = None;
         for migration in path {
             recovery_words = migration.migrate(&mut config, password)?;
@@ -202,7 +207,14 @@ impl MigrationRegistry {
             ));
         }
 
-        provider.upload(&temp_path, config.to_bytes()?).await?;
+        // Tagged under the proven master key: every open, upgrade and recovery
+        // path refuses an untagged 1.1 config that no manifest binds.
+        provider
+            .upload(
+                &temp_path,
+                config.to_authenticated_bytes(&original_master_key)?,
+            )
+            .await?;
         if let Err(error) = provider.rename(&config_path, &backup_path).await {
             let _ = provider.delete(&temp_path).await;
             return Err(error);
@@ -290,6 +302,15 @@ impl MigrationRegistry {
         } else {
             None
         };
+        // Valid pairs share one master key, so one legacy candidate's proof covers
+        // the restore below, which would otherwise discard a committed 1.1 config.
+        if let Some(legacy) = [&config, &backup, &temporary]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.config.is_legacy_format())
+        {
+            prove_legacy_master_key(provider, &legacy.master_key).await?;
+        }
 
         match (&config, &backup, &temporary) {
             (Some(previous), None, Some(next)) => {
@@ -345,7 +366,7 @@ impl MigrationRegistry {
         let master_key = config
             .verify_password(password)?
             .ok_or_else(|| Error::NotPermitted("Invalid password".to_string()))?;
-        if config.version == VaultVersion::CURRENT {
+        if config.version >= VaultVersion::V1_1 {
             validate_v1_1_invariants(&config)?;
         }
         Ok(AuthenticatedConfig { config, master_key })
@@ -379,37 +400,69 @@ impl Default for MigrationRegistry {
 }
 
 /// Check whether a vault config requires migration.
+///
+/// 1.0 needs the password-authenticated registry migration to 1.1 first;
+/// 1.1 is upgraded to `CURRENT` by `VaultManager::upgrade_to_current`.
 pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
     let current = VaultVersion::CURRENT;
-
-    if config.version == current {
-        if validate_v1_1_invariants(config).is_err() {
-            return MigrationStatus::Incompatible {
-                version: config.version,
-            };
-        }
-        return MigrationStatus::UpToDate;
-    }
-
-    // Different major version means incompatible.
-    if config.version.major != current.major {
-        return MigrationStatus::Incompatible {
-            version: config.version,
-        };
-    }
-
-    // Same major, different minor: needs migration if vault is older.
-    if config.version.minor < current.minor {
-        return MigrationStatus::NeedsMigration {
-            from: config.version,
-            to: current,
-        };
-    }
-
-    // Vault is newer than current software.
-    MigrationStatus::Incompatible {
+    let incompatible = MigrationStatus::Incompatible {
         version: config.version,
+    };
+
+    if config.version == current || config.version == VaultVersion::V1_1 {
+        if validate_v1_1_invariants(config).is_err() {
+            return incompatible;
+        }
+        if config.version == current {
+            return MigrationStatus::UpToDate;
+        }
+    } else if config.version != (VaultVersion { major: 1, minor: 0 }) {
+        // Unknown 1.x, other majors, and vaults newer than this software.
+        return incompatible;
     }
+
+    MigrationStatus::NeedsMigration {
+        from: config.version,
+        to: current,
+    }
+}
+
+/// Prove that the key a legacy config yields is the vault master key.
+///
+/// A legacy config has no `wrapped_master_key`, so `verify_password` returns the
+/// password-derived key itself. `key_verification` is encrypted under that same
+/// key, so it proves only the password. A newer config stripped of its wrapped
+/// key looks identical, and there the derived key is just the password KEK:
+/// wrapping it would issue recovery words for the wrong key and drop the only
+/// wrap of the real one. So the key must authenticate an object written under
+/// the master key: the snapshot manifest or the tree index, whichever exist.
+async fn prove_legacy_master_key(
+    provider: &dyn StorageProvider,
+    master_key: &MasterKey,
+) -> Result<()> {
+    let refused = |reason: &str| {
+        Error::Crypto(format!(
+            "legacy migration refused: {reason}; the password-derived key is not proven to be the vault master key"
+        ))
+    };
+    let meta = VaultPath::parse(META_DIRNAME)?;
+    let manifest_path = meta.join(MANIFEST_FILENAME)?;
+    let tree_path = meta.join(TREE_FILENAME)?;
+    let mut proven = false;
+    if provider.exists(&manifest_path).await? {
+        GenerationManifest::open(master_key, &provider.download(&manifest_path).await?)
+            .map_err(|_| refused("the snapshot manifest does not authenticate"))?;
+        proven = true;
+    }
+    if provider.exists(&tree_path).await? {
+        VaultSession::decrypt_tree_bytes(master_key, &provider.download(&tree_path).await?)
+            .map_err(|_| refused("the tree index does not authenticate"))?;
+        proven = true;
+    }
+    if !proven {
+        return Err(refused("no tree index or snapshot manifest exists"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +470,7 @@ pub fn check_migration_needed(config: &VaultConfig) -> MigrationStatus {
 // ---------------------------------------------------------------------------
 
 fn validate_v1_1_invariants(config: &VaultConfig) -> Result<()> {
-    if config.version != VaultVersion::CURRENT
+    if config.version < VaultVersion::V1_1
         || config.wrapped_master_key.is_none()
         || config.recovery_wrapped_master_key.is_none()
         || config.recovery_key_verification.is_none()
@@ -495,6 +548,157 @@ mod tests {
             .unwrap();
     }
 
+    /// Write `m/tree.json` encrypted under `key`, as every real vault has.
+    async fn upload_tree(provider: &dyn StorageProvider, key: &MasterKey) {
+        let meta = VaultPath::parse(META_DIRNAME).unwrap();
+        if !provider.exists(&meta).await.unwrap() {
+            provider.create_dir(&meta).await.unwrap();
+        }
+        let tree_key = key.derive_file_key(crate::session::TREE_KEY_CONTEXT);
+        let tree_json = crate::tree::VaultTree::new().to_json().unwrap();
+        let encrypted =
+            axiomvault_crypto::encrypt(tree_key.as_bytes(), tree_json.as_bytes()).unwrap();
+        provider
+            .upload(&meta.join(TREE_FILENAME).unwrap(), encrypted)
+            .await
+            .unwrap();
+    }
+
+    /// A genuine 1.0 vault: its tree is encrypted under the password-derived key.
+    async fn upload_legacy_tree(
+        provider: &dyn StorageProvider,
+        legacy: &VaultConfig,
+        password: &[u8],
+    ) {
+        let key = legacy.verify_password(password).unwrap().unwrap();
+        upload_tree(provider, &key).await;
+    }
+
+    /// Every stored path with its bytes (directories map to `None`).
+    async fn storage_snapshot(
+        provider: &dyn StorageProvider,
+    ) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+        let mut objects = std::collections::BTreeMap::new();
+        let mut pending = vec![VaultPath::root()];
+        while let Some(directory) = pending.pop() {
+            for entry in provider.list(&directory).await.unwrap() {
+                let path = directory.join(&entry.name).unwrap();
+                if entry.is_directory {
+                    objects.insert(path.to_string(), None);
+                    pending.push(path);
+                } else {
+                    objects.insert(
+                        path.to_string(),
+                        Some(provider.download(&path).await.unwrap()),
+                    );
+                }
+            }
+        }
+        objects
+    }
+
+    /// A 2.0 config with its wrapped key and recovery material stripped and
+    /// relabelled 1.0: what a provider can serve in place of a real config.
+    fn stripped_config() -> (VaultConfig, MasterKey) {
+        let creation = VaultConfig::new(
+            VaultId::new("stripped").unwrap(),
+            b"test",
+            "local",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut config = creation.config;
+        config.version = VaultVersion { major: 1, minor: 0 };
+        config.wrapped_master_key = None;
+        config.recovery_wrapped_master_key = None;
+        config.recovery_key_verification = None;
+        config.encrypted_recovery_key = None;
+        (config, creation.master_key)
+    }
+
+    #[tokio::test]
+    async fn stripped_wrapped_key_without_tree_is_refused_without_writes() {
+        let (stripped, _) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        provider
+            .create_dir(&VaultPath::parse("d").unwrap())
+            .await
+            .unwrap();
+        provider
+            .create_dir(&VaultPath::parse(META_DIRNAME).unwrap())
+            .await
+            .unwrap();
+        upload_config(&provider, CONFIG_FILENAME, stripped.to_bytes().unwrap()).await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        match result {
+            Err(Error::Crypto(message)) => assert!(
+                message.contains("no tree index or snapshot manifest exists"),
+                "unexpected refusal: {message}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a stripped config must not be migrated"),
+        }
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[tokio::test]
+    async fn stripped_wrapped_key_with_real_tree_is_refused_without_writes() {
+        let (stripped, master_key) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &master_key).await;
+        upload_config(&provider, CONFIG_FILENAME, stripped.to_bytes().unwrap()).await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        match result {
+            Err(Error::Crypto(message)) => assert!(
+                message.contains("the tree index does not authenticate"),
+                "unexpected refusal: {message}"
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a stripped config must not be migrated"),
+        }
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[tokio::test]
+    async fn interrupted_restore_of_a_stripped_backup_is_refused_without_writes() {
+        let (stripped, _) = stripped_config();
+        let provider = axiomvault_storage::MemoryProvider::new();
+        upload_config(
+            &provider,
+            CONFIG_BACKUP_FILENAME,
+            stripped.to_bytes().unwrap(),
+        )
+        .await;
+        let before = storage_snapshot(&provider).await;
+
+        let result = MigrationRegistry::with_defaults()
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
+            .await;
+
+        assert!(matches!(result, Err(Error::Crypto(_))));
+        assert_eq!(storage_snapshot(&provider).await, before);
+    }
+
+    #[test]
+    fn partially_stripped_config_is_refused_by_migrate_to_v1_1() {
+        let mut config = make_test_config(VaultVersion { major: 1, minor: 0 });
+        config.wrapped_master_key = None;
+        let before = config.to_bytes().unwrap();
+        assert!(config.migrate_to_v1_1(b"test").is_err());
+        assert_eq!(config.to_bytes().unwrap(), before);
+    }
+
     #[test]
     fn test_check_migration_up_to_date() {
         let config = make_test_config(VaultVersion::CURRENT);
@@ -503,14 +707,50 @@ mod tests {
 
     #[test]
     fn test_check_migration_incompatible_major() {
-        let config = make_test_config(VaultVersion { major: 2, minor: 0 });
+        let config = make_test_config(VaultVersion { major: 3, minor: 0 });
         let status = check_migration_needed(&config);
         assert_eq!(
             status,
             MigrationStatus::Incompatible {
-                version: VaultVersion { major: 2, minor: 0 }
+                version: VaultVersion { major: 3, minor: 0 }
             }
         );
+    }
+
+    #[test]
+    fn v1_vaults_are_upgradable_and_newer_formats_are_refused() {
+        assert_eq!(
+            check_migration_needed(&make_test_config(VaultVersion::V1_1)),
+            MigrationStatus::NeedsMigration {
+                from: VaultVersion::V1_1,
+                to: VaultVersion::CURRENT
+            }
+        );
+        let legacy = make_legacy_config();
+        assert_eq!(
+            check_migration_needed(&legacy),
+            MigrationStatus::NeedsMigration {
+                from: VaultVersion { major: 1, minor: 0 },
+                to: VaultVersion::CURRENT
+            }
+        );
+        // A 1.1 label without the key-wrapping fields cannot be upgraded.
+        let mut broken = legacy.clone();
+        broken.version = VaultVersion::V1_1;
+        assert!(matches!(
+            check_migration_needed(&broken),
+            MigrationStatus::Incompatible { .. }
+        ));
+        for version in [
+            VaultVersion { major: 1, minor: 2 },
+            VaultVersion { major: 2, minor: 1 },
+            VaultVersion { major: 3, minor: 0 },
+        ] {
+            assert_eq!(
+                check_migration_needed(&make_test_config(version)),
+                MigrationStatus::Incompatible { version }
+            );
+        }
     }
 
     #[test]
@@ -553,6 +793,7 @@ mod tests {
         legacy.encrypted_recovery_key = None;
         let original_master_key = legacy.verify_password(password).unwrap().unwrap();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &original_master_key).await;
         provider
             .upload(
                 &axiomvault_common::VaultPath::parse(CONFIG_FILENAME).unwrap(),
@@ -641,6 +882,7 @@ mod tests {
         config.recovery_key_verification = None;
         config.encrypted_recovery_key = None;
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_legacy_tree(&provider, &config, b"test").await;
         provider
             .upload(
                 &VaultPath::parse(CONFIG_BACKUP_FILENAME).unwrap(),
@@ -651,10 +893,10 @@ mod tests {
         let registry = MigrationRegistry::with_defaults();
 
         let outcome = registry
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await
             .unwrap();
-        assert_eq!(outcome.config.version, VaultVersion::CURRENT);
+        assert_eq!(outcome.config.version, VaultVersion::V1_1);
         assert!(provider
             .exists(&VaultPath::parse(CONFIG_FILENAME).unwrap())
             .await
@@ -679,7 +921,7 @@ mod tests {
             .unwrap();
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -707,7 +949,7 @@ mod tests {
         upload_config(&provider, CONFIG_BACKUP_FILENAME, backup.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -736,7 +978,7 @@ mod tests {
         upload_config(&provider, CONFIG_MIGRATION_FILENAME, staged_bytes.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"wrong password", &VaultVersion::CURRENT)
+            .migrate(&provider, b"wrong password", &VaultVersion::V1_1)
             .await;
 
         assert!(matches!(result, Err(Error::NotPermitted(_))));
@@ -765,11 +1007,12 @@ mod tests {
         let mut committed = legacy.clone();
         committed.migrate_to_v1_1(password).unwrap();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_tree(&provider, &original_master_key).await;
         upload_config(&provider, CONFIG_FILENAME, committed.to_bytes().unwrap()).await;
         upload_config(&provider, CONFIG_BACKUP_FILENAME, backup_bytes).await;
 
         let outcome = MigrationRegistry::with_defaults()
-            .migrate(&provider, password, &VaultVersion::CURRENT)
+            .migrate(&provider, password, &VaultVersion::V1_1)
             .await
             .unwrap();
 
@@ -821,11 +1064,12 @@ mod tests {
         let config_bytes = legacy.to_bytes().unwrap();
         let malformed = b"not a vault config".to_vec();
         let provider = axiomvault_storage::MemoryProvider::new();
+        upload_legacy_tree(&provider, &legacy, b"test").await;
         upload_config(&provider, CONFIG_FILENAME, config_bytes.clone()).await;
         upload_config(&provider, CONFIG_MIGRATION_FILENAME, malformed.clone()).await;
 
         let result = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await;
 
         assert!(result.is_err());
@@ -849,10 +1093,10 @@ mod tests {
             .await
             .unwrap();
         let outcome = MigrationRegistry::with_defaults()
-            .migrate(&provider, b"test", &VaultVersion::CURRENT)
+            .migrate(&provider, b"test", &VaultVersion::V1_1)
             .await
             .unwrap();
-        assert_eq!(outcome.config.version, VaultVersion::CURRENT);
+        assert_eq!(outcome.config.version, VaultVersion::V1_1);
         assert!(outcome.recovery_words.is_some());
     }
 

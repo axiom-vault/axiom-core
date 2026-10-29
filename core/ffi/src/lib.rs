@@ -28,6 +28,7 @@ pub mod vault_ops;
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
 use zeroize::Zeroizing;
@@ -93,6 +94,24 @@ fn into_secret_cstr(secret: Zeroizing<String>) -> Result<*mut c_char, FFIError> 
     Ok(cstring.into_raw())
 }
 
+/// Run the body of an `extern "C"` function, returning `failure` if it panics.
+///
+/// A panic that unwinds out of an `extern "C"` function aborts the host
+/// process, so every exported function runs its body through this guard.
+/// The panic message is not copied into the last error: it may carry
+/// `Debug` output of values the body was handling.
+fn ffi_guard<T>(failure: T, body: impl FnOnce() -> T) -> T {
+    match panic::catch_unwind(AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => {
+            error::set_last_error(FFIError::RuntimeError(
+                "internal panic in FFI call".to_string(),
+            ));
+            failure
+        }
+    }
+}
+
 /// Run an async operation on the global runtime, mapping errors to FFI.
 fn block_on<F, T>(f: F) -> Result<T, ()>
 where
@@ -124,20 +143,22 @@ where
 /// This function is safe to call from foreign code.
 #[no_mangle]
 pub extern "C" fn axiom_init() -> c_int {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
+    ffi_guard(-1, || {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
 
-    match get_runtime() {
-        Ok(_) => {
-            tracing::info!("AxiomVault FFI initialized");
-            0
+        match get_runtime() {
+            Ok(_) => {
+                tracing::info!("AxiomVault FFI initialized");
+                0
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize runtime: {}", e);
+                -1
+            }
         }
-        Err(e) => {
-            tracing::error!("Failed to initialize runtime: {}", e);
-            -1
-        }
-    }
+    })
 }
 
 /// Get the version of the AxiomVault library.
@@ -146,8 +167,10 @@ pub extern "C" fn axiom_init() -> c_int {
 /// Returns a pointer to a static string. Do not free.
 #[no_mangle]
 pub extern "C" fn axiom_version() -> *const c_char {
-    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
-    VERSION.as_ptr() as *const c_char
+    ffi_guard(ptr::null(), || {
+        static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+        VERSION.as_ptr() as *const c_char
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -167,19 +190,21 @@ pub unsafe extern "C" fn axiom_vault_create(
     path: *const c_char,
     password: *const c_char,
 ) -> *mut FFIVaultHandle {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let password_zeroizing = match zeroizing_string_from_ptr(password, "password") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
+    ffi_guard(ptr::null_mut(), || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let password_zeroizing = match zeroizing_string_from_ptr(password, "password") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
 
-    match block_on(vault_ops::create_vault(path_str, password_zeroizing)) {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::create_vault(path_str, password_zeroizing)) {
+            Ok(handle) => Box::into_raw(Box::new(handle)),
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Open an existing vault at the specified path with the given password.
@@ -194,19 +219,21 @@ pub unsafe extern "C" fn axiom_vault_open(
     path: *const c_char,
     password: *const c_char,
 ) -> *mut FFIVaultHandle {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let password_zeroizing = match zeroizing_string_from_ptr(password, "password") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
+    ffi_guard(ptr::null_mut(), || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let password_zeroizing = match zeroizing_string_from_ptr(password, "password") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
 
-    match block_on(vault_ops::open_vault(path_str, password_zeroizing)) {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::open_vault(path_str, password_zeroizing)) {
+            Ok(handle) => Box::into_raw(Box::new(handle)),
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Close a vault and free its resources.
@@ -217,34 +244,36 @@ pub unsafe extern "C" fn axiom_vault_open(
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_vault_close(handle: *mut FFIVaultHandle) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-
-    let handle = Box::from_raw(handle);
-
-    // Abort any active event subscription task.
-    if let Ok(mut guard) = handle.event_task.lock() {
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
-    }
-
-    let runtime = match get_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            error::set_last_error(FFIError::RuntimeError(e.to_string()));
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
             return -1;
         }
-    };
 
-    // Close the vault through AppService so the index is wiped.
-    if let Err(e) = runtime.block_on(handle.service.close_vault()) {
-        // Log but don't fail — the handle is being freed regardless.
-        tracing::warn!("Error closing vault: {}", e);
-    }
-    0
+        let handle = Box::from_raw(handle);
+
+        // Abort any active event subscription task.
+        if let Ok(mut guard) = handle.event_task.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
+
+        let runtime = match get_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                error::set_last_error(FFIError::RuntimeError(e.to_string()));
+                return -1;
+            }
+        };
+
+        // Close the vault through AppService so the index is wiped.
+        if let Err(e) = runtime.block_on(handle.service.close_vault()) {
+            // Log but don't fail — the handle is being freed regardless.
+            tracing::warn!("Error closing vault: {}", e);
+        }
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -259,18 +288,20 @@ pub unsafe extern "C" fn axiom_vault_close(handle: *mut FFIVaultHandle) -> c_int
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_vault_info(handle: *const FFIVaultHandle) -> *mut FFIVaultInfo {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return ptr::null_mut();
-    }
-
-    match vault_ops::get_vault_info(&*handle) {
-        Ok(info) => Box::into_raw(Box::new(info)),
-        Err(e) => {
-            error::set_last_error(e);
-            ptr::null_mut()
+    ffi_guard(ptr::null_mut(), || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return ptr::null_mut();
         }
-    }
+
+        match vault_ops::get_vault_info(&*handle) {
+            Ok(info) => Box::into_raw(Box::new(info)),
+            Err(e) => {
+                error::set_last_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Free vault info structure.
@@ -280,15 +311,17 @@ pub unsafe extern "C" fn axiom_vault_info(handle: *const FFIVaultHandle) -> *mut
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_vault_info_free(info: *mut FFIVaultInfo) {
-    if !info.is_null() {
-        let info = Box::from_raw(info);
-        if !info.vault_id.is_null() {
-            let _ = CString::from_raw(info.vault_id as *mut c_char);
+    ffi_guard((), || {
+        if !info.is_null() {
+            let info = Box::from_raw(info);
+            if !info.vault_id.is_null() {
+                let _ = CString::from_raw(info.vault_id as *mut c_char);
+            }
+            if !info.root_path.is_null() {
+                let _ = CString::from_raw(info.root_path as *mut c_char);
+            }
         }
-        if !info.root_path.is_null() {
-            let _ = CString::from_raw(info.root_path as *mut c_char);
-        }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -308,24 +341,26 @@ pub unsafe extern "C" fn axiom_vault_list(
     handle: *const FFIVaultHandle,
     path: *const c_char,
 ) -> *mut c_char {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return ptr::null_mut();
-    }
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
+    ffi_guard(ptr::null_mut(), || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return ptr::null_mut();
+        }
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
 
-    match block_on(vault_ops::list_vault(&*handle, path_str)) {
-        Ok(json) => CString::new(json)
-            .map(|s| s.into_raw())
-            .unwrap_or_else(|_| {
-                error::set_last_error(FFIError::StringConversionError);
-                ptr::null_mut()
-            }),
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::list_vault(&*handle, path_str)) {
+            Ok(json) => CString::new(json)
+                .map(|s| s.into_raw())
+                .unwrap_or_else(|_| {
+                    error::set_last_error(FFIError::StringConversionError);
+                    ptr::null_mut()
+                }),
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Add a file to the vault.
@@ -341,23 +376,25 @@ pub unsafe extern "C" fn axiom_vault_add_file(
     local_path: *const c_char,
     vault_path: *const c_char,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-    let local_str = match str_from_ptr(local_path, "local_path") {
-        Some(s) => s,
-        None => return -1,
-    };
-    let vault_str = match str_from_ptr(vault_path, "vault_path") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return -1;
+        }
+        let local_str = match str_from_ptr(local_path, "local_path") {
+            Some(s) => s,
+            None => return -1,
+        };
+        let vault_str = match str_from_ptr(vault_path, "vault_path") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match block_on(vault_ops::add_file(&*handle, local_str, vault_str)) {
-        Ok(()) => 0,
-        Err(()) => -1,
-    }
+        match block_on(vault_ops::add_file(&*handle, local_str, vault_str)) {
+            Ok(()) => 0,
+            Err(()) => -1,
+        }
+    })
 }
 
 /// Extract a file from the vault.
@@ -373,23 +410,25 @@ pub unsafe extern "C" fn axiom_vault_extract_file(
     vault_path: *const c_char,
     local_path: *const c_char,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-    let vault_str = match str_from_ptr(vault_path, "vault_path") {
-        Some(s) => s,
-        None => return -1,
-    };
-    let local_str = match str_from_ptr(local_path, "local_path") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return -1;
+        }
+        let vault_str = match str_from_ptr(vault_path, "vault_path") {
+            Some(s) => s,
+            None => return -1,
+        };
+        let local_str = match str_from_ptr(local_path, "local_path") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match block_on(vault_ops::extract_file(&*handle, vault_str, local_str)) {
-        Ok(()) => 0,
-        Err(()) => -1,
-    }
+        match block_on(vault_ops::extract_file(&*handle, vault_str, local_str)) {
+            Ok(()) => 0,
+            Err(()) => -1,
+        }
+    })
 }
 
 /// Create a directory in the vault.
@@ -403,19 +442,21 @@ pub unsafe extern "C" fn axiom_vault_mkdir(
     handle: *const FFIVaultHandle,
     vault_path: *const c_char,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-    let vault_str = match str_from_ptr(vault_path, "vault_path") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return -1;
+        }
+        let vault_str = match str_from_ptr(vault_path, "vault_path") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match block_on(vault_ops::create_directory(&*handle, vault_str)) {
-        Ok(()) => 0,
-        Err(()) => -1,
-    }
+        match block_on(vault_ops::create_directory(&*handle, vault_str)) {
+            Ok(()) => 0,
+            Err(()) => -1,
+        }
+    })
 }
 
 /// Remove a file or directory from the vault.
@@ -429,19 +470,21 @@ pub unsafe extern "C" fn axiom_vault_remove(
     handle: *const FFIVaultHandle,
     vault_path: *const c_char,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-    let vault_str = match str_from_ptr(vault_path, "vault_path") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return -1;
+        }
+        let vault_str = match str_from_ptr(vault_path, "vault_path") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match block_on(vault_ops::remove_entry(&*handle, vault_str)) {
-        Ok(()) => 0,
-        Err(()) => -1,
-    }
+        match block_on(vault_ops::remove_entry(&*handle, vault_str)) {
+            Ok(()) => 0,
+            Err(()) => -1,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -460,23 +503,25 @@ pub unsafe extern "C" fn axiom_vault_change_password(
     old_password: *const c_char,
     new_password: *const c_char,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-    let old_pw = match zeroizing_string_from_ptr(old_password, "old_password") {
-        Some(s) => s,
-        None => return -1,
-    };
-    let new_pw = match zeroizing_string_from_ptr(new_password, "new_password") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return -1;
+        }
+        let old_pw = match zeroizing_string_from_ptr(old_password, "old_password") {
+            Some(s) => s,
+            None => return -1,
+        };
+        let new_pw = match zeroizing_string_from_ptr(new_password, "new_password") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match block_on(vault_ops::change_password(&*handle, old_pw, new_pw)) {
-        Ok(()) => 0,
-        Err(()) => -1,
-    }
+        match block_on(vault_ops::change_password(&*handle, old_pw, new_pw)) {
+            Ok(()) => 0,
+            Err(()) => -1,
+        }
+    })
 }
 
 /// Get the recovery words from a newly created vault.
@@ -498,27 +543,29 @@ pub unsafe extern "C" fn axiom_vault_change_password(
 pub unsafe extern "C" fn axiom_vault_get_recovery_words(
     handle: *const FFIVaultHandle,
 ) -> *mut c_char {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return ptr::null_mut();
-    }
+    ffi_guard(ptr::null_mut(), || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return ptr::null_mut();
+        }
 
-    let words = (*handle)
-        .recovery_words
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
+        let words = (*handle)
+            .recovery_words
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
 
-    match words {
-        Some(w) => match into_secret_cstr(w) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                error::set_last_error(e);
-                ptr::null_mut()
-            }
-        },
-        None => ptr::null_mut(),
-    }
+        match words {
+            Some(w) => match into_secret_cstr(w) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    error::set_last_error(e);
+                    ptr::null_mut()
+                }
+            },
+            None => ptr::null_mut(),
+        }
+    })
 }
 
 /// Show recovery key for an open vault (requires active session).
@@ -535,21 +582,23 @@ pub unsafe extern "C" fn axiom_vault_get_recovery_words(
 pub unsafe extern "C" fn axiom_vault_show_recovery_key(
     handle: *const FFIVaultHandle,
 ) -> *mut c_char {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return ptr::null_mut();
-    }
+    ffi_guard(ptr::null_mut(), || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
+            return ptr::null_mut();
+        }
 
-    match block_on(vault_ops::show_recovery_key(&*handle)) {
-        Ok(words) => match into_secret_cstr(words) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                error::set_last_error(e);
-                ptr::null_mut()
-            }
-        },
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::show_recovery_key(&*handle)) {
+            Ok(words) => match into_secret_cstr(words) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    error::set_last_error(e);
+                    ptr::null_mut()
+                }
+            },
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Reset the vault password using recovery key words.
@@ -566,27 +615,29 @@ pub unsafe extern "C" fn axiom_vault_reset_password(
     recovery_words: *const c_char,
     new_password: *const c_char,
 ) -> *mut FFIVaultHandle {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let words_zeroizing = match zeroizing_string_from_ptr(recovery_words, "recovery_words") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let password_zeroizing = match zeroizing_string_from_ptr(new_password, "new_password") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
+    ffi_guard(ptr::null_mut(), || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let words_zeroizing = match zeroizing_string_from_ptr(recovery_words, "recovery_words") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let password_zeroizing = match zeroizing_string_from_ptr(new_password, "new_password") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
 
-    match block_on(vault_ops::reset_password(
-        path_str,
-        words_zeroizing,
-        password_zeroizing,
-    )) {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::reset_password(
+            path_str,
+            words_zeroizing,
+            password_zeroizing,
+        )) {
+            Ok(handle) => Box::into_raw(Box::new(handle)),
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -605,18 +656,20 @@ pub unsafe extern "C" fn axiom_vault_reset_password(
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_vault_check_migration(path: *const c_char) -> c_int {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    match vault_ops::check_migration(path_str) {
-        Ok(status) => status,
-        Err(e) => {
-            error::set_last_error(e);
-            -1
+        match vault_ops::check_migration(path_str) {
+            Ok(status) => status,
+            Err(e) => {
+                error::set_last_error(e);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Run migrations on a vault at the given path.
@@ -634,25 +687,27 @@ pub unsafe extern "C" fn axiom_vault_migrate(
     path: *const c_char,
     password: *const c_char,
 ) -> c_int {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return -1,
-    };
-    let password = match zeroizing_string_from_ptr(password, "password") {
-        Some(s) => s,
-        None => return -1,
-    };
+    ffi_guard(-1, || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return -1,
+        };
+        let password = match zeroizing_string_from_ptr(password, "password") {
+            Some(s) => s,
+            None => return -1,
+        };
 
-    MIGRATION_RECOVERY_WORDS.with(|slot| {
-        slot.borrow_mut().take();
-    });
-    match block_on(vault_ops::run_migration(path_str, password)) {
-        Ok(words) => {
-            MIGRATION_RECOVERY_WORDS.with(|slot| *slot.borrow_mut() = words);
-            0
+        MIGRATION_RECOVERY_WORDS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        match block_on(vault_ops::run_migration(path_str, password)) {
+            Ok(words) => {
+                MIGRATION_RECOVERY_WORDS.with(|slot| *slot.borrow_mut() = words);
+                0
+            }
+            Err(()) => -1,
         }
-        Err(()) => -1,
-    }
+    })
 }
 
 /// Take recovery words generated by the most recent successful migration on
@@ -663,17 +718,19 @@ pub unsafe extern "C" fn axiom_vault_migrate(
 /// which wipes it before deallocation.
 #[no_mangle]
 pub extern "C" fn axiom_vault_take_migration_recovery_words() -> *mut c_char {
-    let words = MIGRATION_RECOVERY_WORDS.with(|slot| slot.borrow_mut().take());
-    match words {
-        Some(words) => match into_secret_cstr(words) {
-            Ok(pointer) => pointer,
-            Err(error) => {
-                error::set_last_error(error);
-                ptr::null_mut()
-            }
-        },
-        None => ptr::null_mut(),
-    }
+    ffi_guard(ptr::null_mut(), || {
+        let words = MIGRATION_RECOVERY_WORDS.with(|slot| slot.borrow_mut().take());
+        match words {
+            Some(words) => match into_secret_cstr(words) {
+                Ok(pointer) => pointer,
+                Err(error) => {
+                    error::set_last_error(error);
+                    ptr::null_mut()
+                }
+            },
+            None => ptr::null_mut(),
+        }
+    })
 }
 
 /// Run a vault health check and return results as JSON.
@@ -688,32 +745,34 @@ pub unsafe extern "C" fn axiom_vault_health_check(
     path: *const c_char,
     password: *const c_char,
 ) -> *mut c_char {
-    let path_str = match str_from_ptr(path, "path") {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
+    ffi_guard(ptr::null_mut(), || {
+        let path_str = match str_from_ptr(path, "path") {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
 
-    let password_opt = if password.is_null() {
-        None
-    } else {
-        match CStr::from_ptr(password).to_str() {
-            Ok(s) => Some(s),
-            Err(_) => {
-                error::set_last_error(FFIError::InvalidUtf8("password".into()));
-                return ptr::null_mut();
+        let password_opt = if password.is_null() {
+            None
+        } else {
+            match CStr::from_ptr(password).to_str() {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    error::set_last_error(FFIError::InvalidUtf8("password".into()));
+                    return ptr::null_mut();
+                }
             }
-        }
-    };
+        };
 
-    match block_on(vault_ops::health_check(path_str, password_opt)) {
-        Ok(json) => CString::new(json)
-            .map(|s| s.into_raw())
-            .unwrap_or_else(|_| {
-                error::set_last_error(FFIError::StringConversionError);
-                ptr::null_mut()
-            }),
-        Err(()) => ptr::null_mut(),
-    }
+        match block_on(vault_ops::health_check(path_str, password_opt)) {
+            Ok(json) => CString::new(json)
+                .map(|s| s.into_raw())
+                .unwrap_or_else(|_| {
+                    error::set_last_error(FFIError::StringConversionError);
+                    ptr::null_mut()
+                }),
+            Err(()) => ptr::null_mut(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -737,58 +796,60 @@ pub unsafe extern "C" fn axiom_vault_subscribe_events(
     handle: *const FFIVaultHandle,
     callback: Option<FFIEventCallback>,
 ) -> c_int {
-    if handle.is_null() {
-        error::set_last_error(FFIError::NullPointer("handle is null".into()));
-        return -1;
-    }
-
-    let handle = &*handle;
-
-    // Abort any existing subscription task.
-    if let Ok(mut guard) = handle.event_task.lock() {
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
-    }
-
-    // If no callback, we just unsubscribed — done.
-    let callback = match callback {
-        Some(cb) => cb,
-        None => return 0,
-    };
-
-    let mut rx = handle.service.subscribe();
-
-    let runtime = match get_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            error::set_last_error(FFIError::RuntimeError(e.to_string()));
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            error::set_last_error(FFIError::NullPointer("handle is null".into()));
             return -1;
         }
-    };
 
-    let task = runtime.spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if let Ok(cstr) = CString::new(json) {
-                            callback(cstr.as_ptr());
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+        let handle = &*handle;
+
+        // Abort any existing subscription task.
+        if let Ok(mut guard) = handle.event_task.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
             }
         }
-    });
 
-    // Store the task handle so it can be aborted on re-subscribe or close.
-    if let Ok(mut guard) = handle.event_task.lock() {
-        *guard = Some(task);
-    }
+        // If no callback, we just unsubscribed — done.
+        let callback = match callback {
+            Some(cb) => cb,
+            None => return 0,
+        };
 
-    0
+        let mut rx = handle.service.subscribe();
+
+        let runtime = match get_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                error::set_last_error(FFIError::RuntimeError(e.to_string()));
+                return -1;
+            }
+        };
+
+        let task = runtime.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if let Ok(cstr) = CString::new(json) {
+                                callback(cstr.as_ptr());
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        // Store the task handle so it can be aborted on re-subscribe or close.
+        if let Ok(mut guard) = handle.event_task.lock() {
+            *guard = Some(task);
+        }
+
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -803,13 +864,15 @@ pub unsafe extern "C" fn axiom_vault_subscribe_events(
 /// - Returns null if no error occurred
 #[no_mangle]
 pub extern "C" fn axiom_last_error() -> *mut c_char {
-    error::take_last_error()
-        .map(|e| {
-            CString::new(e.to_string())
-                .map(|s| s.into_raw())
-                .unwrap_or(ptr::null_mut())
-        })
-        .unwrap_or(ptr::null_mut())
+    ffi_guard(ptr::null_mut(), || {
+        error::take_last_error()
+            .map(|e| {
+                CString::new(e.to_string())
+                    .map(|s| s.into_raw())
+                    .unwrap_or(ptr::null_mut())
+            })
+            .unwrap_or(ptr::null_mut())
+    })
 }
 
 /// Free a string returned by an FFI function.
@@ -824,9 +887,11 @@ pub extern "C" fn axiom_last_error() -> *mut c_char {
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        let _ = CString::from_raw(s);
-    }
+    ffi_guard((), || {
+        if !s.is_null() {
+            let _ = CString::from_raw(s);
+        }
+    })
 }
 
 /// Free a recovery-words string returned by [`axiom_vault_get_recovery_words`]
@@ -847,32 +912,34 @@ pub unsafe extern "C" fn axiom_string_free(s: *mut c_char) {
 // SAFETY: see `# Safety` rustdoc above; caller upholds raw-pointer invariants.
 #[no_mangle]
 pub unsafe extern "C" fn axiom_recovery_words_free(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    // Reclaim ownership of the allocation FIRST so its internal length is
-    // recovered from the (still-intact) NUL terminator. Zeroizing before
-    // `from_raw` would cause `strlen` to see length 0 and the allocator
-    // would only free 1 byte.
-    //
-    // SAFETY: The caller must ensure `s` came from a recovery-words FFI
-    // function, which allocated it via `CString::into_raw`. `from_raw` thus
-    // takes back ownership of the same allocation and won't be called twice.
-    let cstring = CString::from_raw(s);
+    ffi_guard((), || {
+        if s.is_null() {
+            return;
+        }
+        // Reclaim ownership of the allocation FIRST so its internal length is
+        // recovered from the (still-intact) NUL terminator. Zeroizing before
+        // `from_raw` would cause `strlen` to see length 0 and the allocator
+        // would only free 1 byte.
+        //
+        // SAFETY: The caller must ensure `s` came from a recovery-words FFI
+        // function, which allocated it via `CString::into_raw`. `from_raw` thus
+        // takes back ownership of the same allocation and won't be called twice.
+        let cstring = CString::from_raw(s);
 
-    // Convert into an owned `Vec<u8>` so the wipe operates on memory we own.
-    // Writing through a `*mut` derived from `&[u8]` (as an earlier version
-    // did via `cstring.as_bytes_with_nul().as_ptr() as *mut u8`) violates
-    // Rust's aliasing model. We could fall back to `ptr::write_bytes` plus a
-    // `compiler_fence`, but the compiler is still permitted to elide a write
-    // it considers a dead store (the bytes are dropped immediately after).
-    // `zeroize::Zeroize` is the standard primitive for exactly this case:
-    // its implementation uses volatile writes that the optimizer must not
-    // remove.
-    use zeroize::Zeroize;
-    let mut bytes = cstring.into_bytes_with_nul();
-    bytes.zeroize();
-    drop(bytes);
+        // Convert into an owned `Vec<u8>` so the wipe operates on memory we own.
+        // Writing through a `*mut` derived from `&[u8]` (as an earlier version
+        // did via `cstring.as_bytes_with_nul().as_ptr() as *mut u8`) violates
+        // Rust's aliasing model. We could fall back to `ptr::write_bytes` plus a
+        // `compiler_fence`, but the compiler is still permitted to elide a write
+        // it considers a dead store (the bytes are dropped immediately after).
+        // `zeroize::Zeroize` is the standard primitive for exactly this case:
+        // its implementation uses volatile writes that the optimizer must not
+        // remove.
+        use zeroize::Zeroize;
+        let mut bytes = cstring.into_bytes_with_nul();
+        bytes.zeroize();
+        drop(bytes);
+    })
 }
 
 #[cfg(test)]
@@ -898,6 +965,41 @@ mod tests {
         // SAFETY: `raw` came from `into_secret_cstr` which uses `CString::into_raw`,
         // so this is the matching free.
         unsafe { axiom_recovery_words_free(raw) };
+    }
+
+    /// An event callback runs on a runtime worker thread. An FFI call made
+    /// from there reaches `Runtime::block_on`, which panics inside a runtime.
+    /// The guard must turn that panic into the documented failure value
+    /// instead of letting it unwind out of `extern "C"` and abort the process.
+    #[test]
+    fn ffi_call_from_runtime_thread_returns_failure_instead_of_aborting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+        let password = CString::new("password").unwrap();
+        let runtime = get_runtime().unwrap();
+
+        let (handle_is_null, open_error, migrate_status, migrate_error) = runtime
+            .block_on(runtime.spawn(async move {
+                // SAFETY: both pointers are valid NUL-terminated strings for this call.
+                let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
+                let open_error = error::take_last_error().map(|e| e.to_string());
+                // SAFETY: both pointers are valid NUL-terminated strings for this call.
+                let status = unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) };
+                let migrate_error = error::take_last_error().map(|e| e.to_string());
+                (handle.is_null(), open_error, status, migrate_error)
+            }))
+            .unwrap();
+
+        assert!(handle_is_null);
+        assert_eq!(
+            open_error.as_deref(),
+            Some("Runtime error: internal panic in FFI call")
+        );
+        assert_eq!(migrate_status, -1);
+        assert_eq!(
+            migrate_error.as_deref(),
+            Some("Runtime error: internal panic in FFI call")
+        );
     }
 
     /// Calling the free function on a null pointer must be a no-op (matches
@@ -944,8 +1046,12 @@ mod tests {
         drop(bytes);
     }
 
+    /// A current config stripped of its wrapped key and relabelled 1.0, with no
+    /// tree index or manifest, is what a provider serves to swap the master key:
+    /// the password-derived key would be wrapped as if it were the master key.
+    /// Nothing authenticates that key as the master key, so it must be refused.
     #[test]
-    fn ffi_migration_consumes_password_and_returns_recovery_words_once() {
+    fn ffi_migration_refuses_a_stripped_config_without_writes() {
         use axiomvault_common::VaultId;
         use axiomvault_crypto::KdfParams;
         use axiomvault_vault::{VaultConfig, VaultVersion};
@@ -965,6 +1071,169 @@ mod tests {
         legacy.recovery_wrapped_master_key = None;
         legacy.recovery_key_verification = None;
         legacy.encrypted_recovery_key = None;
+        // A real vault has its data and metadata directories; the 1.1 -> 2.0
+        // upgrade publishes its first manifest generation under `m/`.
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
+        std::fs::write(
+            directory.path().join("vault.config"),
+            legacy.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+        let password = CString::new("correct password").unwrap();
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        assert_eq!(
+            unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
+            -1
+        );
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(
+            error.contains("not proven to be the vault master key"),
+            "unexpected error: {error}"
+        );
+        assert!(axiom_vault_take_migration_recovery_words().is_null());
+
+        assert_eq!(
+            std::fs::read(directory.path().join("vault.config")).unwrap(),
+            legacy.to_bytes().unwrap()
+        );
+        assert!(std::fs::read_dir(directory.path().join("m"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    /// An untagged 1.1 `vault.config` with no manifest: nothing authenticates
+    /// its provider settings, id or hardware-key flag, so open, migrate and
+    /// reset all refuse it before any write. Without an open handle there is
+    /// no `axiom_vault_change_password` call to make.
+    #[test]
+    fn ffi_refuses_an_untagged_v1_1_vault_on_every_path_without_writes() {
+        use axiomvault_common::VaultId;
+        use axiomvault_crypto::KdfParams;
+        use axiomvault_vault::{VaultConfig, VaultVersion};
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use std::time::SystemTime;
+
+        /// Every file and directory with its bytes and modification time.
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+            let mut objects = BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    if path.is_dir() {
+                        objects.insert(path.clone(), (Vec::new(), modified));
+                        pending.push(path);
+                    } else {
+                        objects.insert(path.clone(), (std::fs::read(&path).unwrap(), modified));
+                    }
+                }
+            }
+            objects
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let creation = VaultConfig::new(
+            VaultId::new("ffi-v1-1").unwrap(),
+            b"correct password",
+            "local",
+            serde_json::json!({ "root": directory.path() }),
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut v1_1 = creation.config;
+        v1_1.version = VaultVersion::V1_1;
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
+        std::fs::write(
+            directory.path().join("vault.config"),
+            v1_1.to_bytes().unwrap(),
+        )
+        .unwrap();
+        let before = snapshot(directory.path());
+
+        let path = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+        let password = CString::new("correct password").unwrap();
+        let unauthenticated = "vault.config is not authenticated: a 1.1 config with no \
+            integrity tag (config_mac) and no snapshot manifest is refused";
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
+        assert!(handle.is_null(), "open must refuse an untagged 1.1 vault");
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
+        assert_eq!(snapshot(directory.path()), before);
+
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        assert_eq!(
+            unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
+            -1
+        );
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
+        assert!(axiom_vault_take_migration_recovery_words().is_null());
+        assert_eq!(snapshot(directory.path()), before);
+
+        let words = CString::new(creation.recovery_words.as_str()).unwrap();
+        let new_password = CString::new("new password").unwrap();
+        // SAFETY: all three pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe {
+            axiom_vault_reset_password(path.as_ptr(), words.as_ptr(), new_password.as_ptr())
+        };
+        assert!(handle.is_null(), "reset must refuse an untagged 1.1 vault");
+        let error = error::take_last_error().unwrap().to_string();
+        assert!(error.contains(unauthenticated), "unexpected error: {error}");
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    /// A 1.0 vault migrates through the registry to a tagged 1.1 config, which
+    /// the same `axiom_vault_migrate` call upgrades to `CURRENT`.
+    #[test]
+    fn ffi_migrate_upgrades_a_v1_0_vault_through_a_tagged_v1_1_config() {
+        use axiomvault_common::VaultId;
+        use axiomvault_crypto::KdfParams;
+        use axiomvault_vault::{VaultConfig, VaultManager, VaultSession, VaultTree, VaultVersion};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = serde_json::json!({ "root": directory.path() });
+        let creation = VaultConfig::new(
+            VaultId::new("ffi-v1-0").unwrap(),
+            b"correct password",
+            "local",
+            root.clone(),
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let mut legacy = creation.config.clone();
+        legacy.version = VaultVersion { major: 1, minor: 0 };
+        legacy.wrapped_master_key = None;
+        legacy.recovery_wrapped_master_key = None;
+        legacy.recovery_key_verification = None;
+        legacy.encrypted_recovery_key = None;
+        std::fs::create_dir(directory.path().join("d")).unwrap();
+        std::fs::create_dir(directory.path().join("m")).unwrap();
+        // A real 1.0 vault's tree index is under the password-derived key.
+        let legacy_key = legacy
+            .verify_password(b"correct password")
+            .unwrap()
+            .unwrap();
+        let provider = VaultManager::new()
+            .registry()
+            .resolve("local", root)
+            .unwrap();
+        let session =
+            VaultSession::from_master_key(creation.config, legacy_key, provider, VaultTree::new())
+                .unwrap();
+        runtime::get_runtime()
+            .unwrap()
+            .block_on(session.save_tree())
+            .unwrap();
+        drop(session);
         std::fs::write(
             directory.path().join("vault.config"),
             legacy.to_bytes().unwrap(),
@@ -978,21 +1247,21 @@ mod tests {
             unsafe { axiom_vault_migrate(path.as_ptr(), password.as_ptr()) },
             0
         );
-
         let words = axiom_vault_take_migration_recovery_words();
-        assert!(!words.is_null());
-        // SAFETY: the migration getter returned this live C string.
-        let mnemonic = unsafe { CStr::from_ptr(words) }.to_str().unwrap();
-        assert_eq!(mnemonic.split_whitespace().count(), 24);
-        // SAFETY: `words` came from the migration recovery getter.
+        assert!(!words.is_null(), "a 1.0 migration generates recovery words");
+        // SAFETY: `words` was just returned by `axiom_vault_take_migration_recovery_words`.
         unsafe { axiom_recovery_words_free(words) };
-        assert!(axiom_vault_take_migration_recovery_words().is_null());
-
         let migrated =
             VaultConfig::from_bytes(&std::fs::read(directory.path().join("vault.config")).unwrap())
                 .unwrap();
         assert_eq!(migrated.version, VaultVersion::CURRENT);
-        assert!(migrated.wrapped_master_key.is_some());
-        assert!(migrated.recovery_wrapped_master_key.is_some());
+        assert!(migrated.config_mac.is_some());
+        assert!(directory.path().join("m/generation.manifest").exists());
+
+        // SAFETY: both pointers are valid NUL-terminated strings for this call.
+        let handle = unsafe { axiom_vault_open(path.as_ptr(), password.as_ptr()) };
+        assert!(!handle.is_null(), "an upgraded vault must open");
+        // SAFETY: `handle` was just returned by `axiom_vault_open`.
+        assert_eq!(unsafe { axiom_vault_close(handle) }, 0);
     }
 }

@@ -62,6 +62,102 @@ pub trait FreshnessAnchor: Send + Sync {
     }
 }
 
+/// The anchor keys one vault's trusted state is kept under. A local vault
+/// has two: one derived from its root as the caller spelt it, the only key
+/// before the root was resolved, and one from the root as the filesystem
+/// resolves it, which every spelling shares. Every store writes all keys
+/// and every load takes the highest generation among them, so neither a
+/// new spelling of the path nor a repointed symlink inside an old one
+/// falls back to trust on first use.
+#[derive(Clone, Debug)]
+pub(crate) struct AnchorKeys {
+    typed: VaultId,
+    /// `None` when it equals `typed`, or the provider has no resolved form.
+    resolved: Option<VaultId>,
+}
+
+impl AnchorKeys {
+    pub(crate) fn new(typed: VaultId, resolved: Option<VaultId>) -> Self {
+        let resolved = resolved.filter(|resolved| resolved != &typed);
+        Self { typed, resolved }
+    }
+
+    fn ids(&self) -> impl Iterator<Item = &VaultId> {
+        std::iter::once(&self.typed).chain(self.resolved.as_ref())
+    }
+
+    /// Key of the in-process publication lock: the resolved one, which every
+    /// spelling of the location shares.
+    pub(crate) fn lock_id(&self) -> &VaultId {
+        self.resolved.as_ref().unwrap_or(&self.typed)
+    }
+
+    /// The highest-generation state under any key (the first on a tie).
+    /// Keys behind it are raised to it, never lowered, so a later open
+    /// through either key alone still knows it.
+    pub(crate) fn load_state(
+        &self,
+        anchor: &dyn FreshnessAnchor,
+    ) -> Result<Option<FreshnessState>> {
+        let mut states = Vec::new();
+        for id in self.ids() {
+            states.push((id, anchor.load_state(id)?));
+        }
+        let best = states
+            .iter()
+            .filter_map(|(_, state)| state.clone())
+            .reduce(|best, state| {
+                if state.generation > best.generation {
+                    state
+                } else {
+                    best
+                }
+            });
+        if let Some(best) = &best {
+            for (id, state) in &states {
+                if state
+                    .as_ref()
+                    .is_none_or(|state| state.generation < best.generation)
+                {
+                    anchor.store_state(id, best.clone())?;
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    pub(crate) fn store_state(
+        &self,
+        anchor: &dyn FreshnessAnchor,
+        state: &FreshnessState,
+    ) -> Result<()> {
+        for id in self.ids() {
+            anchor.store_state(id, state.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Whether any key holds a marker or state.
+    pub(crate) fn is_anchored(&self, anchor: &dyn FreshnessAnchor) -> Result<bool> {
+        for id in self.ids() {
+            if anchor.load(id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stores generation 0 under every key that holds nothing yet.
+    pub(crate) fn mark(&self, anchor: &dyn FreshnessAnchor) -> Result<()> {
+        for id in self.ids() {
+            if anchor.load(id)?.is_none() {
+                anchor.store(id, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Anchor used when the platform cannot provide trusted local storage.
 /// Every operation fails closed rather than silently disabling protection.
 pub struct UnavailableFreshnessAnchor {
@@ -232,6 +328,25 @@ impl LocalFileFreshnessAnchor {
             ))
         })?;
         let path = self.path(vault_id);
+        // `self.lock` only serializes callers in this process. Hold an
+        // exclusive advisory lock on a sidecar file across the read, compare
+        // and rename so two processes cannot interleave and lower the anchor.
+        // The lock is released when `_anchor_lock` is dropped, on every path.
+        let mut lock_options = OpenOptions::new();
+        lock_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let _anchor_lock = lock_options
+            .open(path.with_extension("generation.lock"))
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|error| Error::Vault(format!("failed to lock freshness anchor: {error}")))?;
         if let Some(current) = Self::read_state(&path)? {
             if state.generation < current.generation {
                 return Err(Error::Conflict(
@@ -335,6 +450,49 @@ mod tests {
         assert_eq!(anchor.load(&vault_id).unwrap(), Some(4));
         assert!(anchor.store(&vault_id, 3).is_err());
         assert_eq!(anchor.load(&vault_id).unwrap(), Some(4));
+    }
+
+    /// Two anchors on the same directory stand in for two processes: each has
+    /// its own in-process lock, so only the file lock serializes them. Once a
+    /// store has returned, no later load may see a lower generation.
+    #[test]
+    fn local_anchors_on_the_same_path_do_not_lose_an_update() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const STORES_PER_THREAD: u64 = 2_000;
+        let directory = tempfile::tempdir().unwrap();
+        let committed = AtomicU64::new(0);
+
+        std::thread::scope(|scope| {
+            for parity in 0..2 {
+                let directory = directory.path();
+                let committed = &committed;
+                scope.spawn(move || {
+                    let vault_id = VaultId::new("shared-anchor").unwrap();
+                    let anchor = LocalFileFreshnessAnchor::new(directory);
+                    for step in 1..=STORES_PER_THREAD {
+                        let generation = step * 2 + parity;
+                        let floor = committed.load(Ordering::SeqCst);
+                        match anchor.store(&vault_id, generation) {
+                            Ok(()) => {
+                                committed.fetch_max(generation, Ordering::SeqCst);
+                            }
+                            Err(Error::Conflict(_)) => {}
+                            Err(error) => panic!("unexpected anchor error: {error}"),
+                        }
+                        let loaded = anchor.load(&vault_id).unwrap().unwrap();
+                        assert!(loaded >= floor, "anchor fell from {floor} to {loaded}");
+                    }
+                });
+            }
+        });
+
+        let vault_id = VaultId::new("shared-anchor").unwrap();
+        let anchor = LocalFileFreshnessAnchor::new(directory.path());
+        assert_eq!(
+            anchor.load(&vault_id).unwrap(),
+            Some(committed.load(Ordering::SeqCst))
+        );
     }
 
     #[test]

@@ -126,11 +126,18 @@ mod tests {
 
     /// Start a WebDAV server in the background and return its URL and password.
     async fn start_test_server(session: Arc<VaultSession>) -> (String, String) {
+        start_test_server_with_limit(session, WebDavConfig::default().max_body_size).await
+    }
+
+    async fn start_test_server_with_limit(
+        session: Arc<VaultSession>,
+        max_body_size: usize,
+    ) -> (String, String) {
         let port = free_port().await;
         let config = WebDavConfig {
             bind_address: "127.0.0.1".to_string(),
             port,
-            ..Default::default()
+            max_body_size,
         };
         let server = WebDavServer::new(session, config);
         let url = server.url();
@@ -335,6 +342,37 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.bytes().await.unwrap().as_ref(), b"new content");
+    }
+
+    #[tokio::test]
+    async fn test_put_body_limit() {
+        let session = create_test_session().await;
+        let (base_url, password) = start_test_server_with_limit(session, 16).await;
+        let client = authenticated_client(&password);
+
+        let resp = client
+            .put(format!("{}/at-limit.txt", base_url))
+            .body(vec![b'a'; 16])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let resp = client
+            .put(format!("{}/over-limit.txt", base_url))
+            .body(vec![b'a'; 17])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+        assert!(resp.bytes().await.unwrap().is_empty());
+
+        let resp = client
+            .get(format!("{}/over-limit.txt", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
     #[tokio::test]

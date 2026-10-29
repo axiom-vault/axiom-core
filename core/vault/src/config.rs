@@ -58,7 +58,14 @@ pub struct VaultVersion {
 impl VaultVersion {
     /// Current vault format version.
     /// Bumped to 1.1 to indicate recovery key / key-wrapping support.
-    pub const CURRENT: Self = Self { major: 1, minor: 1 };
+    /// Bumped to 2.0 for manifest-based generations: `vault.config` and
+    /// `m/tree.json` became non-authoritative caches, so 1.x clients (whose
+    /// only gate is the major version) must refuse these vaults.
+    pub const CURRENT: Self = Self { major: 2, minor: 0 };
+
+    /// Key-wrapping and recovery format; the last version that registry
+    /// migrations write. A 1.1 vault is upgraded to `CURRENT` on open.
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
 
     /// Check if this version is compatible with the current version.
     pub fn is_compatible(&self) -> bool {
@@ -195,7 +202,19 @@ pub struct VaultConfig {
     pub encrypted_recovery_key: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_key: Option<HardwareKeyConfig>,
+
+    // -- 2.0 field (config integrity, M-1) ------------------------------
+    /// Keyed BLAKE2b tag over every other field, under a key derived from
+    /// the master key. Set only on the bytes written to storage
+    /// ([`VaultConfig::to_authenticated_bytes`]) and removed on load by
+    /// [`VaultConfig::verify_integrity`], so an in-memory config never
+    /// carries a tag that its edits would make stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_mac: Option<Vec<u8>>,
 }
+
+/// Domain separation for the `config_mac` key.
+const CONFIG_MAC_CONTEXT: &[u8] = b"vault_config_mac_v1";
 
 /// Result of creating a new vault configuration.
 pub struct VaultConfigCreation {
@@ -268,6 +287,7 @@ impl VaultConfig {
             recovery_key_verification: Some(recovery_key_verification),
             encrypted_recovery_key: Some(encrypted_recovery_key),
             hardware_key: None,
+            config_mac: None,
         };
 
         Ok(VaultConfigCreation {
@@ -352,11 +372,6 @@ impl VaultConfig {
         Ok(Some(master_key))
     }
 
-    /// Reset the password using a recovery key.
-    ///
-    /// This re-wraps the master key with a new password-derived KEK and
-    /// updates the password verification data. The recovery key data
-    /// remains unchanged.
     pub fn verify_hardware_key(&self, secret: &[u8]) -> Result<Option<MasterKey>> {
         let hardware_key = self
             .hardware_key
@@ -406,11 +421,42 @@ impl VaultConfig {
         }
     }
 
+    /// Reset the password using a recovery key.
+    ///
+    /// Generates a new master key, wraps it under the new password and under
+    /// the same recovery key (so the existing recovery words keep working),
+    /// and returns it. Nothing in storage is encrypted under the returned key
+    /// yet: persisting this config alone strands the vault, so the vault must
+    /// be re-encrypted and published under it first (`recover_vault` does).
     pub fn reset_password(
         &mut self,
         recovery_key: &RecoveryKey,
         new_password: &[u8],
-    ) -> Result<()> {
+    ) -> Result<MasterKey> {
+        if new_password.is_empty() {
+            return Err(Error::InvalidInput(
+                "New password cannot be empty".to_string(),
+            ));
+        }
+
+        // Verify the recovery key before touching any field.
+        self.verify_recovery_key(recovery_key)?
+            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
+
+        self.rotate_master_key(recovery_key, new_password)
+    }
+
+    /// Replace the master key with a fresh one wrapped under `new_password`
+    /// and under `recovery_key`, the vault's existing recovery key.
+    ///
+    /// The stored recovery key is re-encrypted under the new master key. A
+    /// hardware-key wrap holds the old master key and cannot be re-wrapped
+    /// without the hardware secret, so the enrollment is removed.
+    pub(crate) fn rotate_master_key(
+        &mut self,
+        recovery_key: &RecoveryKey,
+        new_password: &[u8],
+    ) -> Result<MasterKey> {
         use axiomvault_crypto::{derive_key, encrypt};
 
         if new_password.is_empty() {
@@ -418,30 +464,37 @@ impl VaultConfig {
                 "New password cannot be empty".to_string(),
             ));
         }
+        // Every rewrap (password change and both recovery paths) comes through
+        // here, under parameters read from storage.
+        self.kdf_params.validate_minimum()?;
 
-        // Verify recovery key and get master key.
-        let master_key = self
-            .verify_recovery_key(recovery_key)?
-            .ok_or_else(|| Error::NotPermitted("Invalid recovery key".to_string()))?;
-
-        // Derive new password KEK.
+        let master_key = generate_master_key();
         let new_salt = Salt::generate();
         let new_kek = derive_key(new_password, &new_salt, &self.kdf_params)?;
-
-        // Re-wrap master key.
         let new_wrapped = wrap_key(&master_key, new_kek.as_bytes())?;
+        let recovery_kek = recovery_key.derive_kek();
+        let recovery_wrapped = wrap_key(&master_key, &recovery_kek)?;
 
-        // Re-create password verification.
+        // Self-verify both wraps before anything can be persisted.
+        if unwrap_key(&new_wrapped, new_kek.as_bytes())?.as_bytes() != master_key.as_bytes()
+            || unwrap_key(&recovery_wrapped, &recovery_kek)?.as_bytes() != master_key.as_bytes()
+        {
+            return Err(Error::Crypto(
+                "master key verification failed after wrapping; aborting rotation".to_string(),
+            ));
+        }
+
         let verification_plaintext = b"AXIOMVAULT_KEY_VERIFICATION_V1";
-        let new_verification = encrypt(new_kek.as_bytes(), verification_plaintext)?;
-
-        // Update config.
+        self.key_verification = encrypt(new_kek.as_bytes(), verification_plaintext)?;
         self.salt = new_salt;
-        self.key_verification = new_verification;
         self.wrapped_master_key = Some(new_wrapped);
+        self.recovery_wrapped_master_key = Some(recovery_wrapped);
+        self.encrypted_recovery_key =
+            Some(encrypt(master_key.as_bytes(), recovery_key.as_bytes())?);
+        self.hardware_key = None;
         self.modified_at = Utc::now();
 
-        Ok(())
+        Ok(master_key)
     }
 
     /// Retrieve the stored recovery key by decrypting with the master key.
@@ -472,11 +525,37 @@ impl VaultConfig {
         Ok(RecoveryKey::from_bytes(*bytes))
     }
 
+    /// Check that `encrypted_recovery_key` holds `recovery_key` under `master_key`.
+    ///
+    /// The 1.1 layout keeps the recovery key in three fields:
+    /// `recovery_key_verification` and `recovery_wrapped_master_key`, which
+    /// [`VaultConfig::verify_recovery_key`] checks, and `encrypted_recovery_key`,
+    /// which this checks against the master key that wrap yields.
+    pub(crate) fn verify_recovery_key_binding(
+        &self,
+        recovery_key: &RecoveryKey,
+        master_key: &MasterKey,
+    ) -> Result<()> {
+        let stored = self.decrypt_recovery_key(master_key)?;
+        if !bool::from(stored.as_bytes().ct_eq(recovery_key.as_bytes())) {
+            return Err(Error::Crypto(
+                "stored recovery key does not match the recovery words".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Migrate a legacy v1.0 vault to the v1.1 key-wrapping format.
     ///
     /// For legacy vaults, the Argon2id output was the master key. We keep
     /// that as the master key and simply wrap it under both the password
     /// KEK and a new recovery KEK.
+    ///
+    /// The password proves only the derived key, not that it is the master
+    /// key: a newer config stripped of `wrapped_master_key` looks legacy too.
+    /// This touches no storage, so callers must first prove the key against an
+    /// object encrypted under the master key, as `MigrationRegistry::migrate`
+    /// does, before persisting the result.
     ///
     /// # Returns
     /// The recovery words to show to the user.
@@ -485,6 +564,17 @@ impl VaultConfig {
 
         if !self.is_legacy_format() {
             return Err(Error::Vault("Vault is already in v1.1 format".to_string()));
+        }
+        // A real 1.0 config has no recovery material; its presence means the
+        // wrapped key was stripped from a newer config.
+        if self.recovery_wrapped_master_key.is_some()
+            || self.recovery_key_verification.is_some()
+            || self.encrypted_recovery_key.is_some()
+        {
+            return Err(Error::Vault(
+                "legacy migration refused: config has recovery fields of a newer format but no wrapped master key"
+                    .to_string(),
+            ));
         }
 
         // In legacy mode, verify_password returns the Argon2id output which
@@ -504,7 +594,7 @@ impl VaultConfig {
         let encrypted_recovery_key = encrypt(master_key.as_bytes(), recovery_key.as_bytes())?;
         let recovery_words = recovery_key.to_mnemonic()?;
 
-        self.version = VaultVersion::CURRENT;
+        self.version = VaultVersion::V1_1;
         self.wrapped_master_key = Some(wrapped_master_key);
         self.recovery_wrapped_master_key = Some(recovery_wrapped);
         self.recovery_key_verification = Some(recovery_verification);
@@ -540,7 +630,76 @@ impl VaultConfig {
         config.kdf_params.validate()?;
         Ok(config)
     }
+
+    /// `config_mac` over this config with the tag itself left out.
+    fn compute_mac(&self, master_key: &MasterKey) -> Result<Vec<u8>> {
+        use blake2::digest::consts::U32;
+        use blake2::digest::Mac;
+
+        let mut untagged = self.clone();
+        untagged.config_mac = None;
+        let key = master_key.derive_file_key(CONFIG_MAC_CONTEXT);
+        let mut mac = <blake2::Blake2bMac<U32> as Mac>::new_from_slice(key.as_bytes())
+            .map_err(|e| Error::Crypto(format!("config MAC key rejected: {e}")))?;
+        mac.update(&untagged.to_bytes()?);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    /// Serialize for storage with a `config_mac` under `master_key`, the key
+    /// the generation that publishes these bytes is sealed with.
+    pub(crate) fn to_authenticated_bytes(&self, master_key: &MasterKey) -> Result<Vec<u8>> {
+        let mut tagged = self.clone();
+        tagged.config_mac = Some(self.compute_mac(master_key)?);
+        tagged.to_bytes()
+    }
+
+    /// Check `config_mac` against `master_key` and remove it.
+    ///
+    /// The tag is keyed by the master key, so this runs after unlock and before
+    /// anything is written or rewrapped. A `CURRENT` config must carry a tag.
+    /// Nothing tells an untagged 1.1 config from a 2.0 config stripped and
+    /// relabelled, so it is accepted only where `bound_by_manifest`: a sealed
+    /// manifest binds these bytes. Every 1.1 config this code writes (the
+    /// registry's 1.0 -> 1.1 step) is tagged. Any tag present must verify.
+    pub(crate) fn verify_integrity(
+        &mut self,
+        master_key: &MasterKey,
+        bound_by_manifest: bool,
+    ) -> Result<()> {
+        let Some(tag) = self.config_mac.take() else {
+            if self.version.major >= VaultVersion::CURRENT.major {
+                return Err(Error::Crypto(format!(
+                    "{CONFIG_FILENAME} has no integrity tag (config_mac); a {} vault config \
+                     without one is refused",
+                    self.version
+                )));
+            }
+            if !bound_by_manifest && self.version >= VaultVersion::V1_1 {
+                return Err(Error::Crypto(format!(
+                    "{CONFIG_FILENAME} is not authenticated: a {} config with no integrity tag \
+                     (config_mac) and no snapshot manifest is refused; restore a tagged copy of \
+                     {CONFIG_FILENAME}, or a copy bound by a snapshot manifest",
+                    self.version
+                )));
+            }
+            return Ok(());
+        };
+        let expected = self.compute_mac(master_key)?;
+        if tag.len() != expected.len() || !bool::from(tag.as_slice().ct_eq(&expected)) {
+            return Err(Error::Crypto(format!(
+                "{CONFIG_FILENAME} integrity check failed (config_mac mismatch): \
+                 the stored config was changed outside this vault"
+            )));
+        }
+        Ok(())
+    }
 }
+
+/// The refusal of an untagged 1.1 config that no manifest binds.
+#[cfg(test)]
+pub(crate) const UNAUTHENTICATED_V1_1: &str = "Cryptographic error: vault.config is not \
+    authenticated: a 1.1 config with no integrity tag (config_mac) and no snapshot manifest is \
+    refused; restore a tagged copy of vault.config, or a copy bound by a snapshot manifest";
 
 /// Configuration file name in vault root.
 pub const CONFIG_FILENAME: &str = "vault.config";
@@ -581,17 +740,137 @@ mod tests {
         }
     }
 
+    fn tagged_config() -> (VaultConfig, MasterKey) {
+        let creation = VaultConfig::new(
+            VaultId::new("config-mac").unwrap(),
+            b"password",
+            "local",
+            serde_json::json!({ "root": "/vault" }),
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        (creation.config, creation.master_key)
+    }
+
+    #[test]
+    fn config_mac_round_trips_and_is_removed_on_verify() {
+        let (config, master_key) = tagged_config();
+        let bytes = config.to_authenticated_bytes(&master_key).unwrap();
+        let mut restored = VaultConfig::from_bytes(&bytes).unwrap();
+        assert!(restored.config_mac.is_some());
+        restored.verify_integrity(&master_key, false).unwrap();
+        assert!(restored.config_mac.is_none());
+        assert_eq!(restored.to_bytes().unwrap(), config.to_bytes().unwrap());
+        // Re-tagging the verified config reproduces the stored bytes.
+        assert_eq!(restored.to_authenticated_bytes(&master_key).unwrap(), bytes);
+    }
+
+    #[test]
+    fn config_mac_covers_every_field_and_the_key() {
+        let (config, master_key) = tagged_config();
+        let bytes = config.to_authenticated_bytes(&master_key).unwrap();
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(&str, Edit); 6] = [
+            ("kdf_params", |json| {
+                json["kdf_params"]["memory_cost"] = 16.into()
+            }),
+            ("hardware_key", |json| {
+                json["hardware_key"] = serde_json::json!({
+                    "metadata": { "kind": "RawSecret", "enrolled_at": "2026-01-01T00:00:00Z" },
+                    "wrapped_master_key": [1, 2, 3],
+                    "key_verification": [4, 5, 6],
+                })
+            }),
+            ("provider_config", |json| {
+                json["provider_config"]["root"] = "/attacker".into()
+            }),
+            ("provider_type", |json| {
+                json["provider_type"] = "gdrive".into()
+            }),
+            ("version", |json| json["version"]["minor"] = 1.into()),
+            ("salt", |json| {
+                let byte = json["salt"][0].as_u64().unwrap();
+                json["salt"][0] = (byte ^ 1).into()
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            edit(&mut json);
+            let mut tampered =
+                VaultConfig::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+            let error = tampered.verify_integrity(&master_key, true).unwrap_err();
+            assert!(
+                error.to_string().contains("config_mac mismatch"),
+                "{field}: {error}"
+            );
+        }
+        let mut genuine = VaultConfig::from_bytes(&bytes).unwrap();
+        let other_key = generate_master_key();
+        assert!(genuine.verify_integrity(&other_key, true).is_err());
+    }
+
+    #[test]
+    fn untagged_config_is_refused_unless_a_manifest_binds_a_1_1_config() {
+        let (mut config, master_key) = tagged_config();
+        for bound_by_manifest in [false, true] {
+            let error = config
+                .clone()
+                .verify_integrity(&master_key, bound_by_manifest)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Cryptographic error: vault.config has no integrity tag (config_mac); a 2.0 vault config without one is refused"
+            );
+        }
+        // An untagged 1.1 config is accepted only where a manifest binds it.
+        config.version = VaultVersion::V1_1;
+        config.clone().verify_integrity(&master_key, true).unwrap();
+        assert_eq!(
+            config
+                .verify_integrity(&master_key, false)
+                .unwrap_err()
+                .to_string(),
+            UNAUTHENTICATED_V1_1
+        );
+    }
+
     #[test]
     fn test_vault_version_compatibility() {
         let current = VaultVersion::CURRENT;
         assert!(current.is_compatible());
 
-        let incompatible = VaultVersion { major: 2, minor: 0 };
+        let incompatible = VaultVersion { major: 3, minor: 0 };
         assert!(!incompatible.is_compatible());
 
-        // v1.0 should be compatible with v1.1
-        let legacy = VaultVersion { major: 1, minor: 0 };
-        assert!(legacy.is_compatible());
+        // 1.x vaults are not directly usable; they upgrade through migration
+        // (1.0) or on open (1.1) before a session is created.
+        assert!(!VaultVersion { major: 1, minor: 0 }.is_compatible());
+        assert!(!VaultVersion::V1_1.is_compatible());
+    }
+
+    #[test]
+    fn v1_1_client_gate_refuses_current_format() {
+        // Copy of the 1.1 client's only open-path gate (b6520ff
+        // `VaultVersion::is_compatible`, called by `VaultSession::from_master_key`).
+        fn v1_1_client_is_compatible(version: &VaultVersion) -> bool {
+            version.major == VaultVersion::V1_1.major
+        }
+        assert!(!v1_1_client_is_compatible(&VaultVersion::CURRENT));
+        assert!(v1_1_client_is_compatible(&VaultVersion::V1_1));
+    }
+
+    #[test]
+    fn new_config_reports_current_version() {
+        let config = VaultConfig::new(
+            VaultId::new("fresh").unwrap(),
+            b"password",
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.version, VaultVersion { major: 2, minor: 0 });
     }
 
     #[test]
@@ -627,12 +906,32 @@ mod tests {
         let rk = RecoveryKey::from_mnemonic(&recovery_words).unwrap();
         assert!(config.verify_recovery_key(&rk).unwrap().is_some());
 
+        let old_key = config.verify_password(password).unwrap().unwrap();
         let new_password = b"new-password";
-        config.reset_password(&rk, new_password).unwrap();
+        let new_key = config.reset_password(&rk, new_password).unwrap();
+        assert_ne!(old_key.as_bytes(), new_key.as_bytes());
 
         assert!(config.verify_password(password).unwrap().is_none());
-        assert!(config.verify_password(new_password).unwrap().is_some());
-        assert!(config.verify_recovery_key(&rk).unwrap().is_some());
+        assert_eq!(
+            config
+                .verify_password(new_password)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            new_key.as_bytes()
+        );
+        assert_eq!(
+            config.verify_recovery_key(&rk).unwrap().unwrap().as_bytes(),
+            new_key.as_bytes()
+        );
+
+        // A wrong recovery key is refused without changing the config.
+        let before = config.to_bytes().unwrap();
+        assert!(matches!(
+            config.reset_password(&RecoveryKey::generate(), b"other"),
+            Err(Error::NotPermitted(_))
+        ));
+        assert_eq!(config.to_bytes().unwrap(), before);
     }
 
     #[test]
@@ -805,6 +1104,7 @@ mod tests {
             recovery_key_verification: None,
             encrypted_recovery_key: None,
             hardware_key: None,
+            config_mac: None,
         };
 
         assert!(config.is_legacy_format());
@@ -839,6 +1139,7 @@ mod tests {
             recovery_key_verification: None,
             encrypted_recovery_key: None,
             hardware_key: None,
+            config_mac: None,
         };
 
         let recovery_words = config.migrate_to_v1_1(password).unwrap();

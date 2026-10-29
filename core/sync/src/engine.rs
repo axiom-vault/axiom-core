@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_storage::StorageProvider;
 
-use crate::conflict::{ConflictResolver, ConflictStrategy};
+use crate::conflict::{ConflictResolver, ConflictStrategy, MAX_CONFLICT_NAME_ATTEMPTS};
 use crate::mapping::{IdentityPathMapper, SyncPathMapper};
 use crate::retry::{RetryConfig, RetryExecutor};
 use crate::scheduler::{SyncMode, SyncRequest, SyncResult, SyncScheduler, SyncSchedulerHandle};
@@ -466,7 +466,8 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                     }
                 }
                 ChangeType::Delete => match self.delete_remote_file(&change.vault_path).await {
-                    Ok(_) => {
+                    Ok(true) => conflicts += 1,
+                    Ok(false) => {
                         synced += 1;
                         if let Err(e) = self.staging.write().await.commit(&change_id).await {
                             warn!("Failed to commit staged change: {}", e);
@@ -500,6 +501,12 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             let state = self.state.read().await;
             state.get(path).cloned()
         };
+
+        // The remote revision the upload may replace; `None` means the
+        // upload may only create (audit M-17). It is set from the revision
+        // checked below, so a change landing after the check is refused by
+        // the provider instead of being overwritten.
+        let mut expected_remote_etag: Option<String> = None;
 
         if let Some(ref entry) = local_entry {
             // A conflict remains pending until an explicit resolution selects
@@ -556,48 +563,56 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                         }
                     }
 
-                    if self.config.auto_resolve_conflicts {
-                        if self.config.conflict_strategy == ConflictStrategy::Manual {
-                            let mut state = self.state.write().await;
-                            if let Some(entry) = state.get_mut(path) {
-                                entry.mark_conflicted(remote.etag.clone(), remote.modified);
-                            }
-                            drop(state);
-                            self.persist_state().await?;
-                            return Ok(true);
-                        }
-                        self.apply_conflict_resolution(path, data, self.config.conflict_strategy)
-                            .await?;
-                        return Ok(false);
-                    } else {
-                        // Mark as conflicted
-                        let mut state = self.state.write().await;
-                        if let Some(entry) = state.get_mut(path) {
-                            entry.mark_conflicted(remote.etag.clone(), remote.modified);
-                        }
-                        drop(state);
-                        self.persist_state().await?;
-                        return Ok(true);
+                    // Record the conflicting revision first: resolution
+                    // replaces exactly that revision and nothing newer.
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.get_mut(path) {
+                        entry.mark_conflicted(remote.etag.clone(), remote.modified);
                     }
+                    drop(state);
+                    self.persist_state().await?;
+                    if self.config.auto_resolve_conflicts
+                        && self.config.conflict_strategy != ConflictStrategy::Manual
+                    {
+                        return match self
+                            .apply_conflict_resolution(path, data, self.config.conflict_strategy)
+                            .await
+                        {
+                            Ok(()) => Ok(false),
+                            Err(Error::Conflict(_)) => Ok(true),
+                            Err(error) => Err(error),
+                        };
+                    }
+                    return Ok(true);
                 }
-                Ok(_) | Err(Error::NotFound(_)) => {}
+                Ok(remote) => expected_remote_etag = remote.etag,
+                Err(Error::NotFound(_)) => {}
                 Err(error) => return Err(error),
             }
         }
 
-        // No conflict, upload
+        // No conflict observed: upload only over the revision just checked.
         let provider = self.remote.clone();
-        let path_clone = remote_path;
+        let path_clone = remote_path.clone();
+        let upload_data = data.clone();
 
-        let metadata = self
+        let uploaded = self
             .retry_executor
             .execute(move || {
                 let p = provider.clone();
                 let path = path_clone.clone();
-                let d = data.clone();
-                async move { p.upload(&path, d).await }
+                let d = upload_data.clone();
+                let expected = expected_remote_etag.clone();
+                async move { p.upload_if_match(&path, d, expected.as_deref()).await }
             })
-            .await?;
+            .await;
+        let metadata = match uploaded {
+            Ok(metadata) => metadata,
+            Err(Error::Conflict(_)) => {
+                return self.settle_refused_write(path, &remote_path, &data).await;
+            }
+            Err(error) => return Err(error),
+        };
 
         // Update sync state
         let mut state = self.state.write().await;
@@ -616,23 +631,103 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         Ok(false)
     }
 
-    /// Delete a file from remote storage.
-    async fn delete_remote_file(&self, path: &VaultPath) -> Result<()> {
-        let provider = self.remote.clone();
-        let path_clone = self.remote_path(path)?;
+    /// Resolve a conditional write the provider refused. Identical remote
+    /// bytes mean this write already landed (for example a retry after a lost
+    /// acknowledgement), so the path is synced; anything else is recorded as
+    /// a conflict against the revision now on the remote. Returns whether the
+    /// path is in conflict.
+    async fn settle_refused_write(
+        &self,
+        path: &VaultPath,
+        remote_path: &VaultPath,
+        data: &[u8],
+    ) -> Result<bool> {
+        let current = match self
+            .retry_executor
+            .execute_with_condition(
+                || self.remote.download_with_metadata(remote_path),
+                |error| matches!(error, Error::Conflict(_)),
+            )
+            .await
+        {
+            Ok(versioned) => Some(versioned),
+            Err(Error::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut state = self.state.write().await;
+        if state.get(path).is_none() {
+            state.insert(SyncEntry::new_local(path.to_string(), None));
+        }
+        let mut has_conflict = true;
+        if let Some(entry) = state.get_mut(path) {
+            match current {
+                Some(versioned) if versioned.data == data => {
+                    entry.mark_synced(versioned.metadata.etag, versioned.metadata.modified);
+                    has_conflict = false;
+                }
+                Some(versioned) => {
+                    entry.mark_conflicted(versioned.metadata.etag, versioned.metadata.modified)
+                }
+                None => entry.mark_conflicted(None, chrono::Utc::now()),
+            }
+        }
+        drop(state);
+        self.persist_state().await?;
+        Ok(has_conflict)
+    }
 
-        self.retry_executor
+    /// Delete a file from remote storage, but only the revision this side
+    /// last synced (audit M-17). Returns whether the path is in conflict.
+    async fn delete_remote_file(&self, path: &VaultPath) -> Result<bool> {
+        let provider = self.remote.clone();
+        let remote_path = self.remote_path(path)?;
+        let path_clone = remote_path.clone();
+        let entry = self.state.read().await.get(path).cloned();
+        // A pending conflict carries the conflicting revision as its remote
+        // ETag; deleting against it would discard that revision.
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.status == SyncStatus::Conflicted)
+        {
+            return Ok(true);
+        }
+        let expected_remote_etag = entry.and_then(|entry| entry.remote_etag);
+
+        let deleted = self
+            .retry_executor
             .execute(move || {
                 let p = provider.clone();
                 let path = path_clone.clone();
+                let expected = expected_remote_etag.clone();
                 async move {
-                    match p.delete(&path).await {
+                    match p.delete_if_match(&path, expected.as_deref()).await {
                         Ok(()) | Err(Error::NotFound(_)) => Ok(()),
                         Err(error) => Err(error),
                     }
                 }
             })
-            .await?;
+            .await;
+        match deleted {
+            Ok(()) => {}
+            Err(Error::Conflict(_)) => match self.remote.metadata(&remote_path).await {
+                Ok(remote) => {
+                    let mut state = self.state.write().await;
+                    if state.get(path).is_none() {
+                        state.insert(SyncEntry::new_local(path.to_string(), None));
+                    }
+                    if let Some(entry) = state.get_mut(path) {
+                        entry.mark_conflicted(remote.etag, remote.modified);
+                    }
+                    drop(state);
+                    self.persist_state().await?;
+                    return Ok(true);
+                }
+                // Removed by someone else since the refusal: nothing is lost.
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        }
 
         // Remove from sync state
         let mut state = self.state.write().await;
@@ -640,7 +735,7 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         drop(state);
         self.persist_state().await?;
 
-        Ok(())
+        Ok(false)
     }
 
     /// Discover remote objects, mark changed objects for download, and apply
@@ -856,6 +951,36 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
         })
     }
 
+    /// Pick a conflict name free on the remote and create the local copy
+    /// there with create-if-absent. A taken name is retried with a new
+    /// suffix and never overwritten. Returns the remote and local paths and
+    /// the local copy's metadata.
+    async fn create_local_conflict_copy(
+        &self,
+        remote_path: &VaultPath,
+        local_data: &[u8],
+    ) -> Result<(VaultPath, VaultPath, axiomvault_storage::Metadata)> {
+        for _ in 0..MAX_CONFLICT_NAME_ATTEMPTS {
+            let renamed_remote = self.conflict_resolver.generate_conflict_path(remote_path)?;
+            if self.remote.exists(&renamed_remote).await? {
+                continue;
+            }
+            let renamed_local = self.path_mapper.remote_to_local(&renamed_remote)?;
+            match self
+                .local
+                .upload_if_match(&renamed_local, local_data.to_vec(), None)
+                .await
+            {
+                Ok(metadata) => return Ok((renamed_remote, renamed_local, metadata)),
+                Err(Error::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Conflict(format!(
+            "no free conflict name for {remote_path} after {MAX_CONFLICT_NAME_ATTEMPTS} attempts"
+        )))
+    }
+
     async fn apply_conflict_resolution(
         &self,
         path: &VaultPath,
@@ -867,12 +992,38 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
             ConflictStrategy::Manual => Ok(()),
             ConflictStrategy::PreferLocal => {
                 self.local.replace_atomic(path, local_data.clone()).await?;
-                let metadata = self.remote.upload(&remote_path, local_data).await?;
+                // Replace only the revision recorded as conflicting; one that
+                // arrived after it is refused rather than overwritten.
+                let expected_remote_etag = {
+                    let state = self.state.read().await;
+                    state.get(path).and_then(|entry| entry.remote_etag.clone())
+                };
+                match self
+                    .remote
+                    .upload_if_match(
+                        &remote_path,
+                        local_data.clone(),
+                        expected_remote_etag.as_deref(),
+                    )
+                    .await
                 {
-                    let mut state = self.state.write().await;
-                    if let Some(entry) = state.get_mut(path) {
-                        entry.mark_synced(metadata.etag, metadata.modified);
+                    Ok(metadata) => {
+                        let mut state = self.state.write().await;
+                        if let Some(entry) = state.get_mut(path) {
+                            entry.mark_synced(metadata.etag, metadata.modified);
+                        }
                     }
+                    Err(Error::Conflict(_)) => {
+                        if self
+                            .settle_refused_write(path, &remote_path, &local_data)
+                            .await?
+                        {
+                            return Err(Error::Conflict(format!(
+                                "remote changed again since the conflict on {path} was recorded"
+                            )));
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
                 self.persist_state().await?;
                 self.staging.write().await.commit_path(path).await?;
@@ -906,13 +1057,8 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                         |error| matches!(error, Error::Conflict(_)),
                     )
                     .await?;
-                let renamed_remote = self
-                    .conflict_resolver
-                    .generate_conflict_path(&remote_path)?;
-                let renamed_local = self.path_mapper.remote_to_local(&renamed_remote)?;
-                let local_metadata = self
-                    .local
-                    .replace_atomic(&renamed_local, local_data.clone())
+                let (renamed_remote, renamed_local, local_metadata) = self
+                    .create_local_conflict_copy(&remote_path, &local_data)
                     .await?;
                 self.local.replace_atomic(path, versioned.data).await?;
                 self.staging
@@ -935,7 +1081,26 @@ impl<R: StorageProvider + ?Sized + 'static, L: StorageProvider + ?Sized + 'stati
                 }
                 self.persist_state().await?;
 
-                let renamed_metadata = self.remote.upload(&renamed_remote, local_data).await?;
+                // Create-if-absent: never overwrite an object that took the
+                // name after it was checked. Identical bytes are this copy
+                // (an earlier attempt, or one provider serving both sides).
+                let renamed_metadata = match self
+                    .remote
+                    .upload_if_match(&renamed_remote, local_data.clone(), None)
+                    .await
+                {
+                    Ok(metadata) => metadata,
+                    Err(Error::Conflict(_)) => {
+                        let existing = self.remote.download_with_metadata(&renamed_remote).await?;
+                        if existing.data != local_data {
+                            return Err(Error::Conflict(format!(
+                                "conflict copy name {renamed_remote} was taken concurrently"
+                            )));
+                        }
+                        existing.metadata
+                    }
+                    Err(error) => return Err(error),
+                };
                 {
                     let mut state = self.state.write().await;
                     if let Some(entry) = state.get_mut(&renamed_local) {

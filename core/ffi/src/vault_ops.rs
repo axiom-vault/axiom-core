@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::path::Path;
 
 use axiomvault_app::{AppService, CreateVaultParams, OpenVaultParams, RecoverVaultParams};
+use axiomvault_common::VaultId;
 use axiomvault_vault::{
     check_migration_needed, check_vault_health, check_vault_structure, MigrationRegistry,
     MigrationStatus, VaultConfig, VaultManager as CoreVaultManager, VaultVersion,
@@ -40,13 +41,15 @@ pub async fn create_vault(path: &str, password: Zeroizing<String>) -> FFIResult<
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("vault");
+    let vault_id = VaultId::unique(vault_name)
+        .map_err(|e| FFIError::VaultError(format!("Invalid input: {}", e)))?;
 
     let provider_config = serde_json::json!({ "root": abs_path });
 
     let service = AppService::new();
     let result = service
         .create_vault(CreateVaultParams {
-            vault_id: vault_name.to_string(),
+            vault_id: vault_id.to_string(),
             password,
             provider_type: "local".to_string(),
             provider_config,
@@ -284,16 +287,34 @@ pub async fn run_migration(
     let manager = CoreVaultManager::new();
     let provider = manager
         .registry()
-        .resolve("local", provider_config)
+        .resolve("local", provider_config.clone())
         .map_err(|e| FFIError::VaultError(e.to_string()))?;
+    let config_file = Path::new(&abs_path).join("vault.config");
+    if std::fs::read(&config_file)
+        .ok()
+        .and_then(|bytes| VaultConfig::from_bytes(&bytes).ok())
+        .is_some_and(|config| config.version == VaultVersion::CURRENT)
+    {
+        return Ok(None);
+    }
+    // Registry steps rewrite only `vault.config` and end at 1.1; the 1.1 -> 2.0
+    // format upgrade is published through a manifest generation by
+    // upgrade_to_current. open_vault refuses 1.1 and never upgrades.
     let outcome = MigrationRegistry::default()
-        .migrate(
-            provider.as_ref(),
-            password.as_bytes(),
-            &VaultVersion::CURRENT,
-        )
+        .migrate(provider.as_ref(), password.as_bytes(), &VaultVersion::V1_1)
         .await
         .map_err(|e| FFIError::VaultError(e.to_string()))?;
+    if let Err(error) = manager
+        .upgrade_to_current("local", provider_config, password.as_bytes())
+        .await
+    {
+        // New recovery words are already committed; losing them is worse than
+        // leaving the vault at 1.1, which open refuses and a rerun of the
+        // migration upgrades (the registry step is then a no-op).
+        if outcome.recovery_words.is_none() {
+            return Err(FFIError::VaultError(error.to_string()));
+        }
+    }
     Ok(outcome.recovery_words)
 }
 
