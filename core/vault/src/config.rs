@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use subtle::ConstantTimeEq;
 
-use axiomvault_common::{Error, Result, VaultId};
+use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::{
     self, create_recovery_verification, generate_master_key, unwrap_key, wrap_key, RecoveryKey,
 };
 use axiomvault_crypto::recovery::{create_hardware_key_verification, derive_hardware_key_kek};
 use axiomvault_crypto::{KdfParams, MasterKey, Salt};
+use axiomvault_storage::StorageProvider;
 use zeroize::Zeroizing;
 
 fn contains_oauth_credentials(value: &serde_json::Value) -> bool {
@@ -712,6 +713,35 @@ pub const META_DIRNAME: &str = "m";
 
 /// Tree state filename in metadata directory.
 pub const TREE_FILENAME: &str = "tree.json";
+
+/// Longest config that is read; nothing authenticates the length before the
+/// read. A config is about 2 KiB: fixed key material plus a free-form
+/// `provider_config` (folder ids, credential references, or a legacy config's
+/// OAuth tokens), so 1 MiB is room for any of them.
+pub(crate) const CONFIG_MAX_LEN: u64 = 1024 * 1024;
+
+/// Longest encrypted tree index that is read. The tree grows with the vault:
+/// a node takes about 460 bytes with 20-byte names and 1.25 KiB with 255-byte
+/// ones, so 1 GiB is about two million entries, or 850,000 at the longest
+/// names.
+pub(crate) const TREE_MAX_LEN: u64 = 1024 * 1024 * 1024;
+
+/// Download the vault metadata object at `path` (a config, tree or manifest),
+/// refusing one longer than `max_len` before reading past that.
+pub(crate) async fn download_metadata(
+    provider: &dyn StorageProvider,
+    path: &VaultPath,
+    max_len: u64,
+) -> Result<Vec<u8>> {
+    match provider.download_bounded(path, max_len).await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+            Err(Error::Crypto(format!(
+                "{path} is longer than the {max_len}-byte limit for vault metadata and is not read"
+            )))
+        }
+        result => result,
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,8 @@ use std::collections::HashSet;
 use tracing::{debug, warn};
 
 use crate::config::{
-    VaultConfig, VaultVersion, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME,
+    download_metadata, VaultConfig, VaultVersion, CONFIG_FILENAME, CONFIG_MAX_LEN, DATA_DIRNAME,
+    META_DIRNAME, TREE_FILENAME, TREE_MAX_LEN,
 };
 use crate::tree::{NodeType, TreeNode, VaultTree};
 use axiomvault_common::health::{DiagnosticResult, HealthReport, Severity};
@@ -34,7 +35,7 @@ pub async fn check_vault_structure(
     // vault.config lives at the vault root, not under the metadata directory.
     let config_path = VaultPath::parse(CONFIG_FILENAME)?;
     match provider.exists(&config_path).await {
-        Ok(true) => match provider.download(&config_path).await {
+        Ok(true) => match download_metadata(provider, &config_path, CONFIG_MAX_LEN).await {
             Ok(data) => match VaultConfig::from_bytes(&data) {
                 Ok(config) => {
                     check_config(&config, &mut results);
@@ -403,7 +404,7 @@ async fn load_tree(provider: &dyn StorageProvider, master_key: &MasterKey) -> Re
         return Ok(VaultTree::new());
     }
 
-    let encrypted_bytes = provider.download(&tree_path).await?;
+    let encrypted_bytes = download_metadata(provider, &tree_path, TREE_MAX_LEN).await?;
 
     let tree_key = master_key.derive_file_key(TREE_KEY_CONTEXT);
     let mut tree_bytes = decrypt(tree_key.as_bytes(), &encrypted_bytes).map_err(|e| {

@@ -8,11 +8,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::config::{VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME};
+use crate::config::{
+    download_metadata, VaultConfig, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME, TREE_FILENAME,
+    TREE_MAX_LEN,
+};
 use crate::freshness::{
     publication_lock, AnchorKeys, FreshnessAnchor, FreshnessState as AnchorFreshnessState,
 };
-use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
+use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME, MANIFEST_MAX_LEN};
 use crate::tree::VaultTree;
 use axiomvault_common::{Error, Result, VaultId, VaultPath};
 use axiomvault_crypto::recovery::RecoveryKey;
@@ -204,7 +207,8 @@ impl VaultSession {
             return Ok(VaultTree::new());
         }
 
-        let encrypted_bytes = provider.download(&tree_path).await?;
+        let encrypted_bytes =
+            download_metadata(provider.as_ref(), &tree_path, TREE_MAX_LEN).await?;
 
         Self::decrypt_tree_bytes(master_key, &encrypted_bytes)
     }
@@ -475,7 +479,7 @@ impl VaultSession {
         else {
             return false;
         };
-        match self.provider.download(&path).await {
+        match download_metadata(self.provider.as_ref(), &path, MANIFEST_MAX_LEN).await {
             Ok(bytes) => GenerationManifest::open(key, &bytes).is_ok(),
             Err(_) => !self.provider.exists(&path).await.unwrap_or(true),
         }
@@ -550,8 +554,8 @@ impl VaultSession {
 
     async fn current_generation_objects(&self) -> Result<Vec<String>> {
         let path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
-        let manifest =
-            GenerationManifest::open(self.master_key()?, &self.provider.download(&path).await?)?;
+        let bytes = download_metadata(self.provider.as_ref(), &path, MANIFEST_MAX_LEN).await?;
+        let manifest = GenerationManifest::open(self.master_key()?, &bytes)?;
         let (tree_object, config_object) = manifest.object_paths()?;
         Ok([tree_object, config_object]
             .iter()
@@ -618,7 +622,7 @@ impl VaultSession {
         let mut generation = freshness.generation.lock().await;
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
         let previous_manifest = if self.provider.exists(&manifest_path).await? {
-            Some(self.provider.download(&manifest_path).await?)
+            Some(download_metadata(self.provider.as_ref(), &manifest_path, MANIFEST_MAX_LEN).await?)
         } else {
             None
         };
@@ -683,11 +687,10 @@ impl VaultSession {
             .upload(&manifest_path, manifest_bytes.clone())
             .await
         {
-            let visible = self
-                .provider
-                .download(&manifest_path)
-                .await
-                .is_ok_and(|bytes| bytes == manifest_bytes);
+            let visible =
+                download_metadata(self.provider.as_ref(), &manifest_path, MANIFEST_MAX_LEN)
+                    .await
+                    .is_ok_and(|bytes| bytes == manifest_bytes);
             if !visible {
                 return Err(error);
             }
