@@ -1839,3 +1839,250 @@ async fn test_m16_unpromoted_mirror_copy_stays_usable() {
     assert_eq!(provider.download(&renamed).await.unwrap(), b"staged");
     assert_eq!(provider.download(&copied).await.unwrap(), b"staged");
 }
+
+// -- Bounded reads: a backend that serves oversized objects ----------------
+
+/// Junk bytes an inflating backend appends to every object it serves.
+const INFLATION: usize = 1 << 20;
+/// Chunk size of an inflating backend's download streams.
+const INFLATION_CHUNK: usize = 4096;
+
+/// A backend that, once `inflating` is set, serves every object followed by
+/// `INFLATION` junk bytes, streamed in chunks, and counts the object bytes it
+/// hands out. Internal files (the shard map, rebuild checkpoints) pass
+/// through as stored and uncounted.
+struct InflatingProvider {
+    inner: MemoryProvider,
+    inflating: AtomicBool,
+    served: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InflatingProvider {
+    fn new() -> Self {
+        Self {
+            inner: MemoryProvider::new(),
+            inflating: AtomicBool::new(false),
+            served: Default::default(),
+        }
+    }
+
+    fn is_internal(path: &VaultPath) -> bool {
+        path.to_string_path().contains(".axiomvault/")
+    }
+
+    fn junk_len(&self) -> usize {
+        if self.inflating.load(Ordering::SeqCst) {
+            INFLATION
+        } else {
+            0
+        }
+    }
+
+    /// Bytes served since the last call.
+    fn take_served(&self) -> usize {
+        self.served.swap(0, Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageProvider for InflatingProvider {
+    fn name(&self) -> &str {
+        "inflating"
+    }
+    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.inner.upload(path, data).await
+    }
+    async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+        self.inner.upload_stream(path, stream).await
+    }
+    async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+        let mut data = self.inner.download(path).await?;
+        if Self::is_internal(path) {
+            return Ok(data);
+        }
+        data.resize(data.len() + self.junk_len(), 0xEE);
+        self.served.fetch_add(data.len(), Ordering::SeqCst);
+        Ok(data)
+    }
+    async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+        use futures::StreamExt;
+        if Self::is_internal(path) {
+            return self.inner.download_stream(path).await;
+        }
+        let data = self.inner.download(path).await?;
+        let junk = std::iter::repeat_with(|| vec![0xEE; INFLATION_CHUNK])
+            .take(self.junk_len() / INFLATION_CHUNK);
+        let served = Arc::clone(&self.served);
+        let chunks = stream::iter(std::iter::once(data).chain(junk)).map(move |chunk| {
+            served.fetch_add(chunk.len(), Ordering::SeqCst);
+            Ok(chunk)
+        });
+        Ok(Box::pin(chunks))
+    }
+    async fn exists(&self, path: &VaultPath) -> Result<bool> {
+        self.inner.exists(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+        self.inner.list(path).await
+    }
+    async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.metadata(path).await
+    }
+    async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.create_dir(path).await
+    }
+    async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete_dir(path).await
+    }
+    async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.rename(from, to).await
+    }
+    async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.copy(from, to).await
+    }
+}
+
+fn inflating_backends(n: usize) -> (Vec<Arc<InflatingProvider>>, Vec<Arc<dyn StorageProvider>>) {
+    let raw: Vec<Arc<InflatingProvider>> =
+        (0..n).map(|_| Arc::new(InflatingProvider::new())).collect();
+    let dyns = raw
+        .iter()
+        .map(|b| Arc::clone(b) as Arc<dyn StorageProvider>)
+        .collect();
+    (raw, dyns)
+}
+
+fn is_too_long(error: &Error) -> bool {
+    matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::FileTooLarge)
+}
+
+/// An oversized mirror copy is read only up to the authenticated size,
+/// counts as a bad copy, and the read falls back to a genuine one.
+#[tokio::test]
+async fn test_bounded_mirror_read_skips_oversized_copy() {
+    let (raw, backends) = inflating_backends(2);
+    let provider = new_composite(backends, mirror_config()).unwrap();
+    let path = VaultPath::parse("/m.bin").unwrap();
+    let data = vec![7u8; 100];
+    provider.upload(&path, data.clone()).await.unwrap();
+    raw[0].inflating.store(true, Ordering::SeqCst);
+
+    assert_eq!(provider.download_bounded(&path, 100).await.unwrap(), data);
+    let served = raw[0].take_served();
+    assert!(served <= 100 + INFLATION_CHUNK, "held {served} bytes");
+    let health = provider.backend_health(0).await.unwrap();
+    assert_eq!(health.consecutive_failures, 1);
+
+    // Unbounded callers get the same per-copy bound.
+    assert_eq!(provider.download(&path).await.unwrap(), data);
+    let served = raw[0].take_served();
+    assert!(served <= 100 + INFLATION_CHUNK, "held {served} bytes");
+}
+
+/// With every mirror copy oversized the read fails, holding no more than
+/// the bound from any backend; past `max_len` nothing is read at all.
+#[tokio::test]
+async fn test_bounded_mirror_read_fails_when_every_copy_is_oversized() {
+    let (raw, backends) = inflating_backends(3);
+    let provider = new_composite(backends, mirror_config()).unwrap();
+    let path = VaultPath::parse("/m.bin").unwrap();
+    provider.upload(&path, vec![7u8; 100]).await.unwrap();
+    for backend in &raw {
+        backend.inflating.store(true, Ordering::SeqCst);
+    }
+
+    let err = provider.download_bounded(&path, 99).await.unwrap_err();
+    assert!(is_too_long(&err), "{err}");
+    assert!(raw.iter().all(|b| b.take_served() == 0));
+
+    let err = provider.download_bounded(&path, 100).await.unwrap_err();
+    assert!(matches!(err, Error::Crypto(_)), "{err}");
+    for backend in &raw {
+        let served = backend.take_served();
+        assert!(served <= 100 + INFLATION_CHUNK, "held {served} bytes");
+    }
+}
+
+/// Oversized shards are read only up to the payload length the layout
+/// implies and count as missing: up to `parity_shards` of them are
+/// reconstructed around, one more fails the read.
+#[tokio::test]
+async fn test_bounded_erasure_read_treats_oversized_shards_as_missing() {
+    let (raw, backends) = inflating_backends(5);
+    let provider = new_composite(backends, erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/e.bin").unwrap();
+    let data: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+    provider.upload(&path, data.clone()).await.unwrap();
+    let bound = provider.expected_payload_len(300).unwrap() as usize + INFLATION_CHUNK;
+
+    raw[0].inflating.store(true, Ordering::SeqCst);
+    raw[3].inflating.store(true, Ordering::SeqCst);
+    assert_eq!(provider.download_bounded(&path, 300).await.unwrap(), data);
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+    for i in [0, 3] {
+        let health = provider.backend_health(i).await.unwrap();
+        assert_eq!(health.consecutive_failures, 1);
+    }
+
+    raw[4].inflating.store(true, Ordering::SeqCst);
+    let err = provider.download_bounded(&path, 300).await.unwrap_err();
+    assert!(err.to_string().contains("shards available"), "{err}");
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+}
+
+/// Erasure rebuild reads oversized source shards only up to the payload
+/// length and drops them: it rebuilds the genuine shard when enough genuine
+/// ones remain, and writes nothing when not.
+#[tokio::test]
+async fn test_bounded_erasure_rebuild_skips_oversized_shards() {
+    use crate::rebuild::{RaidRebuilder, RebuildConfig};
+
+    let (raw, backends) = inflating_backends(5);
+    let provider = new_composite(backends.clone(), erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/e.bin").unwrap();
+    provider
+        .upload(&path, (0..300u32).map(|i| i as u8).collect())
+        .await
+        .unwrap();
+    let shard4 = shard_of(&provider, "/e.bin", 4).await;
+    let genuine4 = backends[4].download(&shard4).await.unwrap();
+    let bound = provider.expected_payload_len(300).unwrap() as usize + INFLATION_CHUNK;
+
+    raw[0].inflating.store(true, Ordering::SeqCst);
+    backends[4].delete(&shard4).await.unwrap();
+    raw[4].take_served();
+    let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
+        .unwrap()
+        .rebuild()
+        .await
+        .unwrap();
+    assert_eq!((result.rebuilt, result.failed), (1, 0));
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+    assert_eq!(backends[4].download(&shard4).await.unwrap(), genuine4);
+
+    raw[1].inflating.store(true, Ordering::SeqCst);
+    backends[4].delete(&shard4).await.unwrap();
+    let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
+        .unwrap()
+        .rebuild()
+        .await
+        .unwrap();
+    assert_eq!((result.rebuilt, result.failed), (0, 1));
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+    assert!(!backends[4].exists(&shard4).await.unwrap());
+}
