@@ -21,7 +21,7 @@ use crate::tree::{TreeNode, VaultTree};
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::aead::{NONCE_SIZE, TAG_SIZE};
 use axiomvault_crypto::{decrypt, encrypt, DecryptingStream, EncryptingStream, MasterKey};
-use axiomvault_storage::StorageProvider;
+use axiomvault_storage::{ByteStream, StorageProvider};
 
 const STREAM_CONTENT_VERSION: u8 = 2;
 /// Ciphertext is handed to the provider in chunks of about this size.
@@ -470,7 +470,7 @@ async fn reencrypt_stream(
     plaintext_size: u64,
 ) -> Result<String> {
     let encrypted_size = EncryptingStream::new(&new_key)?.encrypted_len(plaintext_size);
-    let mut download = provider.download_stream(from).await?;
+    let mut download = download_stream_bounded(provider.as_ref(), from, encrypted_size).await?;
     let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
     let (plain_sender, plain_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
     let (upload_sender, upload_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
@@ -563,6 +563,27 @@ async fn download_exact(
         return Err(mismatch());
     }
     Ok(data)
+}
+
+/// Stream the object at `path`, which the authenticated snapshot says is
+/// `expected_len` bytes long. Like [`download_exact`], the stream fails as
+/// soon as it runs past that length, so the backend can't make a streamed
+/// read consume more than the snapshot allows. A shorter object is left to
+/// the end frame and the digest.
+async fn download_stream_bounded(
+    provider: &dyn StorageProvider,
+    path: &VaultPath,
+    expected_len: u64,
+) -> Result<ByteStream> {
+    let mut remaining = expected_len;
+    let download = provider.download_stream(path).await?;
+    Ok(Box::pin(download.map(move |chunk| {
+        let chunk = chunk?;
+        remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(|| {
+            Error::Crypto("encrypted file does not match the authenticated snapshot".to_string())
+        })?;
+        Ok(chunk)
+    })))
 }
 
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
@@ -741,7 +762,7 @@ impl<'a> VaultOperations<'a> {
         path: &VaultPath,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
-        let (encrypted_name, expected_digest, content_version) = {
+        let (encrypted_name, expected_digest, content_version, size) = {
             let tree = self.session.tree().read().await;
             let node = tree.get_node(path)?;
             if !node.is_file() {
@@ -751,6 +772,7 @@ impl<'a> VaultOperations<'a> {
                 node.metadata.encrypted_name.clone(),
                 node.metadata.content_digest.clone(),
                 node.metadata.content_version,
+                node.metadata.size.unwrap_or(0),
             )
         };
         if content_version == 0 {
@@ -782,12 +804,14 @@ impl<'a> VaultOperations<'a> {
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let encrypted_len = EncryptingStream::new(&key)?.encrypted_len(size);
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut stream = self
-            .session
-            .provider()
-            .download_stream(&storage_path)
-            .await?;
+        let mut stream = download_stream_bounded(
+            self.session.provider().as_ref(),
+            &storage_path,
+            encrypted_len,
+        )
+        .await?;
 
         let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
         let decrypt_task =
@@ -975,12 +999,14 @@ impl<'a> VaultOperations<'a> {
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let encrypted_len = EncryptingStream::new(&key)?.encrypted_len(size);
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut stream = self
-            .session
-            .provider()
-            .download_stream(&storage_path)
-            .await?;
+        let mut stream = download_stream_bounded(
+            self.session.provider().as_ref(),
+            &storage_path,
+            encrypted_len,
+        )
+        .await?;
 
         let verify_with_digest = expected_digest.is_some();
         let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
@@ -1081,12 +1107,14 @@ impl<'a> VaultOperations<'a> {
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
+        let encrypted_len = EncryptingStream::new(&key)?.encrypted_len(size);
         let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut stream = self
-            .session
-            .provider()
-            .download_stream(&storage_path)
-            .await?;
+        let mut stream = download_stream_bounded(
+            self.session.provider().as_ref(),
+            &storage_path,
+            encrypted_len,
+        )
+        .await?;
 
         let (sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
         let mut output = ReaderSender {
@@ -2205,6 +2233,79 @@ mod tests {
         .await;
         assert!(matches!(result, Err(Error::Crypto(_))));
         assert!(provider.streamed.load(Ordering::SeqCst) <= 4096 + 24 + 16 + 4096);
+    }
+
+    #[tokio::test]
+    async fn streamed_reads_stop_at_the_authenticated_ciphertext_length() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/large.bin").unwrap();
+        let data = streamed_file(&ops, &path).await;
+        let name = session
+            .tree()
+            .read()
+            .await
+            .get_node(&path)
+            .unwrap()
+            .metadata
+            .encrypted_name
+            .clone();
+        let key = session
+            .master_key()
+            .unwrap()
+            .derive_file_key(name.as_bytes());
+        let stream = EncryptingStream::new(key.as_bytes()).unwrap();
+        let expected_len = stream.encrypted_len(data.len() as u64) as usize;
+        // Validly framed content of the same file, twice as long, as an
+        // older version of it or a forged one would be.
+        let mut longer = Vec::new();
+        stream
+            .encrypt_stream(
+                &[data.as_slice(), data.as_slice()].concat()[..],
+                &mut longer,
+            )
+            .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let destination = temp.path().join("export.bin");
+
+        // Without a digest, the length is all that catches the longer stream.
+        for clear_digest in [false, true] {
+            if clear_digest {
+                let mut tree = session.tree().write().await;
+                tree.get_node_mut(&path).unwrap().metadata.content_digest = None;
+            }
+
+            provider.serve_data_blob(longer.clone());
+            let result = ops.read_file_range(&path, 0, 16).await;
+            assert!(matches!(result, Err(Error::Crypto(_))));
+            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+
+            provider.serve_data_blob(longer.clone());
+            let mut reader = ops.open_file_reader(&path, 0).await.unwrap();
+            let result = read_to_end(&mut reader).await;
+            assert!(matches!(result, Err(Error::Crypto(_))));
+            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+
+            provider.serve_data_blob(longer.clone());
+            let result = ops.export_file_to_path(&path, &destination).await;
+            assert!(matches!(result, Err(Error::Crypto(_))));
+            assert!(!destination.exists());
+            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+
+            provider.serve_data_blob(longer.clone());
+            let tree = session.tree().read().await.clone();
+            let dyn_provider: Arc<dyn StorageProvider> = provider.clone();
+            let result = reencrypt_tree(
+                &dyn_provider,
+                session.master_key().unwrap(),
+                &MasterKey::from_bytes([7; 32]),
+                &tree,
+                &mut Vec::new(),
+            )
+            .await;
+            assert!(matches!(result, Err(Error::Crypto(_))));
+            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+        }
     }
 
     #[tokio::test]
