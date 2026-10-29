@@ -152,10 +152,12 @@ impl<'a> EncryptingStream<'a> {
 /// Decrypting stream that processes encrypted chunks.
 pub struct DecryptingStream<'a> {
     key: &'a [u8],
+    chunk_size: usize,
 }
 
 impl<'a> DecryptingStream<'a> {
-    /// Create a new decrypting stream.
+    /// Create a new decrypting stream for ciphertext written with the
+    /// default chunk size.
     ///
     /// # Errors
     /// - Returns error if key length is invalid
@@ -163,7 +165,18 @@ impl<'a> DecryptingStream<'a> {
         if key.len() != KEY_LENGTH {
             return Err(Error::Crypto("Invalid key length".to_string()));
         }
-        Ok(Self { key })
+        Ok(Self {
+            key,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+        })
+    }
+
+    /// Set the chunk size the ciphertext was written with. A header that
+    /// declares any other size is rejected before its frame buffer is
+    /// allocated, as that size is not yet authenticated.
+    pub fn with_chunk_size(mut self, size: usize) -> Self {
+        self.chunk_size = size;
+        self
     }
 
     /// Decrypt data from reader and write authenticated plaintext to writer.
@@ -185,7 +198,7 @@ impl<'a> DecryptingStream<'a> {
         let mut chunk_size_bytes = [0u8; 4];
         reader.read_exact(&mut chunk_size_bytes)?;
         let chunk_size = u32::from_le_bytes(chunk_size_bytes) as usize;
-        validate_chunk_size(chunk_size)?;
+        validate_chunk_size(chunk_size, self.chunk_size)?;
 
         let max_frame = NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE + chunk_size;
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
@@ -262,7 +275,7 @@ impl<'a> DecryptingStream<'a> {
                 .try_into()
                 .map_err(|_| Error::Crypto("Invalid legacy chunk size".to_string()))?,
         ) as usize;
-        validate_chunk_size(chunk_size)?;
+        validate_chunk_size(chunk_size, self.chunk_size)?;
         let total_chunks = u64::from_le_bytes(
             header[4..]
                 .try_into()
@@ -309,8 +322,8 @@ impl<'a> DecryptingStream<'a> {
     }
 }
 
-fn validate_chunk_size(chunk_size: usize) -> Result<()> {
-    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
+fn validate_chunk_size(chunk_size: usize, expected: usize) -> Result<()> {
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE || chunk_size != expected {
         return Err(Error::Crypto(format!("Invalid chunk size: {}", chunk_size)));
     }
     Ok(())
@@ -391,7 +404,12 @@ mod tests {
             let mut encrypted = Vec::new();
             stream.encrypt_stream(&data[..], &mut encrypted).unwrap();
 
-            let decrypted = decrypt_bytes(&key, &encrypted).unwrap();
+            let mut decrypted = Vec::new();
+            DecryptingStream::new(&key)
+                .unwrap()
+                .with_chunk_size(chunk_size)
+                .decrypt_stream(&encrypted[..], &mut decrypted)
+                .unwrap();
             prop_assert_eq!(decrypted, data);
         }
     }
@@ -571,8 +589,41 @@ mod tests {
             .encrypt_stream(&plaintext[..], &mut encrypted)
             .unwrap();
 
-        let decrypted = decrypt_bytes(&key, &encrypted).unwrap();
+        let mut decrypted = Vec::new();
+        DecryptingStream::new(&key)
+            .unwrap()
+            .with_chunk_size(16)
+            .decrypt_stream(&encrypted[..], &mut decrypted)
+            .unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// The header chunk size is not authenticated until the first frame is
+    /// open, so a header declaring anything but the expected size must fail
+    /// before the decryptor reads (and sizes a buffer for) any frame.
+    #[test]
+    fn unexpected_header_chunk_size_is_rejected_before_any_frame() {
+        let key = [42u8; KEY_LENGTH];
+        for version in [STREAM_VERSION, LEGACY_STREAM_VERSION] {
+            for chunk_size in [DEFAULT_CHUNK_SIZE * 2, MAX_CHUNK_SIZE] {
+                let mut forged = vec![version];
+                forged.extend_from_slice(&(chunk_size as u32).to_le_bytes());
+                if version == LEGACY_STREAM_VERSION {
+                    forged.extend_from_slice(&1u64.to_le_bytes());
+                }
+                let header_len = forged.len() as u64;
+                // A frame that would fill the declared chunk size.
+                forged.extend_from_slice(&(chunk_size as u32 + 53).to_le_bytes());
+
+                let mut input = std::io::Cursor::new(&forged);
+                let error = DecryptingStream::new(&key)
+                    .unwrap()
+                    .decrypt_stream(&mut input, std::io::sink())
+                    .expect_err("an unexpected chunk size must fail");
+                assert!(error.to_string().contains("Invalid chunk size"));
+                assert_eq!(input.position(), header_len);
+            }
+        }
     }
 
     #[test]
