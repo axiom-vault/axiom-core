@@ -52,7 +52,7 @@ impl ICloudProvider {
         };
 
         let root = match config.subfolder.as_deref() {
-            Some(subfolder) => base_path.join(validate_subfolder(subfolder)?),
+            Some(subfolder) => confined_root(base_path, subfolder)?,
             None => base_path,
         };
 
@@ -61,11 +61,12 @@ impl ICloudProvider {
     }
 }
 
-/// Split a configured subfolder into plain named components, rejecting
-/// anything that could move the root: absolute paths, drive prefixes,
-/// `.`/`..`, and empty or whitespace-only components.
-fn validate_subfolder(subfolder: &str) -> Result<PathBuf> {
-    let mut path = PathBuf::new();
+/// Join a configured subfolder onto `base` as plain named components,
+/// rejecting anything that could move the root: absolute paths, drive
+/// prefixes, `.`/`..`, empty or whitespace-only components, and existing
+/// symlinks (`LocalProvider` only rejects a symlink as the final root).
+fn confined_root(base: PathBuf, subfolder: &str) -> Result<PathBuf> {
+    let mut root = base;
     for component in subfolder.split(['/', '\\']) {
         if component.trim().is_empty()
             || component == "."
@@ -77,9 +78,14 @@ fn validate_subfolder(subfolder: &str) -> Result<PathBuf> {
                  (no root, drive prefix, '.', '..' or empty components): {subfolder:?}"
             )));
         }
-        path.push(component);
+        root.push(component);
+        if std::fs::symlink_metadata(&root).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Error::NotPermitted(format!(
+                "iCloud subfolder must not pass through a symlink: {subfolder:?}"
+            )));
+        }
     }
-    Ok(path)
+    Ok(root)
 }
 
 #[async_trait]
@@ -234,6 +240,19 @@ mod tests {
         assert_rejected("C:\\escape");
         assert_rejected("C:escape");
         assert_rejected("safe/C:/escape");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rejects_symlinked_subfolder_component() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let result = ICloudProvider::new(config_with_subfolder(&dir, "link/vault"));
+
+        assert!(matches!(result, Err(Error::NotPermitted(_))));
+        assert!(!outside.path().join("vault").exists());
     }
 
     #[test]
