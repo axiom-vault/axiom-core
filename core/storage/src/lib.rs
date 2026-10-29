@@ -28,7 +28,7 @@ pub mod shard_map;
 pub use cloud_auth::{
     CloudAuthorization, CloudPkceVerifier, CloudTokenManager, CloudTokens, TokenRefresher,
 };
-pub use composite::{CompositeConfig, CompositeStorageProvider, RaidMode};
+pub use composite::{CompositeConfig, CompositeKey, CompositeStorageProvider, RaidMode};
 pub use dropbox::{DropboxConfig, DropboxProvider};
 pub use gdrive::{GDriveConfig, GDriveProvider};
 // Re-export unified HealthStatus from common alongside storage-specific health types.
@@ -38,7 +38,7 @@ pub use icloud::{ICloudConfig, ICloudProvider};
 pub use local::LocalProvider;
 pub use memory::MemoryProvider;
 pub use onedrive::{OneDriveConfig, OneDriveProvider};
-pub use provider::{ConflictResolution, Metadata, StorageProvider};
+pub use provider::{ByteStream, ConflictResolution, Metadata, StorageProvider};
 pub use rebuild::{
     RaidRebuilder, RebuildCheckpoint, RebuildConfig, RebuildProgress, RebuildResult,
 };

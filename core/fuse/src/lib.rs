@@ -47,6 +47,10 @@ pub mod mount {
             &self.mount_point
         }
 
+        pub fn is_finished(&self) -> bool {
+            true
+        }
+
         pub fn unmount(self) {
             drop(self);
         }

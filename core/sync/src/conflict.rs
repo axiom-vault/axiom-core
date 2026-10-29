@@ -3,10 +3,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use axiomvault_common::{Result, VaultPath};
+use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_storage::{Metadata, StorageProvider};
 
 use crate::state::SyncEntry;
+
+/// Conflict names tried before giving up; each carries 64 random bits, so
+/// more than one attempt only happens when a name is already taken.
+pub(crate) const MAX_CONFLICT_NAME_ATTEMPTS: usize = 8;
 
 /// Conflict resolution strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,28 +94,55 @@ impl ConflictResolver {
     /// known synchronised state.  If only the local side changed (remote etag
     /// still matches the last-known value) we can safely push; if only the
     /// remote side changed we can safely pull.
+    ///
+    /// Callers pass `remote_etag` for a remote object that exists. A missing
+    /// etag on either the remote object or the baseline means its revision
+    /// cannot be shown to be unchanged, so it is a conflict (audit M-17).
     pub fn detect_conflict(
         &self,
         local_etag: Option<&str>,
         remote_etag: Option<&str>,
         last_known_remote_etag: Option<&str>,
     ) -> bool {
-        // No conflict if etags match
-        if local_etag == remote_etag {
+        let Some(remote_etag) = remote_etag else {
+            return true;
+        };
+        if local_etag == Some(remote_etag) {
             return false;
         }
-
-        // If we have a baseline, conflict only when the remote diverged from
-        // what we last knew *and* the local side also diverged.
-        if let Some(last_known) = last_known_remote_etag {
-            let remote_changed = remote_etag != Some(last_known);
-            let local_changed = local_etag != Some(last_known);
-            return remote_changed && local_changed;
+        match last_known_remote_etag {
+            // Conflict only when the remote diverged from what we last knew
+            // *and* the local side also diverged.
+            Some(last_known) => remote_etag != last_known && local_etag != Some(last_known),
+            // The remote object exists but was never seen by this side.
+            None => true,
         }
+    }
 
-        // Without a baseline we cannot tell who changed; treat as conflict
-        // only when both sides have an etag and they differ.
-        local_etag.is_some() && remote_etag.is_some() && local_etag != remote_etag
+    /// Create `data` under a fresh conflict name derived from `original`.
+    ///
+    /// Each attempt is a create-if-absent write, so an existing object is
+    /// never overwritten; a name collision is retried with a new suffix.
+    pub async fn create_conflict_copy<P: StorageProvider + ?Sized>(
+        &self,
+        provider: &P,
+        original: &VaultPath,
+        data: Vec<u8>,
+    ) -> Result<(VaultPath, Metadata)> {
+        for _ in 0..MAX_CONFLICT_NAME_ATTEMPTS {
+            let candidate = self.generate_conflict_path(original)?;
+            match provider
+                .upload_if_match(&candidate, data.clone(), None)
+                .await
+            {
+                Ok(metadata) => return Ok((candidate, metadata)),
+                Err(Error::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Conflict(format!(
+            "no free conflict name for {original} after {MAX_CONFLICT_NAME_ATTEMPTS} attempts"
+        )))
     }
 
     /// Generate a conflict-renamed path
@@ -176,8 +207,11 @@ impl ConflictResolver {
     ) -> Result<ResolutionResult> {
         match strategy {
             ConflictStrategy::PreferLocal => {
-                // Upload local version, overwriting remote
-                let metadata = provider.upload(&conflict.path, local_data).await?;
+                // Overwrite only the conflicting remote revision; a newer one
+                // is refused as a conflict.
+                let metadata = provider
+                    .upload_if_match(&conflict.path, local_data, conflict.remote_etag.as_deref())
+                    .await?;
                 Ok(ResolutionResult::UsedLocal {
                     new_remote_etag: metadata.etag,
                 })
@@ -190,8 +224,9 @@ impl ConflictResolver {
             }
             ConflictStrategy::KeepBoth => {
                 // Rename local and upload as new file
-                let renamed_path = self.generate_conflict_path(&conflict.path)?;
-                let _metadata = provider.upload(&renamed_path, local_data).await?;
+                let (renamed_path, _metadata) = self
+                    .create_conflict_copy(provider, &conflict.path, local_data)
+                    .await?;
 
                 // The remote version stays at original path
                 Ok(ResolutionResult::KeptBoth {
@@ -225,8 +260,21 @@ mod tests {
         // Same etag = no conflict
         assert!(!resolver.detect_conflict(Some("etag1"), Some("etag1"), Some("etag1")));
 
-        // Both none = no conflict
-        assert!(!resolver.detect_conflict(None, None, None));
+        // Only the local side changed since the baseline = no conflict
+        assert!(!resolver.detect_conflict(Some("local"), Some("etag1"), Some("etag1")));
+    }
+
+    /// Audit M-17: an existing remote object whose revision is unknown, or
+    /// that this side never saw, is a conflict rather than "no conflict".
+    #[test]
+    fn test_missing_etag_with_existing_remote_is_conflict() {
+        let resolver = ConflictResolver::default();
+
+        // Remote exists but carries no etag.
+        assert!(resolver.detect_conflict(None, None, None));
+        assert!(resolver.detect_conflict(Some("local"), None, Some("base")));
+        // Remote exists, but there is no local etag and no baseline.
+        assert!(resolver.detect_conflict(None, Some("remote"), None));
     }
 
     #[test]

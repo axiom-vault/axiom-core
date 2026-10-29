@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-use crate::provider::{ByteStream, Metadata, StorageProvider};
+use crate::provider::{check_precondition, ByteStream, Metadata, StorageProvider};
 use axiomvault_common::{Error, Result, VaultPath};
 
 /// In-memory storage entry.
@@ -54,6 +54,51 @@ impl MemoryProvider {
     fn path_to_key(path: &VaultPath) -> String {
         path.to_string_path()
     }
+
+    /// Write a file under an already-held write lock, after `precondition`
+    /// accepts the current entry. Holding the lock across the check and the
+    /// insert makes conditional writes exact.
+    fn write_locked(
+        storage: &mut HashMap<String, Entry>,
+        path: &VaultPath,
+        data: Vec<u8>,
+        precondition: impl FnOnce(Option<&Metadata>) -> Result<()>,
+    ) -> Result<Metadata> {
+        if let Some(parent) = path.parent() {
+            match storage.get(&Self::path_to_key(&parent)) {
+                Some(Entry::Directory { .. }) => {}
+                Some(Entry::File { .. }) => {
+                    return Err(Error::InvalidInput("Parent is a file".to_string()));
+                }
+                None => {
+                    return Err(Error::NotFound("Parent directory not found".to_string()));
+                }
+            }
+        }
+
+        let key = Self::path_to_key(path);
+        precondition(storage.get(&key).map(|entry| match entry {
+            Entry::File { metadata, .. } | Entry::Directory { metadata } => metadata,
+        }))?;
+
+        let metadata = Metadata {
+            id: Uuid::new_v4().to_string(),
+            name: path.name().unwrap_or("/").to_string(),
+            size: Some(data.len() as u64),
+            is_directory: false,
+            modified: Utc::now(),
+            etag: Some(Uuid::new_v4().to_string()),
+            provider_data: None,
+        };
+        storage.insert(
+            key,
+            Entry::File {
+                data,
+                metadata: metadata.clone(),
+            },
+        );
+        Ok(metadata)
+    }
 }
 
 impl Default for MemoryProvider {
@@ -69,41 +114,36 @@ impl StorageProvider for MemoryProvider {
     }
 
     async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        let mut storage = self.storage.write().unwrap();
+        Self::write_locked(&mut storage, path, data, |_| Ok(()))
+    }
+
+    async fn upload_if_match(
+        &self,
+        path: &VaultPath,
+        data: Vec<u8>,
+        expected_etag: Option<&str>,
+    ) -> Result<Metadata> {
+        let mut storage = self.storage.write().unwrap();
+        Self::write_locked(&mut storage, path, data, |current| {
+            check_precondition(current, expected_etag)
+        })
+    }
+
+    async fn delete_if_match(&self, path: &VaultPath, expected_etag: Option<&str>) -> Result<()> {
         let key = Self::path_to_key(path);
-
-        // Check parent exists
-        if let Some(parent) = path.parent() {
-            let parent_key = Self::path_to_key(&parent);
-            let storage = self.storage.read().unwrap();
-            match storage.get(&parent_key) {
-                Some(Entry::Directory { .. }) => {}
-                Some(Entry::File { .. }) => {
-                    return Err(Error::InvalidInput("Parent is a file".to_string()));
-                }
-                None => {
-                    return Err(Error::NotFound("Parent directory not found".to_string()));
-                }
+        let mut storage = self.storage.write().unwrap();
+        match storage.get(&key) {
+            Some(Entry::File { metadata, .. }) => {
+                check_precondition(Some(metadata), expected_etag)?;
+                storage.remove(&key);
+                Ok(())
             }
+            Some(Entry::Directory { .. }) => Err(Error::InvalidInput(
+                "Use delete_dir for directories".to_string(),
+            )),
+            None => Err(Error::NotFound(format!("File not found: {}", path))),
         }
-
-        let metadata = Metadata {
-            id: Uuid::new_v4().to_string(),
-            name: path.name().unwrap_or("/").to_string(),
-            size: Some(data.len() as u64),
-            is_directory: false,
-            modified: Utc::now(),
-            etag: Some(Uuid::new_v4().to_string()),
-            provider_data: None,
-        };
-
-        let entry = Entry::File {
-            data,
-            metadata: metadata.clone(),
-        };
-
-        self.storage.write().unwrap().insert(key, entry);
-
-        Ok(metadata)
     }
 
     async fn upload_stream(&self, path: &VaultPath, mut stream: ByteStream) -> Result<Metadata> {
@@ -466,6 +506,52 @@ mod tests {
 
         assert!(!provider.exists(&from).await.unwrap());
         assert!(provider.exists(&to).await.unwrap());
+    }
+
+    /// Audit M-17: conditional writes and deletes refuse a stale revision
+    /// and leave the newer one in place.
+    #[tokio::test]
+    async fn test_conditional_write_and_delete_refuse_stale_revision() {
+        let provider = MemoryProvider::new();
+        let path = VaultPath::parse("/test.txt").unwrap();
+
+        let created = provider
+            .upload_if_match(&path, b"a".to_vec(), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.upload_if_match(&path, b"x".to_vec(), None).await,
+            Err(Error::Conflict(_))
+        ));
+        let stale = created.etag.unwrap();
+        let newer = provider
+            .upload_if_match(&path, b"b".to_vec(), Some(&stale))
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider
+                .upload_if_match(&path, b"x".to_vec(), Some(&stale))
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            provider.delete_if_match(&path, Some(&stale)).await,
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            provider.delete_if_match(&path, None).await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(provider.download(&path).await.unwrap(), b"b");
+
+        provider
+            .delete_if_match(&path, newer.etag.as_deref())
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.delete_if_match(&path, newer.etag.as_deref()).await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[tokio::test]

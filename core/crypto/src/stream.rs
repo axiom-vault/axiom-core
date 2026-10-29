@@ -5,20 +5,32 @@
 
 use std::io::{Read, Write};
 
-use zeroize::Zeroize;
+use chacha20poly1305::{
+    aead::{generic_array::GenericArray, AeadCore, AeadInPlace, KeyInit, OsRng},
+    XChaCha20Poly1305,
+};
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::aead::{decrypt, encrypt, NONCE_SIZE, TAG_SIZE};
+use crate::aead::{decrypt, NONCE_SIZE, TAG_SIZE};
 use crate::keys::KEY_LENGTH;
 use axiomvault_common::{Error, Result};
 
 /// Default chunk size for streaming encryption (64 KiB).
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Header size: version (1) + chunk_size (4) + total_chunks (8).
-pub const HEADER_SIZE: usize = 13;
+/// Current header size: version (1) + chunk size (4).
+pub const HEADER_SIZE: usize = 5;
 
-/// Stream encryption version.
-pub const STREAM_VERSION: u8 = 1;
+/// Current stream encryption version.
+pub const STREAM_VERSION: u8 = 2;
+const LEGACY_STREAM_VERSION: u8 = 1;
+const LEGACY_HEADER_REMAINDER: usize = 12;
+const FRAME_METADATA_SIZE: usize = 13;
+const FRAME_LENGTH_SIZE: usize = 4;
+const FRAME_PREFIX_SIZE: usize = FRAME_LENGTH_SIZE + NONCE_SIZE + FRAME_METADATA_SIZE;
+const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+const DATA_FRAME: u8 = 0;
+const END_FRAME: u8 = 1;
 
 /// Encrypting stream that processes data in chunks.
 pub struct EncryptingStream<'a> {
@@ -50,68 +62,90 @@ impl<'a> EncryptingStream<'a> {
         self
     }
 
-    /// Encrypt data from reader and write to writer.
+    /// Exact ciphertext length `encrypt_stream` produces for `plaintext_len` input bytes.
     ///
-    /// # Format
-    /// - Header: version (1 byte) + chunk_size (4 bytes) + total_chunks (8 bytes)
-    /// - Chunks: nonce (24 B) || encrypt(index_le64 || plaintext) || tag (16 B)
-    ///
-    /// The chunk index is prepended to the plaintext (and therefore authenticated
-    /// by Poly1305) to detect chunk reordering or injection attacks.
-    ///
-    /// # Known limitation
-    /// The current implementation reads all encrypted chunks into a `Vec` before
-    /// writing, because `total_chunks` is written in the header and cannot be
-    /// known until all chunks are processed. For large files this doubles
-    /// peak memory usage. A future revision should either write chunks to a
-    /// temporary file and seek back to fill in the header, or remove the
-    /// `total_chunks` field from the header (using EOF instead).
-    ///
-    /// # Postconditions
-    /// - All data is encrypted and authenticated
-    /// - Chunk ordering is verified on decryption
-    ///
-    /// # Errors
-    /// - I/O errors from reader/writer
-    /// - Encryption errors
-    pub fn encrypt_stream<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> Result<u64> {
-        let mut buffer = vec![0u8; self.chunk_size];
-        let mut encrypted_chunks: Vec<Vec<u8>> = Vec::new();
-        let mut total_bytes = 0u64;
+    /// Lets callers announce the upload size before encrypting, so transports
+    /// that need the total length up front can stay bounded-memory.
+    pub fn encrypted_len(&self, plaintext_len: u64) -> u64 {
+        let frame_overhead =
+            (FRAME_LENGTH_SIZE + NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE) as u64;
+        let data_frames = plaintext_len.div_ceil(self.chunk_size as u64);
+        HEADER_SIZE as u64 + plaintext_len + (data_frames + 1) * frame_overhead
+    }
 
-        // Encrypt each chunk as it arrives; store encrypted output until we know
-        // the total count (needed for the header).
+    /// Encrypt from `reader` to `writer` with bounded memory.
+    ///
+    /// Version 2 consists of a five-byte header followed by length-prefixed,
+    /// independently authenticated frames. Every frame authenticates its index,
+    /// type, and the header chunk size. A mandatory authenticated end frame makes
+    /// truncation detectable without knowing the input size in advance.
+    pub fn encrypt_stream<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> Result<u64> {
+        if self.chunk_size == 0 || self.chunk_size > MAX_CHUNK_SIZE {
+            return Err(Error::Crypto("Invalid chunk size".to_string()));
+        }
+        let chunk_size = u32::try_from(self.chunk_size)
+            .map_err(|_| Error::Crypto("Invalid chunk size".to_string()))?;
+        writer.write_all(&[STREAM_VERSION])?;
+        writer.write_all(&chunk_size.to_le_bytes())?;
+
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        // One frame buffer reused for every chunk: length || nonce || metadata || data || tag.
+        // Plaintext is read straight into place and sealed in place, so no chunk is copied.
+        let mut frame = Zeroizing::new(vec![0u8; FRAME_PREFIX_SIZE + self.chunk_size + TAG_SIZE]);
+        let mut index = 0u64;
+        let mut total_bytes = 0u64;
         loop {
-            let bytes_read = reader.read(&mut buffer)?;
+            let bytes_read = read_plaintext_chunk(
+                &mut reader,
+                &mut frame[FRAME_PREFIX_SIZE..FRAME_PREFIX_SIZE + self.chunk_size],
+            )?;
             if bytes_read == 0 {
                 break;
             }
-            let chunk_index = encrypted_chunks.len() as u64;
+            self.write_frame(
+                &cipher,
+                &mut writer,
+                &mut frame,
+                index,
+                DATA_FRAME,
+                bytes_read,
+            )?;
             total_bytes += bytes_read as u64;
-
-            // Prepend chunk index to the plaintext so it is authenticated.
-            let mut plaintext = Vec::with_capacity(8 + bytes_read);
-            plaintext.extend_from_slice(&chunk_index.to_le_bytes());
-            plaintext.extend_from_slice(&buffer[..bytes_read]);
-
-            let encrypted = encrypt(self.key, &plaintext)?;
-            plaintext.zeroize();
-            encrypted_chunks.push(encrypted);
+            index += 1;
         }
-
-        buffer.zeroize();
-
-        // Write header
-        writer.write_all(&[STREAM_VERSION])?;
-        writer.write_all(&(self.chunk_size as u32).to_le_bytes())?;
-        writer.write_all(&(encrypted_chunks.len() as u64).to_le_bytes())?;
-
-        // Write encrypted chunks
-        for chunk in encrypted_chunks {
-            writer.write_all(&chunk)?;
-        }
-
+        self.write_frame(&cipher, &mut writer, &mut frame, index, END_FRAME, 0)?;
         Ok(total_bytes)
+    }
+
+    /// Seal the `data_len` plaintext bytes that sit after the metadata in `frame`
+    /// and write the whole frame with a single call.
+    fn write_frame<W: Write>(
+        &self,
+        cipher: &XChaCha20Poly1305,
+        writer: &mut W,
+        frame: &mut [u8],
+        index: u64,
+        kind: u8,
+        data_len: usize,
+    ) -> Result<()> {
+        let body_start = FRAME_LENGTH_SIZE + NONCE_SIZE;
+        let body_end = FRAME_PREFIX_SIZE + data_len;
+        let frame_end = body_end + TAG_SIZE;
+        let frame_len = u32::try_from(frame_end - FRAME_LENGTH_SIZE)
+            .map_err(|_| Error::Crypto("Encrypted frame too large".to_string()))?;
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        frame[..FRAME_LENGTH_SIZE].copy_from_slice(&frame_len.to_le_bytes());
+        frame[FRAME_LENGTH_SIZE..body_start].copy_from_slice(&nonce);
+        frame[body_start..body_start + 8].copy_from_slice(&index.to_le_bytes());
+        frame[body_start + 8] = kind;
+        frame[body_start + 9..FRAME_PREFIX_SIZE]
+            .copy_from_slice(&(self.chunk_size as u32).to_le_bytes());
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut frame[body_start..body_end])
+            .map_err(|e| Error::Crypto(format!("Encryption failed: {}", e)))?;
+        frame[body_end..frame_end].copy_from_slice(&tag);
+        writer.write_all(&frame[..frame_end])?;
+        Ok(())
     }
 }
 
@@ -132,81 +166,158 @@ impl<'a> DecryptingStream<'a> {
         Ok(Self { key })
     }
 
-    /// Decrypt data from reader and write to writer.
-    ///
-    /// # Preconditions
-    /// - Reader contains validly encrypted stream data
-    /// - Format must match EncryptingStream output
-    ///
-    /// # Postconditions
-    /// - Original plaintext is recovered
-    /// - All chunks are authenticated
-    ///
-    /// # Errors
-    /// - I/O errors
-    /// - Invalid format
-    /// - Authentication failure (tampered data)
+    /// Decrypt data from reader and write authenticated plaintext to writer.
+    /// Version 1 remains readable; all new ciphertext is emitted as version 2.
     pub fn decrypt_stream<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> Result<u64> {
-        // Read header
         let mut version = [0u8; 1];
         reader.read_exact(&mut version)?;
-        if version[0] != STREAM_VERSION {
-            return Err(Error::Crypto(format!(
+        match version[0] {
+            STREAM_VERSION => self.decrypt_v2(&mut reader, &mut writer),
+            LEGACY_STREAM_VERSION => self.decrypt_v1(&mut reader, &mut writer),
+            other => Err(Error::Crypto(format!(
                 "Unsupported stream version: {}",
-                version[0]
-            )));
+                other
+            ))),
         }
+    }
 
+    fn decrypt_v2<R: Read, W: Write>(&self, reader: &mut R, writer: &mut W) -> Result<u64> {
         let mut chunk_size_bytes = [0u8; 4];
         reader.read_exact(&mut chunk_size_bytes)?;
         let chunk_size = u32::from_le_bytes(chunk_size_bytes) as usize;
+        validate_chunk_size(chunk_size)?;
 
-        // Validate chunk size to prevent malicious headers causing huge allocations (e.g. 4GB)
-        const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
-        if chunk_size > MAX_CHUNK_SIZE {
-            return Err(Error::Crypto(format!(
-                "Chunk size {} exceeds maximum allowed ({} bytes)",
-                chunk_size, MAX_CHUNK_SIZE
-            )));
-        }
-
-        let mut total_chunks_bytes = [0u8; 8];
-        reader.read_exact(&mut total_chunks_bytes)?;
-        let total_chunks = u64::from_le_bytes(total_chunks_bytes);
-
-        let encrypted_chunk_size = NONCE_SIZE + chunk_size + 8 + TAG_SIZE;
-        let mut encrypted_buffer = vec![0u8; encrypted_chunk_size];
+        let max_frame = NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE + chunk_size;
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        // Frames are read into one reused buffer and opened in place.
+        // It grows to the largest frame seen, so a small file neither
+        // allocates nor wipes a whole chunk.
+        let mut frame = Zeroizing::new(Vec::new());
+        let mut index = 0u64;
         let mut total_bytes = 0u64;
+        loop {
+            let mut length = [0u8; FRAME_LENGTH_SIZE];
+            reader
+                .read_exact(&mut length)
+                .map_err(|_| Error::Crypto("Missing authenticated end frame".to_string()))?;
+            let frame_len = u32::from_le_bytes(length) as usize;
+            if frame_len < NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE || frame_len > max_frame {
+                return Err(Error::Crypto("Invalid encrypted frame length".to_string()));
+            }
+            if frame.len() < frame_len {
+                // Replacing the buffer wipes the old one, which holds plaintext.
+                frame = Zeroizing::new(vec![0u8; frame_len]);
+            }
+            let encrypted = &mut frame[..frame_len];
+            reader.read_exact(encrypted)?;
+            let (nonce, body) = encrypted.split_at_mut(NONCE_SIZE);
+            let (plaintext, tag) = body.split_at_mut(body.len() - TAG_SIZE);
+            cipher
+                .decrypt_in_place_detached(
+                    GenericArray::from_slice(nonce),
+                    b"",
+                    plaintext,
+                    GenericArray::from_slice(tag),
+                )
+                .map_err(|e| Error::Crypto(format!("Decryption failed: {}", e)))?;
+            let frame_index = u64::from_le_bytes(
+                plaintext[..8]
+                    .try_into()
+                    .map_err(|_| Error::Crypto("Invalid frame index".to_string()))?,
+            );
+            let kind = plaintext[8];
+            let authenticated_chunk_size = u32::from_le_bytes(
+                plaintext[9..13]
+                    .try_into()
+                    .map_err(|_| Error::Crypto("Invalid authenticated chunk size".to_string()))?,
+            ) as usize;
+            if frame_index != index || authenticated_chunk_size != chunk_size {
+                return Err(Error::Crypto("Stream metadata mismatch".to_string()));
+            }
+            match kind {
+                DATA_FRAME if plaintext.len() > FRAME_METADATA_SIZE => {
+                    writer.write_all(&plaintext[FRAME_METADATA_SIZE..])?;
+                    total_bytes += (plaintext.len() - FRAME_METADATA_SIZE) as u64;
+                    index += 1;
+                }
+                END_FRAME if plaintext.len() == FRAME_METADATA_SIZE => {
+                    let mut trailing = [0u8; 1];
+                    if reader.read(&mut trailing)? != 0 {
+                        return Err(Error::Crypto("Trailing data after end frame".to_string()));
+                    }
+                    return Ok(total_bytes);
+                }
+                _ => {
+                    return Err(Error::Crypto("Invalid frame type".to_string()));
+                }
+            }
+        }
+    }
 
-        // Decrypt each chunk
+    fn decrypt_v1<R: Read, W: Write>(&self, reader: &mut R, writer: &mut W) -> Result<u64> {
+        let mut header = [0u8; LEGACY_HEADER_REMAINDER];
+        reader.read_exact(&mut header)?;
+        let chunk_size = u32::from_le_bytes(
+            header[..4]
+                .try_into()
+                .map_err(|_| Error::Crypto("Invalid legacy chunk size".to_string()))?,
+        ) as usize;
+        validate_chunk_size(chunk_size)?;
+        let total_chunks = u64::from_le_bytes(
+            header[4..]
+                .try_into()
+                .map_err(|_| Error::Crypto("Invalid legacy chunk count".to_string()))?,
+        );
+        if total_chunks == 0 {
+            return Err(Error::Crypto(
+                "Legacy stream declares zero chunks".to_string(),
+            ));
+        }
+        let mut encrypted_buffer = vec![0u8; NONCE_SIZE + chunk_size + 8 + TAG_SIZE];
+        let mut total_bytes = 0u64;
         for i in 0..total_chunks {
-            // Read encrypted chunk (size may vary for last chunk)
-            let bytes_read = read_chunk(&mut reader, &mut encrypted_buffer)?;
+            let bytes_read = read_chunk(reader, &mut encrypted_buffer)?;
             if bytes_read == 0 {
                 return Err(Error::Crypto("Unexpected end of stream".to_string()));
             }
-
             let mut decrypted = decrypt(self.key, &encrypted_buffer[..bytes_read])?;
-
-            // Verify chunk index
             if decrypted.len() < 8 {
                 decrypted.zeroize();
                 return Err(Error::Crypto("Invalid chunk format".to_string()));
             }
-            let chunk_index = u64::from_le_bytes(decrypted[..8].try_into().unwrap());
+            let chunk_index = u64::from_le_bytes(
+                decrypted[..8]
+                    .try_into()
+                    .map_err(|_| Error::Crypto("Invalid chunk index".to_string()))?,
+            );
             if chunk_index != i {
                 decrypted.zeroize();
                 return Err(Error::Crypto("Chunk order mismatch".to_string()));
             }
-
-            let plaintext = &decrypted[8..];
-            writer.write_all(plaintext)?;
-            total_bytes += plaintext.len() as u64;
+            let written = writer.write_all(&decrypted[8..]);
+            total_bytes += (decrypted.len() - 8) as u64;
             decrypted.zeroize();
+            written?;
         }
-
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            return Err(Error::Crypto(
+                "Trailing data after legacy stream".to_string(),
+            ));
+        }
         Ok(total_bytes)
     }
+}
+
+fn validate_chunk_size(chunk_size: usize) -> Result<()> {
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
+        return Err(Error::Crypto(format!("Invalid chunk size: {}", chunk_size)));
+    }
+    Ok(())
+}
+
+fn read_plaintext_chunk<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize> {
+    read_chunk(reader, buffer)
 }
 
 /// Read a complete encrypted chunk from the reader.
@@ -256,6 +367,7 @@ pub fn decrypt_bytes(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aead::encrypt;
     use proptest::prelude::*;
 
     proptest! {
@@ -386,17 +498,32 @@ mod tests {
         );
     }
 
-    /// Header with zero total_chunks should decrypt to empty output.
+    /// An attacker cannot rewrite an existing legacy header to claim zero chunks
+    /// and truncate the authenticated chunk records.
     #[test]
-    fn test_zero_chunk_count_header() {
+    fn legacy_zero_chunk_rewrite_is_rejected() {
         let key = [42u8; KEY_LENGTH];
-        let mut header = vec![STREAM_VERSION];
-        header.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
-        header.extend_from_slice(&0u64.to_le_bytes()); // 0 chunks
-        let result = decrypt_bytes(&key, &header);
-        // 0 chunks means empty file — should succeed with empty output
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let mut rewritten = vec![LEGACY_STREAM_VERSION];
+        rewritten.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+        rewritten.extend_from_slice(&0u64.to_le_bytes());
+
+        let error = decrypt_bytes(&key, &rewritten).expect_err("zero-count legacy input must fail");
+        assert!(error.to_string().contains("zero chunks"));
+    }
+
+    /// Non-empty version-1 ciphertext remains readable after the version-2 migration.
+    #[test]
+    fn legitimate_legacy_stream_remains_readable() {
+        let key = [42u8; KEY_LENGTH];
+        let plaintext = b"legacy payload";
+        let mut legacy = vec![LEGACY_STREAM_VERSION];
+        legacy.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+        legacy.extend_from_slice(&1u64.to_le_bytes());
+        let mut indexed = 0u64.to_le_bytes().to_vec();
+        indexed.extend_from_slice(plaintext);
+        legacy.extend_from_slice(&encrypt(&key, &indexed).unwrap());
+
+        assert_eq!(decrypt_bytes(&key, &legacy).unwrap(), plaintext);
     }
 
     #[test]
@@ -449,6 +576,27 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_len_matches_actual_output() {
+        let key = [42u8; KEY_LENGTH];
+        for (len, chunk_size) in [
+            (0, 16),
+            (1, 16),
+            (16, 16),
+            (17, 16),
+            (1000, DEFAULT_CHUNK_SIZE),
+        ] {
+            let stream = EncryptingStream::new(&key)
+                .unwrap()
+                .with_chunk_size(chunk_size);
+            let mut encrypted = Vec::new();
+            stream
+                .encrypt_stream(&vec![0u8; len][..], &mut encrypted)
+                .unwrap();
+            assert_eq!(stream.encrypted_len(len as u64), encrypted.len() as u64);
+        }
+    }
+
+    #[test]
     fn test_stream_wrong_key_fails() {
         let key1 = [1u8; KEY_LENGTH];
         let key2 = [2u8; KEY_LENGTH];
@@ -467,11 +615,152 @@ mod tests {
 
         let encrypted = encrypt_bytes(&key, plaintext).unwrap();
 
-        // Check header
         assert_eq!(encrypted[0], STREAM_VERSION);
         let chunk_size = u32::from_le_bytes(encrypted[1..5].try_into().unwrap());
         assert_eq!(chunk_size as usize, DEFAULT_CHUNK_SIZE);
-        let total_chunks = u64::from_le_bytes(encrypted[5..13].try_into().unwrap());
-        assert_eq!(total_chunks, 1); // Single chunk for small data
+    }
+
+    struct CountingReader {
+        remaining: usize,
+        consumed: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.remaining.min(buffer.len());
+            buffer[..count].fill(0x5a);
+            self.remaining -= count;
+            self.consumed.set(self.consumed.get() + count);
+            Ok(count)
+        }
+    }
+
+    struct FirstWriteObserver {
+        consumed: std::rc::Rc<std::cell::Cell<usize>>,
+        total_input: usize,
+        saw_write: bool,
+    }
+
+    impl Write for FirstWriteObserver {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.saw_write {
+                assert!(
+                    self.consumed.get() < self.total_input,
+                    "encryption buffered the complete input before its first write"
+                );
+                self.saw_write = true;
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encryption_writes_before_consuming_complete_large_input() {
+        let key = [42u8; KEY_LENGTH];
+        let total_input = DEFAULT_CHUNK_SIZE * 32;
+        let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = CountingReader {
+            remaining: total_input,
+            consumed: consumed.clone(),
+        };
+        let writer = FirstWriteObserver {
+            consumed,
+            total_input,
+            saw_write: false,
+        };
+
+        EncryptingStream::new(&key)
+            .unwrap()
+            .encrypt_stream(reader, writer)
+            .unwrap();
+    }
+
+    #[test]
+    fn tampered_middle_chunk_is_rejected() {
+        let key = [42u8; KEY_LENGTH];
+        let plaintext = vec![0x3c; DEFAULT_CHUNK_SIZE * 3];
+        let mut encrypted = encrypt_bytes(&key, &plaintext).unwrap();
+        let middle = encrypted.len() / 2;
+        encrypted[middle] ^= 0x80;
+
+        assert!(decrypt_bytes(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn missing_authenticated_end_frame_is_rejected() {
+        let key = [42u8; KEY_LENGTH];
+        let plaintext = vec![0x3c; DEFAULT_CHUNK_SIZE * 2];
+        let mut encrypted = encrypt_bytes(&key, &plaintext).unwrap();
+        encrypted.truncate(encrypted.len() - (NONCE_SIZE + TAG_SIZE + 13));
+
+        assert!(decrypt_bytes(&key, &encrypted).is_err());
+    }
+
+    /// Version-2 frames are `len || aead::encrypt(index || kind || chunk_size || data)`.
+    /// The in-place stream path must stay byte-compatible with that per-frame AEAD
+    /// construction in both directions.
+    #[test]
+    fn stream_frames_match_per_frame_aead() {
+        let key = [9u8; KEY_LENGTH];
+        for len in [
+            0,
+            1,
+            DEFAULT_CHUNK_SIZE,
+            DEFAULT_CHUNK_SIZE + 7,
+            3 * DEFAULT_CHUNK_SIZE,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            // Stream output opens frame by frame with aead::decrypt.
+            let encrypted = encrypt_bytes(&key, &data).unwrap();
+            assert_eq!(encrypted[0], STREAM_VERSION);
+            assert_eq!(
+                encrypted[1..HEADER_SIZE],
+                (DEFAULT_CHUNK_SIZE as u32).to_le_bytes()
+            );
+            let mut pos = HEADER_SIZE;
+            let mut index = 0u64;
+            let mut recovered = Vec::new();
+            loop {
+                let frame_len =
+                    u32::from_le_bytes(encrypted[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += FRAME_LENGTH_SIZE;
+                let plaintext = decrypt(&key, &encrypted[pos..pos + frame_len]).unwrap();
+                pos += frame_len;
+                assert_eq!(plaintext[..8], index.to_le_bytes());
+                assert_eq!(plaintext[9..13], (DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                if plaintext[8] == END_FRAME {
+                    assert_eq!(plaintext.len(), FRAME_METADATA_SIZE);
+                    break;
+                }
+                assert_eq!(plaintext[8], DATA_FRAME);
+                recovered.extend_from_slice(&plaintext[FRAME_METADATA_SIZE..]);
+                index += 1;
+            }
+            assert_eq!(pos, encrypted.len());
+            assert_eq!(recovered, data);
+
+            // Frames sealed with aead::encrypt decrypt through DecryptingStream.
+            let mut built = vec![STREAM_VERSION];
+            built.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+            let frames = data
+                .chunks(DEFAULT_CHUNK_SIZE)
+                .map(|chunk| (DATA_FRAME, chunk))
+                .chain(std::iter::once((END_FRAME, &[][..])));
+            for (index, (kind, chunk)) in frames.enumerate() {
+                let mut plaintext = (index as u64).to_le_bytes().to_vec();
+                plaintext.push(kind);
+                plaintext.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
+                plaintext.extend_from_slice(chunk);
+                let sealed = encrypt(&key, &plaintext).unwrap();
+                built.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+                built.extend_from_slice(&sealed);
+            }
+            assert_eq!(decrypt_bytes(&key, &built).unwrap(), data);
+        }
     }
 }

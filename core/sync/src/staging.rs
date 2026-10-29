@@ -23,6 +23,22 @@ use uuid::Uuid;
 
 use axiomvault_common::{Error, Result, VaultPath};
 
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })?;
+    fs::File::open(parent).await?.sync_all().await
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Open `path` for writing with `0o600` permissions on Unix, fail if it
 /// already exists. On non-Unix this falls back to a plain create-new write.
 ///
@@ -42,7 +58,8 @@ async fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
             .open(path)
             .await?;
         file.write_all(data).await?;
-        file.flush().await?;
+        file.sync_all().await?;
+        sync_parent_directory(path).await?;
         Ok(())
     }
 
@@ -55,13 +72,14 @@ async fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
             .open(path)
             .await?;
         file.write_all(data).await?;
-        file.flush().await?;
+        file.sync_all().await?;
+        sync_parent_directory(path).await?;
         Ok(())
     }
 }
 
 /// A staged change waiting to be committed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedChange {
     /// Unique ID for this change.
     pub id: String,
@@ -270,21 +288,72 @@ impl StagingArea {
             .collect()
     }
 
-    /// Commit (remove) a staged change after successful sync.
-    pub async fn commit(&mut self, change_id: &str) -> Result<()> {
-        let change = self
-            .changes
-            .remove(change_id)
-            .ok_or_else(|| Error::NotFound(format!("Staged change not found: {}", change_id)))?;
+    /// Return whether a staged change still exists.
+    pub fn contains(&self, change_id: &str) -> bool {
+        self.changes.contains_key(change_id)
+    }
 
-        // Delete the staging file if present
-        if let Some(staging_file) = &change.staging_file {
-            if staging_file.exists() {
-                fs::remove_file(staging_file).await.map_err(Error::Io)?;
+    /// Move every pending change for one vault path to another path.
+    ///
+    /// This is used by keep-both conflict resolution so an interrupted upload
+    /// retries the renamed copy instead of overwriting the original path.
+    pub async fn retarget_path(&mut self, from: &VaultPath, to: &VaultPath) -> Result<usize> {
+        let mut next = self.changes.clone();
+        let mut changed = 0;
+        for change in next.values_mut() {
+            if &change.vault_path == from {
+                change.vault_path = to.clone();
+                if change.change_type != ChangeType::Delete {
+                    change.change_type = ChangeType::Create;
+                }
+                changed += 1;
             }
         }
+        if changed > 0 {
+            self.persist_registry_snapshot(&next).await?;
+            self.changes = next;
+        }
+        Ok(changed)
+    }
 
-        self.persist_registry().await?;
+    /// Remove every pending change for a vault path.
+    pub async fn commit_path(&mut self, vault_path: &VaultPath) -> Result<usize> {
+        let change_ids: Vec<String> = self
+            .changes_for_path(vault_path)
+            .into_iter()
+            .map(|change| change.id.clone())
+            .collect();
+        for change_id in &change_ids {
+            self.commit(change_id).await?;
+        }
+        Ok(change_ids.len())
+    }
+
+    /// Commit (remove) a staged change after successful sync.
+    pub async fn commit(&mut self, change_id: &str) -> Result<()> {
+        let change =
+            self.changes.get(change_id).cloned().ok_or_else(|| {
+                Error::NotFound(format!("Staged change not found: {}", change_id))
+            })?;
+
+        let mut next = self.changes.clone();
+        next.remove(change_id);
+        self.persist_registry_snapshot(&next).await?;
+        self.changes = next;
+
+        // The durable registry no longer references these bytes. Cleanup is
+        // best-effort; an orphan is safe and cleanup_orphaned can remove it.
+        if let Some(staging_file) = &change.staging_file {
+            if staging_file.exists() {
+                if let Err(error) = fs::remove_file(staging_file).await {
+                    warn!(
+                        "failed to remove committed staging file {}: {}",
+                        staging_file.display(),
+                        error
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -325,7 +394,14 @@ impl StagingArea {
     /// is not world-readable (audit M-5). A leftover temp file from a
     /// previous crashed write is removed first so `create_new` succeeds.
     async fn persist_registry(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.changes)
+        self.persist_registry_snapshot(&self.changes).await
+    }
+
+    async fn persist_registry_snapshot(
+        &self,
+        changes: &HashMap<String, StagedChange>,
+    ) -> Result<()> {
+        let json = serde_json::to_string_pretty(changes)
             .map_err(|e| Error::Serialization(e.to_string()))?;
 
         let tmp_path = self.registry_path.with_extension("json.tmp");
@@ -342,9 +418,28 @@ impl StagingArea {
         write_private_file(&tmp_path, json.as_bytes())
             .await
             .map_err(Error::Io)?;
-        fs::rename(&tmp_path, &self.registry_path)
+        if let Err(error) = fs::rename(&tmp_path, &self.registry_path).await {
+            // Some filesystems can report an ambiguous rename failure. A
+            // matching target proves the rename became visible, but it is not
+            // committed until the parent directory is fsynced below.
+            if !self.registry_matches(changes).await {
+                return Err(Error::Io(error));
+            }
+        }
+
+        sync_parent_directory(&self.registry_path)
             .await
-            .map_err(Error::Io)
+            .map_err(Error::Io)?;
+
+        Ok(())
+    }
+
+    async fn registry_matches(&self, expected: &HashMap<String, StagedChange>) -> bool {
+        let Ok(content) = fs::read_to_string(&self.registry_path).await else {
+            return false;
+        };
+        serde_json::from_str::<HashMap<String, StagedChange>>(&content)
+            .is_ok_and(|actual| actual == *expected)
     }
 
     /// Clean up orphaned staging files.
@@ -430,6 +525,67 @@ mod tests {
 
         staging.commit(&change_id).await.unwrap();
         assert!(staging.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_keeps_registry_and_bytes_when_registry_persistence_fails() {
+        let temp = TempDir::new().unwrap();
+        let mut staging = StagingArea::new(temp.path()).await.unwrap();
+        let vault_path = VaultPath::parse("/pending.bin").unwrap();
+        let change_id = staging
+            .stage_upload(&vault_path, b"pending".to_vec(), ChangeType::Update)
+            .await
+            .unwrap();
+        let staging_file = staging
+            .get_change(&change_id)
+            .unwrap()
+            .staging_file
+            .clone()
+            .unwrap();
+        staging.registry_path = temp.path().join("missing").join("registry.json");
+
+        assert!(staging.commit(&change_id).await.is_err());
+
+        assert!(staging.contains(&change_id));
+        assert_eq!(fs::read(staging_file).await.unwrap(), b"pending");
+    }
+
+    #[tokio::test]
+    async fn retarget_keeps_original_path_when_registry_persistence_fails() {
+        let temp = TempDir::new().unwrap();
+        let mut staging = StagingArea::new(temp.path()).await.unwrap();
+        let original = VaultPath::parse("/original.bin").unwrap();
+        let renamed = VaultPath::parse("/renamed.bin").unwrap();
+        staging
+            .stage_upload(&original, b"pending".to_vec(), ChangeType::Update)
+            .await
+            .unwrap();
+        staging.registry_path = temp.path().join("missing").join("registry.json");
+
+        assert!(staging.retarget_path(&original, &renamed).await.is_err());
+
+        assert_eq!(staging.changes_for_path(&original).len(), 1);
+        assert!(staging.changes_for_path(&renamed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_succeeds_after_registry_removal_when_byte_cleanup_fails() {
+        let temp = TempDir::new().unwrap();
+        let mut staging = StagingArea::new(temp.path()).await.unwrap();
+        let vault_path = VaultPath::parse("/pending.bin").unwrap();
+        let change_id = staging
+            .stage_upload(&vault_path, b"pending".to_vec(), ChangeType::Update)
+            .await
+            .unwrap();
+        let non_file = temp.path().join("non-file");
+        fs::create_dir(&non_file).await.unwrap();
+        staging.changes.get_mut(&change_id).unwrap().staging_file = Some(non_file);
+
+        staging.commit(&change_id).await.unwrap();
+
+        assert!(!staging.contains(&change_id));
+        let restarted = StagingArea::new(temp.path()).await.unwrap();
+        assert!(!restarted.contains(&change_id));
     }
 
     #[tokio::test]
