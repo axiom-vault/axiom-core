@@ -568,22 +568,35 @@ async fn download_exact(
 /// Stream the object at `path`, which the authenticated snapshot says is
 /// `expected_len` bytes long. Like [`download_exact`], the stream fails as
 /// soon as it runs past that length, so the backend can't make a streamed
-/// read consume more than the snapshot allows. A shorter object is left to
-/// the end frame and the digest.
+/// read consume more than the snapshot allows, and fails at its end if it
+/// is shorter, so an older, shorter version of the file is not accepted
+/// in its place. It ends after its first error.
 async fn download_stream_bounded(
     provider: &dyn StorageProvider,
     path: &VaultPath,
     expected_len: u64,
 ) -> Result<ByteStream> {
-    let mut remaining = expected_len;
     let download = provider.download_stream(path).await?;
-    Ok(Box::pin(download.map(move |chunk| {
-        let chunk = chunk?;
-        remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(|| {
-            Error::Crypto("encrypted file does not match the authenticated snapshot".to_string())
-        })?;
-        Ok(chunk)
-    })))
+    Ok(Box::pin(futures::stream::unfold(
+        Some((download, expected_len)),
+        |state| async move {
+            let (mut download, remaining) = state?;
+            let mismatch = || {
+                Error::Crypto(
+                    "encrypted file does not match the authenticated snapshot".to_string(),
+                )
+            };
+            match download.next().await {
+                Some(Ok(chunk)) => match remaining.checked_sub(chunk.len() as u64) {
+                    Some(remaining) => Some((Ok(chunk), Some((download, remaining)))),
+                    None => Some((Err(mismatch()), None)),
+                },
+                Some(Err(error)) => Some((Err(error), None)),
+                None if remaining != 0 => Some((Err(mismatch()), None)),
+                None => None,
+            }
+        },
+    )))
 }
 
 fn persist_plaintext_noclobber(destination: &Path, plaintext: &[u8]) -> Result<()> {
@@ -2236,7 +2249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_reads_stop_at_the_authenticated_ciphertext_length() {
+    async fn streamed_reads_require_the_authenticated_ciphertext_length() {
         let (session, provider) = create_failing_test_session().await;
         let ops = VaultOperations::new(&session).unwrap();
         let path = VaultPath::parse("/large.bin").unwrap();
@@ -2265,46 +2278,52 @@ mod tests {
                 &mut longer,
             )
             .unwrap();
+        // And a shorter one, as an older version would be: a rollback.
+        let mut shorter = Vec::new();
+        stream
+            .encrypt_stream(&data[..data.len() / 2], &mut shorter)
+            .unwrap();
         let temp = tempfile::TempDir::new().unwrap();
         let destination = temp.path().join("export.bin");
 
-        // Without a digest, the length is all that catches the longer stream.
+        // Without a digest, the length is all that catches either stream.
         for clear_digest in [false, true] {
             if clear_digest {
                 let mut tree = session.tree().write().await;
                 tree.get_node_mut(&path).unwrap().metadata.content_digest = None;
             }
+            for blob in [&longer, &shorter] {
+                provider.serve_data_blob(blob.clone());
+                let result = ops.read_file_range(&path, 0, 16).await;
+                assert!(matches!(result, Err(Error::Crypto(_))));
+                assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
 
-            provider.serve_data_blob(longer.clone());
-            let result = ops.read_file_range(&path, 0, 16).await;
-            assert!(matches!(result, Err(Error::Crypto(_))));
-            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+                provider.serve_data_blob(blob.clone());
+                let mut reader = ops.open_file_reader(&path, 0).await.unwrap();
+                let result = read_to_end(&mut reader).await;
+                assert!(matches!(result, Err(Error::Crypto(_))));
+                assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
 
-            provider.serve_data_blob(longer.clone());
-            let mut reader = ops.open_file_reader(&path, 0).await.unwrap();
-            let result = read_to_end(&mut reader).await;
-            assert!(matches!(result, Err(Error::Crypto(_))));
-            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+                provider.serve_data_blob(blob.clone());
+                let result = ops.export_file_to_path(&path, &destination).await;
+                assert!(matches!(result, Err(Error::Crypto(_))));
+                assert!(!destination.exists());
+                assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
 
-            provider.serve_data_blob(longer.clone());
-            let result = ops.export_file_to_path(&path, &destination).await;
-            assert!(matches!(result, Err(Error::Crypto(_))));
-            assert!(!destination.exists());
-            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
-
-            provider.serve_data_blob(longer.clone());
-            let tree = session.tree().read().await.clone();
-            let dyn_provider: Arc<dyn StorageProvider> = provider.clone();
-            let result = reencrypt_tree(
-                &dyn_provider,
-                session.master_key().unwrap(),
-                &MasterKey::from_bytes([7; 32]),
-                &tree,
-                &mut Vec::new(),
-            )
-            .await;
-            assert!(matches!(result, Err(Error::Crypto(_))));
-            assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+                provider.serve_data_blob(blob.clone());
+                let tree = session.tree().read().await.clone();
+                let dyn_provider: Arc<dyn StorageProvider> = provider.clone();
+                let result = reencrypt_tree(
+                    &dyn_provider,
+                    session.master_key().unwrap(),
+                    &MasterKey::from_bytes([7; 32]),
+                    &tree,
+                    &mut Vec::new(),
+                )
+                .await;
+                assert!(matches!(result, Err(Error::Crypto(_))));
+                assert!(provider.streamed.load(Ordering::SeqCst) < expected_len + 4096);
+            }
         }
     }
 
