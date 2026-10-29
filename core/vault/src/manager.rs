@@ -3,12 +3,15 @@
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, DATA_DIRNAME, META_DIRNAME};
+use crate::config::{
+    download_metadata, VaultConfig, VaultVersion, CONFIG_FILENAME, CONFIG_MAX_LEN, DATA_DIRNAME,
+    META_DIRNAME, TREE_MAX_LEN,
+};
 use crate::freshness::{
     AnchorKeys, FreshnessAnchor, FreshnessState, LocalFileFreshnessAnchor,
     UnavailableFreshnessAnchor,
 };
-use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME};
+use crate::manifest::{digest, GenerationManifest, MANIFEST_FILENAME, MANIFEST_MAX_LEN};
 use crate::migration::{check_migration_needed, MigrationStatus};
 use crate::session::VaultSession;
 use crate::tree::VaultTree;
@@ -348,8 +351,9 @@ impl VaultManager {
                 "snapshot manifest references a missing generation object".to_string(),
             ));
         }
-        let encrypted_tree = provider.download(&tree_path).await?;
-        let config_bytes = provider.download(&config_path).await?;
+        let encrypted_tree = download_metadata(provider.as_ref(), &tree_path, TREE_MAX_LEN).await?;
+        let config_bytes =
+            download_metadata(provider.as_ref(), &config_path, CONFIG_MAX_LEN).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
         manifest.verify_bindings(&config.id, &encrypted_tree, &config_bytes)?;
         // The manifest binds these bytes; the tag binds them to the master key
@@ -486,17 +490,20 @@ impl VaultManager {
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
 
         if provider.exists(&manifest_path).await? {
-            let manifest_bytes = provider.download(&manifest_path).await?;
+            let manifest_bytes =
+                download_metadata(provider.as_ref(), &manifest_path, MANIFEST_MAX_LEN).await?;
             let credential_config_bytes =
                 match GenerationManifest::config_path_hint(&manifest_bytes)? {
-                    Some(path) => provider.download(&path).await?,
+                    Some(path) => {
+                        download_metadata(provider.as_ref(), &path, CONFIG_MAX_LEN).await?
+                    }
                     None => {
                         if !provider.exists(&config_path).await? {
                             return Err(Error::NotFound(
                                 "Vault configuration not found".to_string(),
                             ));
                         }
-                        provider.download(&config_path).await?
+                        download_metadata(provider.as_ref(), &config_path, CONFIG_MAX_LEN).await?
                     }
                 };
             let credential_config = VaultConfig::from_bytes(&credential_config_bytes)?;
@@ -570,7 +577,8 @@ impl VaultManager {
         if !provider.exists(&config_path).await? {
             return Err(Error::NotFound("Vault configuration not found".to_string()));
         }
-        let config_bytes = provider.download(&config_path).await?;
+        let config_bytes =
+            download_metadata(provider.as_ref(), &config_path, CONFIG_MAX_LEN).await?;
         let mut config = VaultConfig::from_bytes(&config_bytes)?;
 
         let anchor_keys = location.keys(Some(&config.id))?;
@@ -656,25 +664,25 @@ impl VaultManager {
         // Verify the currently stored authenticated snapshot before mutating config.
         let manifest_path = VaultPath::parse(META_DIRNAME)?.join(MANIFEST_FILENAME)?;
         let stored_manifest = if provider.exists(&manifest_path).await? {
-            Some(provider.download(&manifest_path).await?)
+            Some(download_metadata(provider.as_ref(), &manifest_path, MANIFEST_MAX_LEN).await?)
         } else {
             None
         };
         let credential_config_bytes = match stored_manifest.as_deref() {
             Some(bytes) => match GenerationManifest::config_path_hint(bytes)? {
-                Some(path) => provider.download(&path).await?,
+                Some(path) => download_metadata(provider.as_ref(), &path, CONFIG_MAX_LEN).await?,
                 None => {
                     if !provider.exists(&config_path).await? {
                         return Err(Error::NotFound("Vault configuration not found".to_string()));
                     }
-                    provider.download(&config_path).await?
+                    download_metadata(provider.as_ref(), &config_path, CONFIG_MAX_LEN).await?
                 }
             },
             None => {
                 if !provider.exists(&config_path).await? {
                     return Err(Error::NotFound("Vault configuration not found".to_string()));
                 }
-                provider.download(&config_path).await?
+                download_metadata(provider.as_ref(), &config_path, CONFIG_MAX_LEN).await?
             }
         };
         let credential_config = VaultConfig::from_bytes(&credential_config_bytes)?;
@@ -3062,7 +3070,8 @@ mod tests {
             // A tagged config cannot hold credentials (serialization refuses
             // them), so a config holding them was written outside the vault:
             // at 2.0 its tag fails, at 1.1 it is untagged. Every path refuses
-            // it before the sanitizing upload (M-1).
+            // it before the sanitizing upload (M-1), as a legacy config so the
+            // user can be told to rotate the credentials (axiom-cli#22).
             let expected = if version == VaultVersion::V1_1 {
                 crate::config::UNAUTHENTICATED_V1_1
             } else {
@@ -3077,7 +3086,10 @@ mod tests {
                     .await,
             ] {
                 match result {
-                    Err(error) => assert!(error.to_string().contains(expected), "{error}"),
+                    Err(error) => assert!(
+                        matches!(&error, Error::LegacyConfigCredentials(m) if m.contains(expected)),
+                        "{error}"
+                    ),
                     Ok(_) => panic!("a {version} cloud config holding credentials was opened"),
                 }
             }
@@ -5971,5 +5983,171 @@ mod tests {
             assert_eq!(anchor.load(&first_key).unwrap(), Some(2));
             assert_eq!(anchor.load(&second_key).unwrap(), Some(1));
         }
+    }
+
+    /// A backend that panics on an unbounded read of vault metadata (any
+    /// config and everything under `m/`), records the bound of each bounded
+    /// one, and serves objects whose name starts with `oversized` as longer
+    /// than any bound.
+    struct MetadataBoundProvider {
+        inner: MemoryProvider,
+        oversized: std::sync::Mutex<Option<&'static str>>,
+        bounds: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    impl MetadataBoundProvider {
+        fn assert_bounded(path: &VaultPath) {
+            let metadata = path.to_string_path().starts_with("/m/")
+                || path
+                    .name()
+                    .is_some_and(|name| name.starts_with(CONFIG_FILENAME));
+            assert!(!metadata, "unbounded read of {path}");
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for MetadataBoundProvider {
+        fn name(&self) -> &str {
+            "metadata-bound"
+        }
+        async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+            self.inner.upload(path, data).await
+        }
+        async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+            self.inner.upload_stream(path, stream).await
+        }
+        async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+            Self::assert_bounded(path);
+            self.inner.download(path).await
+        }
+        async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+            Self::assert_bounded(path);
+            self.inner.download_stream(path).await
+        }
+        async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+            let name = path.name().unwrap_or_default().to_string();
+            let oversized = *self.oversized.lock().unwrap();
+            self.bounds.lock().unwrap().push((name.clone(), max_len));
+            if oversized.is_some_and(|prefix| name.starts_with(prefix)) {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::FileTooLarge, "oversized").into(),
+                );
+            }
+            self.inner.download_bounded(path, max_len).await
+        }
+        async fn exists(&self, path: &VaultPath) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+        async fn delete(&self, path: &VaultPath) -> Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+            self.inner.list(path).await
+        }
+        async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+            self.inner.metadata(path).await
+        }
+        async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+            self.inner.create_dir(path).await
+        }
+        async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+            self.inner.delete_dir(path).await
+        }
+        async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+            self.inner.rename(from, to).await
+        }
+        async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+            self.inner.copy(from, to).await
+        }
+    }
+
+    async fn metadata_bound_vault() -> (Arc<MetadataBoundProvider>, VaultManager) {
+        use crate::operations::VaultOperations;
+
+        let provider = Arc::new(MetadataBoundProvider {
+            inner: MemoryProvider::new(),
+            oversized: Default::default(),
+            bounds: Default::default(),
+        });
+        let mut registry = ProviderRegistry::new();
+        let registered = provider.clone();
+        registry
+            .register("test", Box::new(move |_| Ok(registered.clone())))
+            .unwrap();
+        let manager = VaultManager::with_registry_and_anchor(
+            registry,
+            Arc::new(InMemoryFreshnessAnchor::new()),
+        );
+        let creation = manager
+            .create_vault(
+                VaultId::new("metadata-bounds").unwrap(),
+                b"password",
+                "test",
+                serde_json::Value::Null,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(&VaultPath::parse("/file").unwrap(), b"content")
+            .await
+            .unwrap();
+        (provider, manager)
+    }
+
+    #[tokio::test]
+    async fn vault_metadata_is_read_within_the_bound_for_its_format() {
+        let (provider, manager) = metadata_bound_vault().await;
+        manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
+        crate::health::check_vault_structure(provider.as_ref(), "test")
+            .await
+            .unwrap();
+
+        let bounds = provider.bounds.lock().unwrap().clone();
+        for format in ["config.", "tree.", "generation.manifest", CONFIG_FILENAME] {
+            assert!(
+                bounds.iter().any(|(name, _)| name.starts_with(format)),
+                "no {format} read in {bounds:?}"
+            );
+        }
+        for (name, bound) in bounds {
+            let expected = if name.starts_with("config.") || name.starts_with(CONFIG_FILENAME) {
+                CONFIG_MAX_LEN
+            } else if name.starts_with("tree.") {
+                TREE_MAX_LEN
+            } else if name == MANIFEST_FILENAME {
+                MANIFEST_MAX_LEN
+            } else {
+                continue;
+            };
+            assert_eq!(bound, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_vault_metadata_is_refused() {
+        let (provider, manager) = metadata_bound_vault().await;
+        for format in ["generation.manifest", "config.", "tree."] {
+            *provider.oversized.lock().unwrap() = Some(format);
+            match manager
+                .open_vault("test", serde_json::Value::Null, b"password")
+                .await
+            {
+                Err(Error::Crypto(message)) => {
+                    assert!(message.contains("limit for vault metadata"), "{message}")
+                }
+                Err(error) => panic!("{format}: {error}"),
+                Ok(_) => panic!("a vault with an oversized {format} was opened"),
+            }
+        }
+        *provider.oversized.lock().unwrap() = None;
+        manager
+            .open_vault("test", serde_json::Value::Null, b"password")
+            .await
+            .unwrap();
     }
 }

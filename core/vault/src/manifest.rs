@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 pub const MANIFEST_FILENAME: &str = "generation.manifest";
+
+/// Longest manifest that is read. It lists an encrypted name and digest per
+/// file, base64-encoded again in the envelope: about 170 bytes per file with
+/// 20-byte names and 590 with 255-byte ones, under half the file's tree node,
+/// so half the tree's bound.
+pub(crate) const MANIFEST_MAX_LEN: u64 = crate::config::TREE_MAX_LEN / 2;
 const MANIFEST_KEY_CONTEXT: &[u8] = b"vault_generation_manifest_v1";
 
 #[derive(Serialize, Deserialize)]

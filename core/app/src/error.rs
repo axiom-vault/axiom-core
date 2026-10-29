@@ -80,6 +80,7 @@ impl From<CommonError> for AppError {
             CommonError::NotPermitted(msg) => AppError::InvalidInput(msg),
             CommonError::InvalidInput(msg) => AppError::InvalidInput(msg),
             CommonError::Crypto(msg) => AppError::Crypto(msg),
+            CommonError::LegacyConfigCredentials(msg) => AppError::Crypto(msg),
             CommonError::Storage(msg) => AppError::Storage(msg),
             CommonError::Network(msg) => AppError::Storage(msg),
             CommonError::Authentication(msg) => AppError::Storage(msg),

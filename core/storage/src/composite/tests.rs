@@ -2086,3 +2086,128 @@ async fn test_bounded_erasure_rebuild_skips_oversized_shards() {
     }
     assert!(!backends[4].exists(&shard4).await.unwrap());
 }
+
+// -- Bounded metadata reads: a backend with an oversized internal file -----
+
+/// A backend whose object at `oversized` is longer than any bound: an
+/// unbounded read of it panics, and a bounded one records its bound and
+/// fails as too long. Everything else passes through to `inner`.
+struct OversizedProvider {
+    inner: MemoryProvider,
+    oversized: VaultPath,
+    bounds: std::sync::Mutex<Vec<u64>>,
+}
+
+impl OversizedProvider {
+    fn new(oversized: &str) -> Self {
+        Self {
+            inner: MemoryProvider::new(),
+            oversized: VaultPath::parse(oversized).unwrap(),
+            bounds: Default::default(),
+        }
+    }
+
+    fn assert_bounded(&self, path: &VaultPath) {
+        assert_ne!(path, &self.oversized, "unbounded read of {path}");
+    }
+}
+
+#[async_trait]
+impl StorageProvider for OversizedProvider {
+    fn name(&self) -> &str {
+        "oversized"
+    }
+    async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+        self.inner.upload(path, data).await
+    }
+    async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+        self.inner.upload_stream(path, stream).await
+    }
+    async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+        self.assert_bounded(path);
+        self.inner.download(path).await
+    }
+    async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+        self.assert_bounded(path);
+        self.inner.download_stream(path).await
+    }
+    async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+        if path != &self.oversized {
+            return self.inner.download_bounded(path, max_len).await;
+        }
+        self.bounds.lock().unwrap().push(max_len);
+        Err(too_long(path, max_len))
+    }
+    async fn exists(&self, path: &VaultPath) -> Result<bool> {
+        self.inner.exists(path).await
+    }
+    async fn delete(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+        self.inner.list(path).await
+    }
+    async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.metadata(path).await
+    }
+    async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+        self.inner.create_dir(path).await
+    }
+    async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+        self.inner.delete_dir(path).await
+    }
+    async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.rename(from, to).await
+    }
+    async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+        self.inner.copy(from, to).await
+    }
+}
+
+/// An oversized shard map is read only up to the shard map bound and is
+/// refused as an error for its backend.
+#[tokio::test]
+async fn test_oversized_shard_map_is_refused() {
+    let backend = OversizedProvider::new(".axiomvault/shard_map.json");
+
+    let err = ShardMap::load_from_backend(&backend, &test_key())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Crypto(m) if m.contains("limit")),
+        "{err}"
+    );
+    assert_eq!(
+        *backend.bounds.lock().unwrap(),
+        [crate::shard_map::SHARD_MAP_MAX_LEN]
+    );
+}
+
+/// An oversized rebuild checkpoint is read only up to its bound and is
+/// ignored: the rebuild starts fresh and completes.
+#[tokio::test]
+async fn test_oversized_rebuild_checkpoint_starts_fresh() {
+    use crate::rebuild::{RaidRebuilder, RebuildConfig};
+
+    let target = Arc::new(OversizedProvider::new(
+        ".axiomvault/rebuild_checkpoint.json",
+    ));
+    let mut backends = make_backends(2);
+    backends.push(target.clone());
+    let provider = new_composite(backends, mirror_config()).unwrap();
+    let path = VaultPath::parse("/c.bin").unwrap();
+    provider.upload(&path, b"rebuilt".to_vec()).await.unwrap();
+    target.inner.delete(&path).await.unwrap();
+
+    let result = RaidRebuilder::new(&provider, 2, RebuildConfig::default())
+        .unwrap()
+        .rebuild()
+        .await
+        .unwrap();
+    assert_eq!((result.rebuilt, result.failed), (1, 0));
+    assert_eq!(target.inner.download(&path).await.unwrap(), b"rebuilt");
+    assert_eq!(
+        *target.bounds.lock().unwrap(),
+        [crate::shard_map::SHARD_MAP_MAX_LEN]
+    );
+}

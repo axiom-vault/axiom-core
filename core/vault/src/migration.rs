@@ -8,8 +8,11 @@ use std::fmt;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use crate::config::{VaultConfig, VaultVersion, CONFIG_FILENAME, META_DIRNAME, TREE_FILENAME};
-use crate::manifest::{GenerationManifest, MANIFEST_FILENAME};
+use crate::config::{
+    download_metadata, VaultConfig, VaultVersion, CONFIG_FILENAME, CONFIG_MAX_LEN, META_DIRNAME,
+    TREE_FILENAME, TREE_MAX_LEN,
+};
+use crate::manifest::{GenerationManifest, MANIFEST_FILENAME, MANIFEST_MAX_LEN};
 use crate::session::VaultSession;
 use axiomvault_common::{Error, Result, VaultPath};
 use axiomvault_crypto::{recovery::RecoveryKey, MasterKey};
@@ -155,7 +158,7 @@ impl MigrationRegistry {
         self.recover_interrupted(provider, password, &config_path, &backup_path, &temp_path)
             .await?;
 
-        let original_bytes = provider.download(&config_path).await?;
+        let original_bytes = download_metadata(provider, &config_path, CONFIG_MAX_LEN).await?;
         let mut config = VaultConfig::from_bytes(&original_bytes)?;
         let from = config.version;
         let path = self.find_path(&from, target).ok_or_else(|| {
@@ -229,7 +232,7 @@ impl MigrationRegistry {
             };
         }
 
-        let committed = match provider.download(&config_path).await {
+        let committed = match download_metadata(provider, &config_path, CONFIG_MAX_LEN).await {
             Ok(bytes) => VaultConfig::from_bytes(&bytes),
             Err(error) => Err(error),
         };
@@ -361,7 +364,7 @@ impl MigrationRegistry {
         path: &VaultPath,
         password: &[u8],
     ) -> Result<AuthenticatedConfig> {
-        let bytes = provider.download(path).await?;
+        let bytes = download_metadata(provider, path, CONFIG_MAX_LEN).await?;
         let config = VaultConfig::from_bytes(&bytes)?;
         let master_key = config
             .verify_password(password)?
@@ -450,12 +453,14 @@ async fn prove_legacy_master_key(
     let tree_path = meta.join(TREE_FILENAME)?;
     let mut proven = false;
     if provider.exists(&manifest_path).await? {
-        GenerationManifest::open(master_key, &provider.download(&manifest_path).await?)
+        let bytes = download_metadata(provider, &manifest_path, MANIFEST_MAX_LEN).await?;
+        GenerationManifest::open(master_key, &bytes)
             .map_err(|_| refused("the snapshot manifest does not authenticate"))?;
         proven = true;
     }
     if provider.exists(&tree_path).await? {
-        VaultSession::decrypt_tree_bytes(master_key, &provider.download(&tree_path).await?)
+        let bytes = download_metadata(provider, &tree_path, TREE_MAX_LEN).await?;
+        VaultSession::decrypt_tree_bytes(master_key, &bytes)
             .map_err(|_| refused("the tree index does not authenticate"))?;
         proven = true;
     }

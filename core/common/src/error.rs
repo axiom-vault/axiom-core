@@ -66,6 +66,14 @@ pub enum Error {
     /// Network operation failed.
     #[error("Network error: {0}")]
     Network(String),
+
+    /// A vault config embeds OAuth credentials, as configs written by older
+    /// clients did, and is refused because it does not authenticate.
+    ///
+    /// The credentials were stored with the vault on its storage backend, so
+    /// callers can tell the user to rotate them.
+    #[error("Legacy vault config with credentials: {0}")]
+    LegacyConfigCredentials(String),
 }
 
 /// Result type alias using the common Error.

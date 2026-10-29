@@ -568,4 +568,16 @@ mod tests {
         assert!(provider.exists(&to).await.unwrap());
         assert_eq!(provider.download(&to).await.unwrap(), data);
     }
+
+    #[tokio::test]
+    async fn download_bounded_does_not_reserve_a_generous_bound() {
+        let provider = MemoryProvider::new();
+        let path = VaultPath::parse("/small").unwrap();
+        provider.upload(&path, b"abc".to_vec()).await.unwrap();
+
+        // The default implementation used to reserve all of `max_len`.
+        let data = provider.download_bounded(&path, u64::MAX).await.unwrap();
+        assert_eq!(data, b"abc");
+        assert!(data.capacity() <= 1024 * 1024);
+    }
 }

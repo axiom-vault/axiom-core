@@ -36,6 +36,14 @@ const SHARD_MAP_DIR: &str = ".axiomvault";
 /// Leading bytes of an authenticated shard map file.
 const MAP_MAGIC: &[u8; 8] = b"AXSMAP\x00\x02";
 
+/// Longest stored shard map that is read; nothing authenticates the length
+/// before the read. The map grows with the number of objects: an entry holds
+/// its path, object id, tag and one location (with its own path) per shard,
+/// about 2 KiB at typical name lengths and 4.5 KiB for a 255-byte name in six
+/// shards. 2 GiB is about a million objects. Tombstones, about 130 bytes per
+/// deleted path and never pruned, share it.
+pub(crate) const SHARD_MAP_MAX_LEN: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Encoding parameters for a chunk's erasure coding scheme.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErasureParams {
@@ -388,12 +396,17 @@ impl ShardMap {
     ) -> Result<Option<ShardMap>> {
         let path = VaultPath::parse(SHARD_MAP_PATH)?;
 
-        match backend.download(&path).await {
+        match backend.download_bounded(&path, SHARD_MAP_MAX_LEN).await {
             Ok(data) => {
                 let map = Self::from_authenticated(&data, key)?;
                 Ok(Some(map))
             }
             Err(Error::NotFound(_)) => Ok(None),
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+                Err(Error::Crypto(format!(
+                    "shard map is longer than the {SHARD_MAP_MAX_LEN}-byte limit and is not read"
+                )))
+            }
             Err(e) => Err(e),
         }
     }
