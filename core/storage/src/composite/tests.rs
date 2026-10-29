@@ -1847,9 +1847,10 @@ const INFLATION: usize = 1 << 20;
 /// Chunk size of an inflating backend's download streams.
 const INFLATION_CHUNK: usize = 4096;
 
-/// A backend that, once `inflating` is set, serves every object except the
-/// shard map followed by `INFLATION` junk bytes, streamed in chunks. It
-/// counts every byte it hands out.
+/// A backend that, once `inflating` is set, serves every object followed by
+/// `INFLATION` junk bytes, streamed in chunks, and counts the object bytes it
+/// hands out. Internal files (the shard map, rebuild checkpoints) pass
+/// through as stored and uncounted.
 struct InflatingProvider {
     inner: MemoryProvider,
     inflating: AtomicBool,
@@ -1865,9 +1866,12 @@ impl InflatingProvider {
         }
     }
 
-    fn junk_len(&self, path: &VaultPath) -> usize {
-        let is_map = path.to_string_path().contains(".axiomvault/");
-        if !is_map && self.inflating.load(Ordering::SeqCst) {
+    fn is_internal(path: &VaultPath) -> bool {
+        path.to_string_path().contains(".axiomvault/")
+    }
+
+    fn junk_len(&self) -> usize {
+        if self.inflating.load(Ordering::SeqCst) {
             INFLATION
         } else {
             0
@@ -1893,15 +1897,21 @@ impl StorageProvider for InflatingProvider {
     }
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
         let mut data = self.inner.download(path).await?;
-        data.resize(data.len() + self.junk_len(path), 0xEE);
+        if Self::is_internal(path) {
+            return Ok(data);
+        }
+        data.resize(data.len() + self.junk_len(), 0xEE);
         self.served.fetch_add(data.len(), Ordering::SeqCst);
         Ok(data)
     }
     async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
         use futures::StreamExt;
+        if Self::is_internal(path) {
+            return self.inner.download_stream(path).await;
+        }
         let data = self.inner.download(path).await?;
         let junk = std::iter::repeat_with(|| vec![0xEE; INFLATION_CHUNK])
-            .take(self.junk_len(path) / INFLATION_CHUNK);
+            .take(self.junk_len() / INFLATION_CHUNK);
         let served = Arc::clone(&self.served);
         let chunks = stream::iter(std::iter::once(data).chain(junk)).map(move |chunk| {
             served.fetch_add(chunk.len(), Ordering::SeqCst);
@@ -2027,4 +2037,52 @@ async fn test_bounded_erasure_read_treats_oversized_shards_as_missing() {
         let served = backend.take_served();
         assert!(served <= bound, "backend {i} held {served} bytes");
     }
+}
+
+/// Erasure rebuild reads oversized source shards only up to the payload
+/// length and drops them: it rebuilds the genuine shard when enough genuine
+/// ones remain, and writes nothing when not.
+#[tokio::test]
+async fn test_bounded_erasure_rebuild_skips_oversized_shards() {
+    use crate::rebuild::{RaidRebuilder, RebuildConfig};
+
+    let (raw, backends) = inflating_backends(5);
+    let provider = new_composite(backends.clone(), erasure_config(3, 2)).unwrap();
+    let path = VaultPath::parse("/e.bin").unwrap();
+    provider
+        .upload(&path, (0..300u32).map(|i| i as u8).collect())
+        .await
+        .unwrap();
+    let shard4 = shard_of(&provider, "/e.bin", 4).await;
+    let genuine4 = backends[4].download(&shard4).await.unwrap();
+    let bound = provider.expected_payload_len(300).unwrap() as usize + INFLATION_CHUNK;
+
+    raw[0].inflating.store(true, Ordering::SeqCst);
+    backends[4].delete(&shard4).await.unwrap();
+    raw[4].take_served();
+    let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
+        .unwrap()
+        .rebuild()
+        .await
+        .unwrap();
+    assert_eq!((result.rebuilt, result.failed), (1, 0));
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+    assert_eq!(backends[4].download(&shard4).await.unwrap(), genuine4);
+
+    raw[1].inflating.store(true, Ordering::SeqCst);
+    backends[4].delete(&shard4).await.unwrap();
+    let result = RaidRebuilder::new(&provider, 4, RebuildConfig::default())
+        .unwrap()
+        .rebuild()
+        .await
+        .unwrap();
+    assert_eq!((result.rebuilt, result.failed), (0, 1));
+    for (i, backend) in raw.iter().enumerate() {
+        let served = backend.take_served();
+        assert!(served <= bound, "backend {i} held {served} bytes");
+    }
+    assert!(!backends[4].exists(&shard4).await.unwrap());
 }
