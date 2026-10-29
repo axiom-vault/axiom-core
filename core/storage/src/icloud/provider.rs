@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axiomvault_common::{Error, Result, VaultPath};
@@ -61,55 +61,25 @@ impl ICloudProvider {
     }
 }
 
+/// Split a configured subfolder into plain named components, rejecting
+/// anything that could move the root: absolute paths, drive prefixes,
+/// `.`/`..`, and empty or whitespace-only components.
 fn validate_subfolder(subfolder: &str) -> Result<PathBuf> {
-    if subfolder.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "iCloud subfolder cannot be empty or whitespace".to_string(),
-        ));
-    }
-
-    if has_windows_drive_prefix(subfolder) {
-        return Err(Error::InvalidInput(
-            "iCloud subfolder must be a relative path without filesystem prefixes".to_string(),
-        ));
-    }
-
-    let path = Path::new(subfolder);
-    if path.is_absolute() || path.has_root() {
-        return Err(Error::InvalidInput(
-            "iCloud subfolder must be a relative path".to_string(),
-        ));
-    }
-
-    let mut sanitized = PathBuf::new();
+    let mut path = PathBuf::new();
     for component in subfolder.split(['/', '\\']) {
-        if component.trim().is_empty() {
-            return Err(Error::InvalidInput(
-                "iCloud subfolder components cannot be empty or whitespace".to_string(),
-            ));
+        if component.trim().is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains(':')
+        {
+            return Err(Error::InvalidInput(format!(
+                "iCloud subfolder must be a relative path of named folders \
+                 (no root, drive prefix, '.', '..' or empty components): {subfolder:?}"
+            )));
         }
-
-        if component == "." || component == ".." {
-            return Err(Error::InvalidInput(
-                "iCloud subfolder cannot contain '.' or '..' path components".to_string(),
-            ));
-        }
-
-        sanitized.push(component);
+        path.push(component);
     }
-
-    if sanitized.as_os_str().is_empty() {
-        return Err(Error::InvalidInput(
-            "iCloud subfolder cannot be empty or whitespace".to_string(),
-        ));
-    }
-
-    Ok(sanitized)
-}
-
-fn has_windows_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    Ok(path)
 }
 
 #[async_trait]
@@ -197,11 +167,12 @@ mod tests {
         }
     }
 
-    fn invalid_subfolder_error(subfolder: &str) -> Error {
+    fn assert_rejected(subfolder: &str) {
         let dir = tempfile::TempDir::new().unwrap();
         match ICloudProvider::new(config_with_subfolder(&dir, subfolder)) {
-            Ok(_) => panic!("invalid subfolder should be rejected: {subfolder}"),
-            Err(err) => err,
+            Err(Error::InvalidInput(_)) => {}
+            Err(err) => panic!("unexpected error for subfolder {subfolder:?}: {err}"),
+            Ok(_) => panic!("invalid subfolder should be rejected: {subfolder:?}"),
         }
     }
 
@@ -238,35 +209,31 @@ mod tests {
 
     #[test]
     fn test_rejects_absolute_subfolder() {
-        let err = invalid_subfolder_error("/escape");
-        assert!(matches!(err, Error::InvalidInput(message) if message.contains("relative path")));
+        assert_rejected("/escape");
+        assert_rejected("\\\\server\\share");
     }
 
     #[test]
     fn test_rejects_parent_traversal_subfolder() {
-        let err = invalid_subfolder_error("safe/../escape");
-        assert!(matches!(err, Error::InvalidInput(message) if message.contains("'.' or '..'")));
+        assert_rejected("..");
+        assert_rejected("safe/../escape");
+        assert_rejected("safe/./escape");
     }
 
     #[test]
     fn test_rejects_empty_or_whitespace_subfolder_components() {
-        let repeated_separator_err = invalid_subfolder_error("safe//escape");
-        assert!(matches!(
-            repeated_separator_err,
-            Error::InvalidInput(message) if message.contains("empty or whitespace")
-        ));
-
-        let whitespace_component_err = invalid_subfolder_error("safe/ /escape");
-        assert!(matches!(
-            whitespace_component_err,
-            Error::InvalidInput(message) if message.contains("empty or whitespace")
-        ));
+        assert_rejected("");
+        assert_rejected("   ");
+        assert_rejected("safe//escape");
+        assert_rejected("safe/ /escape");
+        assert_rejected("safe/");
     }
 
     #[test]
     fn test_rejects_windows_prefix_subfolder() {
-        let err = invalid_subfolder_error("C:\\escape");
-        assert!(matches!(err, Error::InvalidInput(message) if message.contains("prefixes")));
+        assert_rejected("C:\\escape");
+        assert_rejected("C:escape");
+        assert_rejected("safe/C:/escape");
     }
 
     #[test]
