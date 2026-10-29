@@ -662,11 +662,29 @@ impl VaultConfig {
     /// relabelled, so it is accepted only where `bound_by_manifest`: a sealed
     /// manifest binds these bytes. Every 1.1 config this code writes (the
     /// registry's 1.0 -> 1.1 step) is tagged. Any tag present must verify.
+    ///
+    /// Serialization refuses OAuth credentials, so no config this code tags
+    /// holds them; one that does was written by an older client. It is refused
+    /// wherever another config would be, as
+    /// [`Error::LegacyConfigCredentials`].
     pub(crate) fn verify_integrity(
         &mut self,
         master_key: &MasterKey,
         bound_by_manifest: bool,
     ) -> Result<()> {
+        match self.check_mac(master_key, bound_by_manifest) {
+            Err(error) if contains_oauth_credentials(&self.provider_config) => {
+                Err(Error::LegacyConfigCredentials(format!(
+                    "{CONFIG_FILENAME} embeds OAuth credentials, as configs from older clients \
+                     did, and is refused ({error})"
+                )))
+            }
+            result => result,
+        }
+    }
+
+    /// [`verify_integrity`](Self::verify_integrity) for any config.
+    fn check_mac(&mut self, master_key: &MasterKey, bound_by_manifest: bool) -> Result<()> {
         let Some(tag) = self.config_mac.take() else {
             if self.version.major >= VaultVersion::CURRENT.major {
                 return Err(Error::Crypto(format!(
@@ -862,6 +880,34 @@ mod tests {
                 .to_string(),
             UNAUTHENTICATED_V1_1
         );
+    }
+
+    #[test]
+    fn config_holding_credentials_is_refused_as_legacy_where_any_config_is() {
+        let (mut config, master_key) = tagged_config();
+        let tag = config.compute_mac(&master_key).unwrap();
+        config.provider_config["tokens"] = serde_json::json!({ "refresh_token": "legacy" });
+        let mut tagged = config.clone();
+        tagged.config_mac = Some(tag);
+        let mut v1_1 = config.clone();
+        v1_1.version = VaultVersion::V1_1;
+        let mut v1_0 = config.clone();
+        v1_0.version = VaultVersion { major: 1, minor: 0 };
+
+        for (mut refused, bound_by_manifest) in
+            [(tagged, true), (config, true), (v1_1.clone(), false)]
+        {
+            let error = refused
+                .verify_integrity(&master_key, bound_by_manifest)
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::LegacyConfigCredentials(m) if m.contains("OAuth credentials")),
+                "{error}"
+            );
+        }
+        // Where an untagged config is accepted, so is this one.
+        v1_1.verify_integrity(&master_key, true).unwrap();
+        v1_0.verify_integrity(&master_key, false).unwrap();
     }
 
     #[test]

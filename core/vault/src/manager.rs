@@ -3070,7 +3070,8 @@ mod tests {
             // A tagged config cannot hold credentials (serialization refuses
             // them), so a config holding them was written outside the vault:
             // at 2.0 its tag fails, at 1.1 it is untagged. Every path refuses
-            // it before the sanitizing upload (M-1).
+            // it before the sanitizing upload (M-1), as a legacy config so the
+            // user can be told to rotate the credentials (axiom-cli#22).
             let expected = if version == VaultVersion::V1_1 {
                 crate::config::UNAUTHENTICATED_V1_1
             } else {
@@ -3085,7 +3086,10 @@ mod tests {
                     .await,
             ] {
                 match result {
-                    Err(error) => assert!(error.to_string().contains(expected), "{error}"),
+                    Err(error) => assert!(
+                        matches!(&error, Error::LegacyConfigCredentials(m) if m.contains(expected)),
+                        "{error}"
+                    ),
                     Ok(_) => panic!("a {version} cloud config holding credentials was opened"),
                 }
             }
