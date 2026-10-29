@@ -9,7 +9,7 @@
 use std::fmt;
 
 use blake2::digest::consts::U32;
-use blake2::digest::Mac;
+use blake2::digest::{KeyInit, Mac};
 use zeroize::Zeroizing;
 
 /// Length of an authentication tag in bytes.
@@ -41,7 +41,7 @@ impl CompositeKey {
     }
 
     fn mac(&self, domain: &[u8], parts: &[&[u8]]) -> Blake2bMac256 {
-        let mut mac = <Blake2bMac256 as Mac>::new_from_slice(self.0.as_slice())
+        let mut mac = <Blake2bMac256 as KeyInit>::new_from_slice(self.0.as_slice())
             .expect("BLAKE2b accepts a 32-byte key");
         // Length-prefix every field so no two field lists hash alike.
         for part in std::iter::once(&domain).chain(parts.iter()) {

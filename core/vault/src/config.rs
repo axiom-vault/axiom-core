@@ -634,12 +634,12 @@ impl VaultConfig {
     /// `config_mac` over this config with the tag itself left out.
     fn compute_mac(&self, master_key: &MasterKey) -> Result<Vec<u8>> {
         use blake2::digest::consts::U32;
-        use blake2::digest::Mac;
+        use blake2::digest::{KeyInit, Mac};
 
         let mut untagged = self.clone();
         untagged.config_mac = None;
         let key = master_key.derive_file_key(CONFIG_MAC_CONTEXT);
-        let mut mac = <blake2::Blake2bMac<U32> as Mac>::new_from_slice(key.as_bytes())
+        let mut mac = <blake2::Blake2bMac<U32> as KeyInit>::new_from_slice(key.as_bytes())
             .map_err(|e| Error::Crypto(format!("config MAC key rejected: {e}")))?;
         mac.update(&untagged.to_bytes()?);
         Ok(mac.finalize().into_bytes().to_vec())
