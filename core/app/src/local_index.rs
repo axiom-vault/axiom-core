@@ -51,7 +51,8 @@ fn secure_index_file(path: &Path) -> AppResult<(std::path::PathBuf, std::fs::Fil
         let metadata = std::fs::symlink_metadata(ancestor).map_err(index_io)?;
         // Root-owned sticky directories such as /tmp cannot rename a child
         // owned by this user. Other writable ancestry is not a safe boundary.
-        let trusted_sticky = metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0;
+        // 0o1000 is S_ISVTX, which libc types as u16 on macOS and u32 on Linux.
+        let trusted_sticky = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
         if !metadata.is_dir()
             || (metadata.uid() != 0 && metadata.uid() != uid)
             || (metadata.mode() & 0o022 != 0 && !trusted_sticky)
