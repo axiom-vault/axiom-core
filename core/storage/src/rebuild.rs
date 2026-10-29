@@ -31,6 +31,12 @@ use axiomvault_common::{Error, Result, VaultPath};
 /// Well-known path for the rebuild checkpoint file on the target backend.
 const CHECKPOINT_PATH: &str = ".axiomvault/rebuild_checkpoint.json";
 
+/// Longest checkpoint that is read. It is not fixed-size: it lists every
+/// completed chunk path. Those are shard map keys, and each takes a few bytes
+/// more here than its path, against well over twice that in the map, so the
+/// shard map's bound covers it.
+const CHECKPOINT_MAX_LEN: u64 = crate::shard_map::SHARD_MAP_MAX_LEN;
+
 /// Configuration for a rebuild operation.
 #[derive(Debug, Clone)]
 pub struct RebuildConfig {
@@ -90,8 +96,14 @@ impl RebuildCheckpoint {
             Ok(p) => p,
             Err(_) => return None,
         };
-        let data = match backend.download(&path).await {
+        let data = match backend.download_bounded(&path, CHECKPOINT_MAX_LEN).await {
             Ok(d) => d,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+                warn!(
+                    "Rebuild checkpoint is longer than {CHECKPOINT_MAX_LEN} bytes, starting fresh"
+                );
+                return None;
+            }
             Err(_) => return None,
         };
         let ckpt: Self = match serde_json::from_slice(&data) {
