@@ -777,6 +777,7 @@ impl<'a> RaidRebuilder<'a> {
         // Download all available shards from peer backends.
         let mut shard_opts: Vec<Option<Vec<u8>>> = vec![None; total_shards];
         let mut available = 0usize;
+        let payload_len = composite.expected_payload_len(entry.original_size)?;
 
         for i in 0..total_shards {
             if i == target_index {
@@ -784,7 +785,7 @@ impl<'a> RaidRebuilder<'a> {
             }
             let shard_path =
                 CompositeStorageProvider::shard_path(&vault_path, &entry.object_id, i)?;
-            match backends[i].download(&shard_path).await {
+            match backends[i].download_bounded(&shard_path, payload_len).await {
                 Ok(payload) => {
                     let Some(shard_data) = composite.open_shard(entry, i, &payload) else {
                         warn!(

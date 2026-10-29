@@ -25,7 +25,7 @@ use tokio::sync::{OnceCell, RwLock};
 use tracing::warn;
 
 use crate::health::ProviderHealth;
-use crate::provider::{ByteStream, Metadata, StorageProvider};
+use crate::provider::{too_long, ByteStream, Metadata, StorageProvider};
 use crate::shard_map::{mirror_staging_path, ChunkEntry, ShardMap};
 use auth::{DOMAIN_MIRROR, TAG_LEN};
 use axiomvault_common::{Error, Result, VaultPath};
@@ -229,7 +229,8 @@ impl CompositeStorageProvider {
 
     /// Read the verified copy of `entry` from one backend: the copy at
     /// `path`, else the staged copy (its write was committed but not yet
-    /// renamed into place on this backend).
+    /// renamed into place on this backend). Neither read holds more than
+    /// the entry's size: a longer copy counts as forged.
     pub(crate) async fn read_mirror_copy(
         &self,
         backend: &dyn StorageProvider,
@@ -240,9 +241,13 @@ impl CompositeStorageProvider {
         let mut first_error = None;
         let mut forged = false;
         for candidate in [path, &staged] {
-            match backend.download(candidate).await {
+            match backend
+                .download_bounded(candidate, entry.original_size)
+                .await
+            {
                 Ok(data) if self.verify_mirror_copy(entry, &data) => return Ok(data),
                 Ok(_) => forged = true,
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::FileTooLarge => forged = true,
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
@@ -450,16 +455,25 @@ impl StorageProvider for CompositeStorageProvider {
     }
 
     async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+        self.download_bounded(path, u64::MAX).await
+    }
+
+    async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
+        // Every backend read is bounded by this authenticated size, so
+        // nothing is read for an object the map says is too long.
+        let entry = self.entry_for(path).await?;
+        if entry.original_size > max_len {
+            return Err(too_long(path, max_len));
+        }
         match self.config.mode {
             RaidMode::Mirror => {
-                let entry = self.entry_for(path).await?;
                 let (path, entry) = (&path, &entry);
                 self.try_first("download", |backend| async move {
                     self.read_mirror_copy(backend.as_ref(), path, entry).await
                 })
                 .await
             }
-            RaidMode::Erasure { .. } => self.erasure_download(path).await,
+            RaidMode::Erasure { .. } => self.erasure_download(path, &entry).await,
         }
     }
 

@@ -150,6 +150,12 @@ impl CompositeStorageProvider {
         })
     }
 
+    /// Length of the stored payload of every shard of an object of
+    /// `original_size` bytes: the most a shard read needs to hold.
+    pub(crate) fn expected_payload_len(&self, original_size: u64) -> Result<u64> {
+        Ok((SHARD_HEADER_LEN + self.expected_shard_len(original_size)?) as u64)
+    }
+
     /// Pass the fields a shard tag covers to `f`: the write, the shard's
     /// index (its position in the set and its backend), the coding
     /// parameters, the object's size and the shard data.
@@ -381,10 +387,14 @@ impl CompositeStorageProvider {
     ///
     /// Only shards that verify against the authenticated shard map entry are
     /// used; the rest count as missing, so the result is either the data that
-    /// was written or an error.
-    pub(crate) async fn erasure_download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+    /// was written or an error. A shard read stops past the payload length
+    /// `entry` implies, and that shard counts as missing too.
+    pub(crate) async fn erasure_download(
+        &self,
+        path: &VaultPath,
+        entry: &ChunkEntry,
+    ) -> Result<Vec<u8>> {
         self.probe_if_due().await;
-        let entry = self.entry_for(path).await?;
 
         let RaidMode::Erasure {
             data_shards,
@@ -395,13 +405,14 @@ impl CompositeStorageProvider {
         };
 
         let total = data_shards + parity_shards;
+        let payload_len = self.expected_payload_len(entry.original_size)?;
         let mut futures = Vec::with_capacity(total);
         for i in 0..total {
             let backend = Arc::clone(&self.backends[i]);
             let shard_path = Self::shard_path(path, &entry.object_id, i)?;
             futures.push(async move {
                 let start = tokio::time::Instant::now();
-                let result = backend.download(&shard_path).await;
+                let result = backend.download_bounded(&shard_path, payload_len).await;
                 (i, result, start.elapsed())
             });
         }
@@ -413,7 +424,7 @@ impl CompositeStorageProvider {
 
         for (i, result, latency) in results {
             if let Ok(payload) = result {
-                let Some(shard_data) = self.open_shard(&entry, i, &payload) else {
+                let Some(shard_data) = self.open_shard(entry, i, &payload) else {
                     warn!(
                         shard = i,
                         "Erasure download: shard failed authentication, treating it as missing"
