@@ -82,6 +82,12 @@ pub(crate) fn too_long(path: &VaultPath, max_len: u64) -> axiomvault_common::Err
     .into()
 }
 
+/// The most the default [`StorageProvider::download_bounded`] reserves up
+/// front. Exact lengths up to this read without regrowing the buffer, and a
+/// generous cap (vault metadata, the shard map) is not reserved in full for
+/// an object far shorter than it.
+const BOUNDED_PREALLOC_MAX: u64 = 1024 * 1024;
+
 /// Storage provider trait for different backends.
 ///
 /// All operations are async and use streams for large data transfers.
@@ -224,13 +230,14 @@ pub trait StorageProvider: Send + Sync {
     /// is returned as is; callers that expect an exact length check it.
     ///
     /// The default reads [`download_stream`](Self::download_stream) into a
-    /// buffer preallocated to `max_len` and stops at the first chunk that runs
-    /// past it. Providers that can read a small object in one step should
-    /// override it.
+    /// buffer preallocated to `max_len` (at most 1 MiB) and stops at the first
+    /// chunk that runs past it. Providers that can read a small object in one
+    /// step should override it.
     async fn download_bounded(&self, path: &VaultPath, max_len: u64) -> Result<Vec<u8>> {
         use futures::StreamExt;
         let mut download = self.download_stream(path).await?;
-        let mut data = Vec::with_capacity(usize::try_from(max_len).unwrap_or(0));
+        let mut data =
+            Vec::with_capacity(usize::try_from(max_len.min(BOUNDED_PREALLOC_MAX)).unwrap_or(0));
         while let Some(chunk) = download.next().await {
             let chunk = chunk?;
             if chunk.len() as u64 > max_len - data.len() as u64 {
