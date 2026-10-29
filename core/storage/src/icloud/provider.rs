@@ -2,13 +2,15 @@
 //!
 //! Wraps `LocalProvider` around the iCloud Drive mount point on macOS.
 
-use crate::local::LocalProvider;
-use crate::provider::{ByteStream, Metadata, StorageProvider};
 use async_trait::async_trait;
-use axiomvault_common::{Error, Result, VaultPath};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use axiomvault_common::{Error, Result, VaultPath};
+
+use crate::local::LocalProvider;
+use crate::provider::{ByteStream, Metadata, StorageProvider};
 
 /// iCloud Drive provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +43,10 @@ impl ICloudProvider {
             Some(ref path) => PathBuf::from(path),
             None => super::detect_icloud_path().ok_or_else(|| {
                 Error::NotFound(
-                    "iCloud Drive not found. iCloud Drive is only available on macOS with iCloud enabled. You can set a custom path via the 'root_path' config option.".to_string(),
+                    "iCloud Drive not found. \
+                     iCloud Drive is only available on macOS with iCloud enabled. \
+                     You can set a custom path via the 'root_path' config option."
+                        .to_string(),
                 )
             })?,
         };
@@ -170,6 +175,7 @@ impl StorageProvider for ICloudProvider {
 pub fn create_icloud_provider(config: serde_json::Value) -> Result<Arc<dyn StorageProvider>> {
     let icloud_config: ICloudConfig = serde_json::from_value(config)
         .map_err(|e| Error::InvalidInput(format!("Invalid iCloud config: {}", e)))?;
+
     Ok(Arc::new(ICloudProvider::new(icloud_config)?))
 }
 
@@ -295,23 +301,28 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let provider = ICloudProvider::new(config_with_root(&dir)).unwrap();
 
+        // Create a directory
         let dir_path = VaultPath::parse("test-dir").unwrap();
         provider.create_dir(&dir_path).await.unwrap();
         assert!(provider.exists(&dir_path).await.unwrap());
 
+        // Upload a file
         let file_path = VaultPath::parse("test-dir/hello.txt").unwrap();
         provider
             .upload(&file_path, b"hello world".to_vec())
             .await
             .unwrap();
 
+        // Download and verify
         let data = provider.download(&file_path).await.unwrap();
         assert_eq!(data, b"hello world");
 
+        // List directory
         let entries = provider.list(&dir_path).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "hello.txt");
 
+        // Delete
         provider.delete(&file_path).await.unwrap();
         assert!(!provider.exists(&file_path).await.unwrap());
     }
