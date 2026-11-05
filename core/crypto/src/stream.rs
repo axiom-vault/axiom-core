@@ -751,6 +751,31 @@ mod tests {
         assert!(decrypt_bytes(&key, &encrypted).is_err());
     }
 
+    /// Pins the v2 stream format: a fixed stream (key 00..1f, chunk size 4,
+    /// plaintext "hello") written by an earlier build must still decrypt.
+    #[test]
+    fn stream_known_answer_decrypts() {
+        let key: [u8; KEY_LENGTH] = core::array::from_fn(|i| i as u8);
+        let hex =
+            "020400000039000000fc5e8e10d775145a4c65efc09f0090649b6febdee4ef74d96c6061768f9c49\
+             6f161849db20fd08789571f84a6262f8dc0206951ce755c4941b36000000b95e82111831ca73e8\
+             1d19d63120a34a3f2481618e8f2669b863c05e7cdee863dc0926cc97173f45a4be285fcc9d1afe\
+             30bfae5f9a3e35000000f6aa4b6edf9be1218374cf043df8e63c42ba8e3b864933abe7bbb6c67e\
+             20a96ea1547c0335e561b13e533eb84b3a7efc75261a6b05";
+        let encrypted: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+
+        let mut decrypted = Vec::new();
+        DecryptingStream::new(&key)
+            .unwrap()
+            .with_chunk_size(4)
+            .decrypt_stream(&encrypted[..], &mut decrypted)
+            .unwrap();
+        assert_eq!(decrypted, b"hello");
+    }
+
     /// Version-2 frames are `len || aead::encrypt(index || kind || chunk_size || data)`.
     /// The in-place stream path must stay byte-compatible with that per-frame AEAD
     /// construction in both directions.

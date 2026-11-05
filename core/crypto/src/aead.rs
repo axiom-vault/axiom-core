@@ -250,6 +250,26 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    /// Pins the on-disk format: ciphertext || tag for a fixed key and nonce,
+    /// and nonce || ciphertext || tag opened by `decrypt`.
+    #[test]
+    fn test_known_answer() {
+        let key: [u8; KEY_LENGTH] = core::array::from_fn(|i| i as u8);
+        let nonce: [u8; NONCE_SIZE] = core::array::from_fn(|i| 0x40 + i as u8);
+        let plaintext = b"axiomvault known-answer test";
+
+        let ct = encrypt_with_nonce(&key, &nonce, plaintext).unwrap();
+        let hex: String = ct.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "b5416c1fbd961863e380a7d5c1f312fcbfdbc3b7643c21ba1e548e31f9c4574140c464ba1af6240cb460663d"
+        );
+
+        let mut sealed = nonce.to_vec();
+        sealed.extend_from_slice(&ct);
+        assert_eq!(decrypt(&key, &sealed).unwrap(), plaintext);
+    }
+
     #[test]
     fn test_empty_plaintext() {
         let key = [42u8; KEY_LENGTH];
