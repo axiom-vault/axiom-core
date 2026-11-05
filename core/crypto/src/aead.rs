@@ -4,8 +4,8 @@
 //! with a 24-byte nonce that is safe for random generation.
 
 use chacha20poly1305::{
-    aead::{generic_array::GenericArray, Aead, AeadCore, KeyInit, OsRng},
-    XChaCha20Poly1305,
+    aead::{Aead, Generate, KeyInit},
+    XChaCha20Poly1305, XNonce,
 };
 
 use crate::keys::KEY_LENGTH;
@@ -44,8 +44,10 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
+    let nonce = XNonce::try_generate()
+        .map_err(|e| Error::Crypto(format!("Nonce generation failed: {}", e)))?;
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -92,12 +94,14 @@ pub fn decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     }
 
     let (nonce_bytes, encrypted) = ciphertext.split_at(NONCE_SIZE);
-    let nonce = GenericArray::from_slice(nonce_bytes);
+    let nonce = XNonce::try_from(nonce_bytes)
+        .map_err(|e| Error::Crypto(format!("Invalid nonce: {}", e)))?;
 
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
 
     cipher
-        .decrypt(nonce, encrypted)
+        .decrypt(&nonce, encrypted)
         .map_err(|e| Error::Crypto(format!("Decryption failed: {}", e)))
 }
 
@@ -126,8 +130,9 @@ pub fn encrypt_with_nonce(
         )));
     }
 
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
-    let nonce_array = GenericArray::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
+    let nonce_array = &XNonce::from(*nonce);
 
     cipher
         .encrypt(nonce_array, plaintext)
@@ -152,8 +157,9 @@ pub fn decrypt_with_nonce(
         return Err(Error::Crypto("Ciphertext too short".to_string()));
     }
 
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(key));
-    let nonce_array = GenericArray::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
+    let nonce_array = &XNonce::from(*nonce);
 
     cipher
         .decrypt(nonce_array, ciphertext)
