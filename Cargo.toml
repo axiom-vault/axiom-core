@@ -23,7 +23,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Crypto
 argon2 = "0.6"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 blake2 = "0.11"
 rand = "0.10.1"
 zeroize = { version = "1.7", features = ["derive"] }
@@ -53,7 +53,7 @@ clap_complete = "4.6"
 
 # Testing
 proptest = "1.0"
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 tempfile = "3.8"
 
 # Utils
@@ -69,7 +69,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1.5"
 
 # Database
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Desktop
 fuser = "0.18"
@@ -78,11 +78,11 @@ fuser = "0.18"
 open = "5.3"
 
 # Recovery key word encoding
-bip39 = "2.1"
+bip39 = "3.0"
 
 # Erasure coding
 reed-solomon-erasure = "6.0"
 
 # Filesystem paths
-dirs = "6.0"
+dirs = "7.0"
 percent-encoding = "2.3"

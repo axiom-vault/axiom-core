@@ -98,7 +98,7 @@ async fn call(
     let params = CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone());
     match client.call_tool(params).await {
         Ok(result) => {
-            let text = &result.content[0].raw.as_text().unwrap().text;
+            let text = &result.content[0].as_text().unwrap().text;
             Ok(serde_json::from_str(text).unwrap())
         }
         Err(ServiceError::McpError(err)) => Err(err.message.to_string()),
