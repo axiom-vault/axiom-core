@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -440,6 +440,13 @@ impl VaultFilesystem {
 }
 
 impl Filesystem for VaultFilesystem {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        // StorageProvider has no quota API. fuser's default successful response
+        // reports zero free blocks, which makes Dolphin reject nonempty copies.
+        // Report capacity as unavailable rather than invent a local/cloud quota.
+        reply.error(Errno::EOPNOTSUPP);
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,

@@ -160,6 +160,34 @@ fn names(path: &Path) -> Vec<String> {
 }
 
 #[test]
+fn unknown_provider_capacity_does_not_report_a_full_disk_or_prevent_copy() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    with_mount(|root| {
+        let path = CString::new(root.as_os_str().as_bytes()).unwrap();
+        let mut capacity = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: path is NUL-terminated and capacity points to writable space.
+        let result = unsafe { libc::statvfs(path.as_ptr(), capacity.as_mut_ptr()) };
+        assert_eq!(
+            result, -1,
+            "unknown provider quota must not look like zero free space"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+
+        let content = pattern(FILE_SIZE);
+        fs::write(root.join("original.bin"), &content).unwrap();
+        assert_eq!(
+            fs::copy(root.join("original.bin"), root.join("copied.bin")).unwrap(),
+            content.len() as u64
+        );
+        assert_eq!(fs::read(root.join("copied.bin")).unwrap(), content);
+    });
+}
+
+#[test]
 fn rename_moves_directories_and_keeps_open_source_handles_usable() {
     with_mount(|root| {
         fs::create_dir(root.join("before")).unwrap();
