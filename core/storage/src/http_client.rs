@@ -24,6 +24,9 @@ const USER_AGENT: &str = "AxiomVault/0.1";
 /// hung or slow-loris server.
 pub const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum time without a successful network read on a download connection.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Build an HTTP client with standard settings for cloud API usage.
 ///
 /// Configures a consistent User-Agent header and connection timeout (10s).
@@ -36,6 +39,23 @@ pub fn build_http_client() -> Result<Client, Error> {
     Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::Network(format!("Failed to create HTTP client: {}", e)))
+}
+
+/// Download client with a 30-second per-read stall timeout and no total limit.
+///
+/// Keep uploads on [`build_http_client`]: reqwest starts the read timer before
+/// response headers, which would otherwise cap a slow upload's duration.
+pub(crate) fn build_download_http_client() -> Result<Client, Error> {
+    build_http_client_with_read_timeout(STREAM_READ_TIMEOUT)
+}
+
+fn build_http_client_with_read_timeout(read_timeout: Duration) -> Result<Client, Error> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
         .build()
         .map_err(|e| Error::Network(format!("Failed to create HTTP client: {}", e)))
 }
@@ -140,6 +160,91 @@ pub async fn handle_error_response<T>(response: reqwest::Response) -> axiomvault
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_body_stalls_time_out_and_the_client_recovers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for stalled in [true, false] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    if stalled {
+                        socket.write_all(b"a").await.unwrap();
+                        // Keep an incomplete body open longer than the outer guard.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        socket.write_all(b"ok").await.unwrap();
+                    }
+                });
+            }
+        });
+        let client = build_http_client_with_read_timeout(Duration::from_millis(200)).unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+            .await
+            .expect("streaming client hung beyond its read-stall deadline")
+            .unwrap_err();
+        assert!(error.is_timeout(), "unexpected error: {error}");
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            client
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered.as_ref(), b"ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_read_timeout_resets_when_a_long_transfer_makes_progress() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                socket.write_all(b"x").await.unwrap();
+            }
+        });
+        let client = build_http_client_with_read_timeout(Duration::from_millis(400)).unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(3), async {
+            client
+                .get(&url)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(body.as_ref(), b"xxxxxxxx");
+        server.await.unwrap();
+    }
 
     #[test]
     fn test_bearer_header() {

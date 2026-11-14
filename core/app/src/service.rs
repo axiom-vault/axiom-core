@@ -175,6 +175,16 @@ impl AppService {
             .map_err(AppError::from)?;
 
         let provider_type = std::mem::take(&mut params.provider_type);
+        Ok(self
+            .activate_open_session(Arc::new(session), provider_type)
+            .await)
+    }
+
+    async fn activate_open_session(
+        &self,
+        session: Arc<VaultSession>,
+        provider_type: String,
+    ) -> VaultInfoDto {
         let info = VaultInfoDto {
             id: session.vault_id().to_string(),
             provider_type: provider_type.clone(),
@@ -182,7 +192,7 @@ impl AppService {
         };
 
         *self.session.write().await = Some(ActiveVault {
-            session: Arc::new(session),
+            session,
             provider_type,
             index: None,
         });
@@ -190,7 +200,35 @@ impl AppService {
         self.emit(AppEvent::VaultOpened(info.clone()));
 
         info!(vault_id = %info.id, "Vault opened");
-        Ok(info)
+        info
+    }
+
+    /// Open Google Drive using credentials supplied by the calling frontend.
+    ///
+    /// No token file is read here. The storage provider owns token refresh using
+    /// `config.auth_config`; only the folder and an opaque credential reference
+    /// may persist in vault metadata. Activates the normal service lifecycle and
+    /// returns the shared session for adapters such as FUSE.
+    ///
+    /// Byte passwords and original core errors are preserved for callers whose
+    /// password sources are non-UTF8 or whose retry policy distinguishes network
+    /// failures from expired/revoked authentication.
+    pub async fn open_gdrive_vault(
+        &self,
+        config: axiomvault_storage::GDriveConfig,
+        password: &[u8],
+    ) -> axiomvault_common::Result<Arc<VaultSession>> {
+        let mut provider_config = serde_json::to_value(config)
+            .map_err(|error| axiomvault_common::Error::Serialization(error.to_string()))?;
+        provider_config["credential_ref"] = serde_json::json!("local:gdrive:app-service");
+        let session = Arc::new(
+            self.manager
+                .open_vault("gdrive", provider_config, password)
+                .await?,
+        );
+        self.activate_open_session(session.clone(), "gdrive".to_string())
+            .await;
+        Ok(session)
     }
 
     /// Recover a vault using recovery words.
@@ -731,6 +769,206 @@ impl Default for AppService {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn synthetic_gdrive_config() -> axiomvault_storage::GDriveConfig {
+        use axiomvault_storage::gdrive::{AuthConfig, Tokens};
+        axiomvault_storage::GDriveConfig {
+            folder_id: "synthetic-folder".into(),
+            tokens: Tokens {
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+            auth_config: Some(AuthConfig {
+                client_id: "synthetic-client".into(),
+                client_secret: Some("synthetic-client-secret".into()),
+                redirect_url: "http://localhost:8080/callback".into(),
+            }),
+        }
+    }
+
+    fn service_with_manager(manager: VaultManager) -> AppService {
+        AppService {
+            manager,
+            session: RwLock::new(None),
+            sync_engine: RwLock::new(None),
+            event_tx: event_channel(64).0,
+        }
+    }
+
+    #[tokio::test]
+    async fn gdrive_open_uses_caller_credentials_and_activates_service_without_persisting_secrets()
+    {
+        use axiomvault_storage::{MemoryProvider, ProviderRegistry};
+        use axiomvault_vault::InMemoryFreshnessAnchor;
+        let storage = Arc::new(MemoryProvider::new());
+        let factory_storage = storage.clone();
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                "gdrive",
+                Box::new(move |runtime| {
+                    assert_eq!(runtime["folder_id"], "synthetic-folder");
+                    assert_eq!(runtime["tokens"]["access_token"], "synthetic-access");
+                    assert_eq!(runtime["tokens"]["refresh_token"], "synthetic-refresh");
+                    assert_eq!(runtime["auth_config"]["client_id"], "synthetic-client");
+                    assert_eq!(
+                        runtime["auth_config"]["client_secret"],
+                        "synthetic-client-secret"
+                    );
+                    Ok(factory_storage.clone())
+                }),
+            )
+            .unwrap();
+        let manager = VaultManager::with_registry_and_anchor(
+            registry,
+            Arc::new(InMemoryFreshnessAnchor::new()),
+        );
+        let mut config = serde_json::to_value(synthetic_gdrive_config()).unwrap();
+        // Existing CLI-created vaults keep their authenticated reference even
+        // when opened through another frontend's runtime credentials.
+        config["credential_ref"] = serde_json::json!("local:gdrive:cli-tokens");
+        let password = b"synthetic-password-\xff\x80";
+        let creation = manager
+            .create_vault(
+                VaultId::new("synthetic-app-gdrive").unwrap(),
+                password,
+                "gdrive",
+                config,
+                KdfParams::moderate(),
+            )
+            .await
+            .unwrap();
+        VaultOperations::new(&creation.session)
+            .unwrap()
+            .create_file(
+                &VaultPath::parse("/marker.txt").unwrap(),
+                b"synthetic marker",
+            )
+            .await
+            .unwrap();
+        drop(creation);
+        let service = service_with_manager(manager);
+        let mut events = service.subscribe();
+        assert!(matches!(
+            service
+                .open_gdrive_vault(synthetic_gdrive_config(), b"wrong")
+                .await,
+            Err(axiomvault_common::Error::NotPermitted(_))
+        ));
+        assert!(!service.is_vault_open().await);
+        assert!(events.try_recv().is_err());
+        let session = service
+            .open_gdrive_vault(synthetic_gdrive_config(), password)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &session,
+            &service.vault_session().await.unwrap()
+        ));
+        assert_eq!(
+            service.read_file("/marker.txt").await.unwrap(),
+            b"synthetic marker"
+        );
+        assert_eq!(service.vault_info().await.unwrap().provider_type, "gdrive");
+        assert!(
+            matches!(events.try_recv().unwrap(), AppEvent::VaultOpened(info) if info.id == "synthetic-app-gdrive" && info.provider_type == "gdrive")
+        );
+        // Exercise a later facade mutation as well as opening, then inspect
+        // every persisted metadata object for accidental credential leakage.
+        service
+            .create_file("/new.txt", b"new marker")
+            .await
+            .unwrap();
+        let safe = &session.config().provider_config;
+        assert_eq!(safe["credential_ref"], "local:gdrive:cli-tokens");
+        assert!(safe.get("tokens").is_none() && safe.get("auth_config").is_none());
+        let mut metadata = storage
+            .list(&VaultPath::parse("/m").unwrap())
+            .await
+            .unwrap();
+        metadata.push(
+            storage
+                .metadata(&VaultPath::parse("/vault.config").unwrap())
+                .await
+                .unwrap(),
+        );
+        for entry in metadata {
+            let path = if entry.name == "vault.config" {
+                VaultPath::parse("/vault.config").unwrap()
+            } else {
+                VaultPath::parse("/m").unwrap().join(&entry.name).unwrap()
+            };
+            let bytes = storage.download(&path).await.unwrap();
+            for secret in [
+                "synthetic-access",
+                "synthetic-refresh",
+                "synthetic-client-secret",
+            ] {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "credential persisted in {path}"
+                );
+            }
+        }
+        // CLI uses a temporary facade. The returned session must retain its
+        // provider and freshness state after that facade and manager are gone.
+        drop(service);
+        let ops = VaultOperations::new(&session).unwrap();
+        assert_eq!(
+            ops.read_file(&VaultPath::parse("/new.txt").unwrap())
+                .await
+                .unwrap(),
+            b"new marker"
+        );
+        ops.create_file(
+            &VaultPath::parse("/after-facade.txt").unwrap(),
+            b"still usable",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ops.read_file(&VaultPath::parse("/after-facade.txt").unwrap())
+                .await
+                .unwrap(),
+            b"still usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn gdrive_open_preserves_original_connection_error_variants() {
+        use axiomvault_common::Error;
+        use axiomvault_storage::ProviderRegistry;
+        use axiomvault_vault::InMemoryFreshnessAnchor;
+        for error in [
+            Error::Network("synthetic offline".into()),
+            Error::AuthenticationExpired("synthetic expired".into()),
+            Error::Authentication("synthetic revoked".into()),
+        ] {
+            let expected = std::mem::discriminant(&error);
+            let error = std::sync::Mutex::new(Some(error));
+            let mut registry = ProviderRegistry::new();
+            registry
+                .register(
+                    "gdrive",
+                    Box::new(move |_| Err(error.lock().unwrap().take().unwrap())),
+                )
+                .unwrap();
+            let service = service_with_manager(VaultManager::with_registry_and_anchor(
+                registry,
+                Arc::new(InMemoryFreshnessAnchor::new()),
+            ));
+            let actual = service
+                .open_gdrive_vault(synthetic_gdrive_config(), b"synthetic")
+                .await
+                .err()
+                .expect("opening must fail");
+            assert_eq!(std::mem::discriminant(&actual), expected);
+            assert!(!service.is_vault_open().await);
+        }
+    }
 
     async fn service_with_corrupt_index() -> (AppService, TempDir) {
         let service = AppService::new();

@@ -73,8 +73,10 @@ struct FileListResponse {
 
 /// Google Drive API client.
 pub struct DriveClient {
-    /// HTTP client for streaming uploads and downloads (no total timeout).
+    /// HTTP client for uploads (no total timeout).
     http: Client,
+    /// Downloads bound read stalls without limiting total transfer duration.
+    download_http: Client,
     /// HTTP client for short metadata requests (bounded total timeout).
     metadata_http: Client,
     token_manager: std::sync::Arc<TokenManager>,
@@ -85,6 +87,7 @@ impl DriveClient {
     pub fn new(token_manager: std::sync::Arc<TokenManager>) -> axiomvault_common::Result<Self> {
         Ok(Self {
             http: http_client::build_http_client()?,
+            download_http: http_client::build_download_http_client()?,
             metadata_http: http_client::build_metadata_http_client()?,
             token_manager,
         })
@@ -472,7 +475,7 @@ impl DriveClient {
         let auth = self.auth_header().await?;
 
         let response = self
-            .http
+            .download_http
             .get(&url)
             .header(header::AUTHORIZATION, auth)
             .query(&[("alt", "media")])
@@ -505,7 +508,7 @@ impl DriveClient {
         let auth = self.auth_header().await?;
 
         let response = self
-            .http
+            .download_http
             .get(&url)
             .header(header::AUTHORIZATION, auth)
             .query(&[("alt", "media")])
