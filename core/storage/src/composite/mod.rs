@@ -672,8 +672,8 @@ impl StorageProvider for CompositeStorageProvider {
                 let object_id = self.entry_for(from).await?.object_id;
                 let total = self.backends.len();
                 let mut futures = Vec::with_capacity(total);
-                for i in 0..total {
-                    let backend = Arc::clone(&self.backends[i]);
+                for (i, backend) in self.backends.iter().enumerate() {
+                    let backend = Arc::clone(backend);
                     let from_shard = Self::shard_path(from, &object_id, i)?;
                     let to_shard = Self::shard_path(to, &object_id, i)?;
                     futures.push(async move { backend.rename(&from_shard, &to_shard).await });
@@ -731,8 +731,8 @@ impl StorageProvider for CompositeStorageProvider {
                 let object_id = self.entry_for(from).await?.object_id;
                 let total = self.backends.len();
                 let mut futures = Vec::with_capacity(total);
-                for i in 0..total {
-                    let backend = Arc::clone(&self.backends[i]);
+                for (i, backend) in self.backends.iter().enumerate() {
+                    let backend = Arc::clone(backend);
                     let from_shard = Self::shard_path(from, &object_id, i)?;
                     let to_shard = Self::shard_path(to, &object_id, i)?;
                     futures.push(async move { backend.copy(&from_shard, &to_shard).await });
