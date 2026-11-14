@@ -1534,6 +1534,74 @@ impl<'a> VaultOperations<'a> {
         Ok(())
     }
 
+    /// Move a file or directory, optionally replacing an existing file or empty
+    /// directory. The authenticated tree is committed before changing memory or
+    /// removing replaced content, so a failed save preserves both original paths.
+    /// Content identities and keys stay unchanged; moving never decrypts a blob.
+    pub async fn rename(&self, from: &VaultPath, to: &VaultPath, no_replace: bool) -> Result<()> {
+        use std::io::{Error as IoError, ErrorKind};
+
+        if from.is_root() || to.is_root() {
+            return Err(Error::NotPermitted(
+                "Cannot rename the vault root".to_string(),
+            ));
+        }
+        let mut tree = self.session.tree().write().await;
+        let source = tree.get_node(from)?;
+        if from == to {
+            return if no_replace {
+                Err(Error::AlreadyExists(to.to_string()))
+            } else {
+                Ok(())
+            };
+        }
+        if source.is_directory() && to.components().starts_with(from.components()) {
+            return Err(Error::InvalidInput(
+                "Cannot move a directory into itself".to_string(),
+            ));
+        }
+        if !tree.get_parent(to)?.is_directory() {
+            return Err(Error::Io(IoError::from(ErrorKind::NotADirectory)));
+        }
+        let replaced_blob = if let Ok(target) = tree.get_node(to) {
+            if no_replace {
+                return Err(Error::AlreadyExists(to.to_string()));
+            }
+            if source.is_directory() && target.is_file() {
+                return Err(Error::Io(IoError::from(ErrorKind::NotADirectory)));
+            }
+            if source.is_file() && target.is_directory() {
+                return Err(Error::Io(IoError::from(ErrorKind::IsADirectory)));
+            }
+            if !target.children.is_empty() {
+                return Err(Error::Io(IoError::from(ErrorKind::DirectoryNotEmpty)));
+            }
+            target
+                .is_file()
+                .then(|| target.metadata.encrypted_name.clone())
+        } else {
+            None
+        };
+
+        let mut candidate = tree.clone();
+        let mut moved = candidate.remove(from)?;
+        if candidate.exists(to) {
+            candidate.remove(to)?;
+        }
+        moved.metadata.name = to.name().expect("root rejected above").to_string();
+        candidate.get_parent_mut(to)?.add_child(moved)?;
+        self.session.save_tree_snapshot(&candidate).await?;
+        *tree = candidate;
+
+        if let Some(encrypted_name) = replaced_blob {
+            let path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
+            if let Err(error) = self.session.provider().delete(&path).await {
+                warn!(%error, "File replaced but obsolete blob cleanup failed");
+            }
+        }
+        Ok(())
+    }
+
     /// Check if path exists.
     pub async fn exists(&self, path: &VaultPath) -> bool {
         let tree = self.session.tree().read().await;
@@ -1737,6 +1805,50 @@ mod tests {
         )
         .unwrap();
         (session, provider)
+    }
+
+    #[tokio::test]
+    async fn rename_persistence_failure_preserves_the_reopenable_snapshot() {
+        let (session, provider) = create_failing_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let from = VaultPath::parse("/source").unwrap();
+        let to = VaultPath::parse("/target").unwrap();
+        ops.create_file(&from, b"new contents").await.unwrap();
+        ops.create_file(&to, b"old contents").await.unwrap();
+        let tree_path = VaultPath::parse("/m/tree.json").unwrap();
+        let before = provider.download(&tree_path).await.unwrap();
+        provider.fail_next_tree_upload();
+        assert!(ops.rename(&from, &to, false).await.is_err());
+        assert_eq!(ops.read_file(&from).await.unwrap(), b"new contents");
+        assert_eq!(ops.read_file(&to).await.unwrap(), b"old contents");
+        assert_eq!(provider.download(&tree_path).await.unwrap(), before);
+        assert_eq!(
+            provider
+                .list(&VaultPath::parse("/d").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        ops.rename(&from, &to, false).await.unwrap();
+        let storage: Arc<dyn StorageProvider> = provider.clone();
+        let tree = VaultSession::load_and_decrypt_tree(&storage, session.master_key().unwrap())
+            .await
+            .unwrap();
+        let reopened =
+            VaultSession::unlock(session.config().clone(), b"test-password", storage, tree)
+                .unwrap();
+        let reopened_ops = VaultOperations::new(&reopened).unwrap();
+        assert!(!reopened_ops.exists(&from).await);
+        assert_eq!(reopened_ops.read_file(&to).await.unwrap(), b"new contents");
+        assert_eq!(
+            provider
+                .list(&VaultPath::parse("/d").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
