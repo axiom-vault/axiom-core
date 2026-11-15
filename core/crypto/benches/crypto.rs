@@ -3,14 +3,15 @@
 //! `raw/*` measures the bare chacha20poly1305 crate in place, so the gap to
 //! `stream/*` is the framing overhead (copies, allocations, nonce generation).
 
+use std::hint::black_box;
 use std::time::Duration;
 
 use axiomvault_crypto::aead::{decrypt, encrypt};
 use axiomvault_crypto::keys::KEY_LENGTH;
 use axiomvault_crypto::stream::{DecryptingStream, EncryptingStream, DEFAULT_CHUNK_SIZE};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 const KEY: [u8; KEY_LENGTH] = [42u8; KEY_LENGTH];
 const STREAM_LEN: usize = 64 * 1024 * 1024;
@@ -27,7 +28,7 @@ fn bench_aead(c: &mut Criterion) {
     group.bench_function("raw_encrypt_in_place", |b| {
         b.iter(|| {
             cipher
-                .encrypt_in_place_detached(&nonce, b"", black_box(&mut buffer))
+                .encrypt_inout_detached(&nonce, b"", black_box(&mut buffer[..]).into())
                 .unwrap()
         })
     });

@@ -6,8 +6,8 @@
 use std::io::{Read, Write};
 
 use chacha20poly1305::{
-    aead::{generic_array::GenericArray, AeadCore, AeadInPlace, KeyInit, OsRng},
-    XChaCha20Poly1305,
+    aead::{AeadInOut, Generate, KeyInit},
+    Tag, XChaCha20Poly1305, XNonce,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -88,7 +88,8 @@ impl<'a> EncryptingStream<'a> {
         writer.write_all(&[STREAM_VERSION])?;
         writer.write_all(&chunk_size.to_le_bytes())?;
 
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        let cipher = XChaCha20Poly1305::new_from_slice(self.key)
+            .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
         // One frame buffer reused for every chunk: length || nonce || metadata || data || tag.
         // Plaintext is read straight into place and sealed in place, so no chunk is copied.
         let mut frame = Zeroizing::new(vec![0u8; FRAME_PREFIX_SIZE + self.chunk_size + TAG_SIZE]);
@@ -133,7 +134,8 @@ impl<'a> EncryptingStream<'a> {
         let frame_end = body_end + TAG_SIZE;
         let frame_len = u32::try_from(frame_end - FRAME_LENGTH_SIZE)
             .map_err(|_| Error::Crypto("Encrypted frame too large".to_string()))?;
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = XNonce::try_generate()
+            .map_err(|e| Error::Crypto(format!("Nonce generation failed: {}", e)))?;
         frame[..FRAME_LENGTH_SIZE].copy_from_slice(&frame_len.to_le_bytes());
         frame[FRAME_LENGTH_SIZE..body_start].copy_from_slice(&nonce);
         frame[body_start..body_start + 8].copy_from_slice(&index.to_le_bytes());
@@ -141,7 +143,7 @@ impl<'a> EncryptingStream<'a> {
         frame[body_start + 9..FRAME_PREFIX_SIZE]
             .copy_from_slice(&(self.chunk_size as u32).to_le_bytes());
         let tag = cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut frame[body_start..body_end])
+            .encrypt_inout_detached(&nonce, b"", (&mut frame[body_start..body_end]).into())
             .map_err(|e| Error::Crypto(format!("Encryption failed: {}", e)))?;
         frame[body_end..frame_end].copy_from_slice(&tag);
         writer.write_all(&frame[..frame_end])?;
@@ -201,7 +203,8 @@ impl<'a> DecryptingStream<'a> {
         validate_chunk_size(chunk_size, self.chunk_size)?;
 
         let max_frame = NONCE_SIZE + TAG_SIZE + FRAME_METADATA_SIZE + chunk_size;
-        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(self.key));
+        let cipher = XChaCha20Poly1305::new_from_slice(self.key)
+            .map_err(|e| Error::Crypto(format!("Invalid key: {}", e)))?;
         // Frames are read into one reused buffer and opened in place.
         // It grows to the largest frame seen, so a small file neither
         // allocates nor wipes a whole chunk.
@@ -225,13 +228,12 @@ impl<'a> DecryptingStream<'a> {
             reader.read_exact(encrypted)?;
             let (nonce, body) = encrypted.split_at_mut(NONCE_SIZE);
             let (plaintext, tag) = body.split_at_mut(body.len() - TAG_SIZE);
+            let nonce = XNonce::try_from(&*nonce)
+                .map_err(|e| Error::Crypto(format!("Invalid nonce: {}", e)))?;
+            let tag =
+                Tag::try_from(&*tag).map_err(|e| Error::Crypto(format!("Invalid tag: {}", e)))?;
             cipher
-                .decrypt_in_place_detached(
-                    GenericArray::from_slice(nonce),
-                    b"",
-                    plaintext,
-                    GenericArray::from_slice(tag),
-                )
+                .decrypt_inout_detached(&nonce, b"", (&mut *plaintext).into(), &tag)
                 .map_err(|e| Error::Crypto(format!("Decryption failed: {}", e)))?;
             let frame_index = u64::from_le_bytes(
                 plaintext[..8]
@@ -749,6 +751,31 @@ mod tests {
         encrypted.truncate(encrypted.len() - (NONCE_SIZE + TAG_SIZE + 13));
 
         assert!(decrypt_bytes(&key, &encrypted).is_err());
+    }
+
+    /// Pins the v2 stream format: a fixed stream (key 00..1f, chunk size 4,
+    /// plaintext "hello") written by an earlier build must still decrypt.
+    #[test]
+    fn stream_known_answer_decrypts() {
+        let key: [u8; KEY_LENGTH] = core::array::from_fn(|i| i as u8);
+        let hex =
+            "020400000039000000fc5e8e10d775145a4c65efc09f0090649b6febdee4ef74d96c6061768f9c49\
+             6f161849db20fd08789571f84a6262f8dc0206951ce755c4941b36000000b95e82111831ca73e8\
+             1d19d63120a34a3f2481618e8f2669b863c05e7cdee863dc0926cc97173f45a4be285fcc9d1afe\
+             30bfae5f9a3e35000000f6aa4b6edf9be1218374cf043df8e63c42ba8e3b864933abe7bbb6c67e\
+             20a96ea1547c0335e561b13e533eb84b3a7efc75261a6b05";
+        let encrypted: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+
+        let mut decrypted = Vec::new();
+        DecryptingStream::new(&key)
+            .unwrap()
+            .with_chunk_size(4)
+            .decrypt_stream(&encrypted[..], &mut decrypted)
+            .unwrap();
+        assert_eq!(decrypted, b"hello");
     }
 
     /// Version-2 frames are `len || aead::encrypt(index || kind || chunk_size || data)`.

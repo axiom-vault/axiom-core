@@ -218,6 +218,23 @@ mod tests {
         assert_eq!(key.as_bytes(), restored.as_bytes());
     }
 
+    /// Pins the BIP39 encoding: fixed entropy maps to the same 24 words.
+    #[test]
+    fn test_recovery_key_mnemonic_known_answer() {
+        let entropy: [u8; KEY_LENGTH] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        let expected = "arctic live gadget display excess mandate sniff autumn people disorder \
+                        affair hole retreat fancy close tip deer village tuition orbit cannon \
+                        owner maid spare";
+
+        let words = RecoveryKey::from_bytes(entropy).to_mnemonic().unwrap();
+        assert_eq!(&*words, expected);
+        assert_eq!(
+            RecoveryKey::from_mnemonic(expected).unwrap().as_bytes(),
+            &entropy
+        );
+    }
+
     #[test]
     fn test_recovery_key_invalid_mnemonic() {
         let result = RecoveryKey::from_mnemonic("not valid words at all");

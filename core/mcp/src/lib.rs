@@ -309,7 +309,7 @@ fn decode_content(args: &WriteFileArgs) -> Result<Vec<u8>, McpError> {
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let body = serde_json::to_string_pretty(value)
         .map_err(|err| McpError::internal_error(err.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 #[tool_router]
@@ -498,7 +498,7 @@ impl AxiomMcpServer {
     )]
     async fn safe_readonly_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::Assistant,
+            Role::Assistant,
             "1. Inspect vault_info. If the vault is locked, ask the user to run `axiom-agent unlock` (or `axiom agent unlock`) in their own terminal; no tool can unlock it. 2. Use exists, metadata, list_directory, and read_file before any mutation. 3. Respect truncation flags; read large files in parts with offset and max_bytes.",
         )]
     }
@@ -509,7 +509,7 @@ impl AxiomMcpServer {
     )]
     async fn safe_write_workflow(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(
-            PromptMessageRole::Assistant,
+            Role::Assistant,
             "1. Verify target paths with exists/metadata. 2. Require explicit user approval. 3. Mutating tools work only when the user launched axiom-agent with --allow-writes; import/export also need --allow-file-io=<dir> and stay inside that directory; every vault path must lie under the agent's --root. 4. Re-read metadata after write/update/delete/mkdir/import/export.",
         )]
     }
@@ -518,8 +518,8 @@ impl AxiomMcpServer {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for AxiomMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
@@ -536,22 +536,18 @@ impl ServerHandler for AxiomMcpServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                RawResource::new(SERVER_STATUS_URI, "server-status").no_annotation(),
-                RawResource::new(VAULT_STATUS_URI, "vault-status").no_annotation(),
-                RawResource::new(VAULT_TREE_URI, "vault-tree").no_annotation(),
-            ],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(SERVER_STATUS_URI, "server-status"),
+            Resource::new(VAULT_STATUS_URI, "vault-status"),
+            Resource::new(VAULT_TREE_URI, "vault-tree"),
+        ]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let contents = match request.uri.as_str() {
             SERVER_STATUS_URI => {
                 let agent = match self.agent(Request::Status).await {
@@ -592,7 +588,7 @@ impl ServerHandler for AxiomMcpServer {
                 ))
             }
         };
-        Ok(ReadResourceResult::new(vec![contents]))
+        Ok(ReadResourceResult::new(vec![contents]).into())
     }
 
     async fn list_resource_templates(
@@ -600,11 +596,7 @@ impl ServerHandler for AxiomMcpServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult {
-            next_cursor: None,
-            resource_templates: Vec::new(),
-            meta: None,
-        })
+        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()))
     }
 }
 
