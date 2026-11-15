@@ -407,8 +407,8 @@ impl CompositeStorageProvider {
         let total = data_shards + parity_shards;
         let payload_len = self.expected_payload_len(entry.original_size)?;
         let mut futures = Vec::with_capacity(total);
-        for i in 0..total {
-            let backend = Arc::clone(&self.backends[i]);
+        for (i, backend) in self.backends[..total].iter().enumerate() {
+            let backend = Arc::clone(backend);
             let shard_path = Self::shard_path(path, &entry.object_id, i)?;
             futures.push(async move {
                 let start = tokio::time::Instant::now();
@@ -458,8 +458,8 @@ impl CompositeStorageProvider {
         let entry = self.entry_for(path).await?;
         let total = self.backends.len();
         let mut futures = Vec::with_capacity(total);
-        for i in 0..total {
-            let backend = Arc::clone(&self.backends[i]);
+        for (i, backend) in self.backends.iter().enumerate() {
+            let backend = Arc::clone(backend);
             let shard_path = Self::shard_path(path, &entry.object_id, i)?;
             futures.push(async move { backend.delete(&shard_path).await });
         }

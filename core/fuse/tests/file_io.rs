@@ -160,6 +160,224 @@ fn names(path: &Path) -> Vec<String> {
 }
 
 #[test]
+fn unknown_provider_capacity_does_not_report_a_full_disk_or_prevent_copy() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    with_mount(|root| {
+        let path = CString::new(root.as_os_str().as_bytes()).unwrap();
+        let mut capacity = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: path is NUL-terminated and capacity points to writable space.
+        let result = unsafe { libc::statvfs(path.as_ptr(), capacity.as_mut_ptr()) };
+        assert_eq!(
+            result, -1,
+            "unknown provider quota must not look like zero free space"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+
+        let content = pattern(FILE_SIZE);
+        fs::write(root.join("original.bin"), &content).unwrap();
+        assert_eq!(
+            fs::copy(root.join("original.bin"), root.join("copied.bin")).unwrap(),
+            content.len() as u64
+        );
+        assert_eq!(fs::read(root.join("copied.bin")).unwrap(), content);
+    });
+}
+
+#[test]
+fn rename_moves_directories_and_keeps_open_source_handles_usable() {
+    with_mount(|root| {
+        fs::create_dir(root.join("before")).unwrap();
+        let path = root.join("before/file.txt");
+        fs::write(&path, b"original").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs::rename(root.join("before"), root.join("after")).unwrap();
+        file.write_all_at(b"updated!", 0).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(!root.join("before").exists());
+        assert_eq!(fs::read(root.join("after/file.txt")).unwrap(), b"updated!");
+        fs::rename(root.join("after/file.txt"), root.join("moved.txt")).unwrap();
+        assert_eq!(fs::read(root.join("moved.txt")).unwrap(), b"updated!");
+    });
+}
+
+#[test]
+fn rename_replaces_an_existing_file_for_atomic_editor_save() {
+    with_mount(|root| {
+        fs::write(root.join("document.txt"), b"old contents").unwrap();
+        let temporary = root.join(".document.tmp");
+        let mut file = fs::File::create(&temporary).unwrap();
+        std::io::Write::write_all(&mut file, b"new contents").unwrap();
+        file.sync_all().unwrap();
+        // Editors may rename the source while its descriptor is still open.
+        fs::rename(&temporary, root.join("document.txt")).unwrap();
+        drop(file);
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(root.join("document.txt")).unwrap(),
+            b"new contents"
+        );
+    });
+}
+
+#[test]
+fn failed_rename_keeps_both_files_and_recovers_after_storage_returns() {
+    with_storage(|root, storage| {
+        fs::write(root.join("source"), b"source contents").unwrap();
+        fs::write(root.join("target"), b"target contents").unwrap();
+        storage.set_metadata_dir(false);
+        assert!(fs::rename(root.join("source"), root.join("target")).is_err());
+        assert_eq!(fs::read(root.join("source")).unwrap(), b"source contents");
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"target contents");
+        storage.set_metadata_dir(true);
+        fs::rename(root.join("source"), root.join("target")).unwrap();
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"source contents");
+    });
+}
+
+#[test]
+fn rename_rejects_directory_cycles_and_nonempty_replacement() {
+    with_mount(|root| {
+        fs::create_dir(root.join("parent")).unwrap();
+        fs::create_dir(root.join("parent/child")).unwrap();
+        assert_eq!(
+            fs::rename(root.join("parent"), root.join("parent/child/nested"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        fs::create_dir(root.join("other")).unwrap();
+        assert_eq!(
+            fs::rename(root.join("other"), root.join("parent"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTEMPTY)
+        );
+        assert!(root.join("other").is_dir());
+        assert!(root.join("parent/child").is_dir());
+    });
+}
+
+#[test]
+fn rename_refuses_an_open_destination_without_losing_either_file() {
+    with_mount(|root| {
+        fs::write(root.join("source"), b"new").unwrap();
+        fs::write(root.join("target"), b"old").unwrap();
+        let target = fs::File::open(root.join("target")).unwrap();
+        assert_eq!(
+            fs::rename(root.join("source"), root.join("target"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        assert_eq!(fs::read(root.join("source")).unwrap(), b"new");
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"old");
+        drop(target);
+        fs::rename(root.join("source"), root.join("target")).unwrap();
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"new");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_noreplace_preserves_an_existing_destination() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    with_mount(|root| {
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+        let from = CString::new(source.as_os_str().as_bytes()).unwrap();
+        let to = CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: Both NUL-terminated paths remain alive for the syscall.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"new");
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+    });
+}
+
+#[test]
+fn renamed_content_survives_reopening_and_remounting_a_local_vault() {
+    use axiomvault_storage::create_default_registry;
+    use axiomvault_vault::{InMemoryFreshnessAnchor, VaultManager};
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping: /dev/fuse is not available");
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mount_point = tempfile::tempdir().unwrap();
+    let manager = VaultManager::with_registry_and_anchor(
+        create_default_registry(),
+        Arc::new(InMemoryFreshnessAnchor::new()),
+    );
+    let config = serde_json::json!({"root": storage.path()});
+    let session = runtime
+        .block_on(manager.create_vault(
+            VaultId::new("synthetic-rename-remount").unwrap(),
+            b"synthetic-only",
+            "local",
+            config.clone(),
+            KdfParams::moderate(),
+        ))
+        .unwrap()
+        .session;
+    let handle = mount(
+        Arc::new(session),
+        mount_point.path(),
+        MountOptions::default(),
+        runtime.handle().clone(),
+    )
+    .unwrap();
+    fs::write(mount_point.path().join("original"), b"old").unwrap();
+    fs::write(mount_point.path().join("temporary"), b"durable replacement").unwrap();
+    fs::rename(
+        mount_point.path().join("temporary"),
+        mount_point.path().join("original"),
+    )
+    .unwrap();
+    handle.unmount();
+    let reopened = runtime
+        .block_on(manager.open_vault("local", config, b"synthetic-only"))
+        .unwrap();
+    let handle = mount(
+        Arc::new(reopened),
+        mount_point.path(),
+        MountOptions::default(),
+        runtime.handle().clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(mount_point.path().join("original")).unwrap(),
+        b"durable replacement"
+    );
+    assert!(!mount_point.path().join("temporary").exists());
+    handle.unmount();
+}
+
+#[test]
 fn ranged_reads_cross_frame_boundaries_and_stop_at_eof() {
     with_mount(|root| {
         let path = root.join("data.bin");

@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -103,6 +103,23 @@ impl InodeMap {
     fn remove_inode(&mut self, path: &str) {
         if let Some(ino) = self.path_to_inode.remove(path) {
             self.inode_to_path.remove(&ino);
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+        self.remove_inode(to);
+        let prefix = format!("{from}/");
+        let moved: Vec<_> = self
+            .path_to_inode
+            .iter()
+            .filter(|(path, _)| path.as_str() == from || path.starts_with(&prefix))
+            .map(|(path, &inode)| (path.clone(), inode))
+            .collect();
+        for (path, inode) in moved {
+            self.path_to_inode.remove(&path);
+            let renamed = format!("{to}{}", &path[from.len()..]);
+            self.path_to_inode.insert(renamed.clone(), inode);
+            self.inode_to_path.insert(inode, renamed);
         }
     }
 }
@@ -423,6 +440,13 @@ impl VaultFilesystem {
 }
 
 impl Filesystem for VaultFilesystem {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        // StorageProvider has no quota API. fuser's default successful response
+        // reports zero free blocks, which makes Dolphin reject nonempty copies.
+        // Report capacity as unavailable rather than invent a local/cloud quota.
+        reply.error(Errno::EOPNOTSUPP);
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
@@ -1135,6 +1159,103 @@ impl Filesystem for VaultFilesystem {
             let attr = create_file_attr(ino, true, 0);
 
             reply.entry(&ttl, &attr, Generation(0));
+        });
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        // Exchange and whiteout have different semantics; never silently replace.
+        #[cfg(target_os = "linux")]
+        let allowed = RenameFlags::RENAME_NOREPLACE;
+        #[cfg(not(target_os = "linux"))]
+        let allowed = RenameFlags::empty();
+        if flags.bits() & !allowed.bits() != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        self.runtime.block_on(async {
+            let paths = {
+                let map = self.inodes.read().await;
+                map.get_path(parent)
+                    .zip(map.get_path(newparent))
+                    .and_then(|(old, new)| {
+                        let from = VaultPath::parse(old).ok()?.join(name).ok()?;
+                        let to = VaultPath::parse(new).ok()?.join(newname).ok()?;
+                        Some((from, to))
+                    })
+            };
+            let Some((from, to)) = paths else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let from_str = from.to_string();
+            let to_str = to.to_string();
+            let prefix = format!("{from_str}/");
+            let mut files = self.open_files.write().await;
+            // A replaced open handle currently addresses files by path. Refuse
+            // it rather than let a later flush overwrite the replacement.
+            if from != to && files.values().any(|file| file.path == to_str) {
+                reply.error(if flags.is_empty() {
+                    Errno::EBUSY
+                } else {
+                    Errno::EEXIST
+                });
+                return;
+            }
+            for file in files
+                .values_mut()
+                .filter(|file| file.path == from_str || file.path.starts_with(&prefix))
+            {
+                if let Err(errno) = persist(&self.session, file).await {
+                    reply.error(errno);
+                    return;
+                }
+            }
+            let result = match VaultOperations::new(&self.session) {
+                Ok(ops) => ops.rename(&from, &to, !flags.is_empty()).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                use axiomvault_common::Error;
+                use std::io::ErrorKind;
+                let errno = match error {
+                    Error::NotFound(_) => Errno::ENOENT,
+                    Error::AlreadyExists(_) => Errno::EEXIST,
+                    Error::NotPermitted(_) => Errno::EPERM,
+                    Error::InvalidInput(_) => Errno::EINVAL,
+                    Error::Io(ref e) => match e.kind() {
+                        ErrorKind::NotADirectory => Errno::ENOTDIR,
+                        ErrorKind::IsADirectory => Errno::EISDIR,
+                        ErrorKind::DirectoryNotEmpty => Errno::ENOTEMPTY,
+                        _ => Errno::EIO,
+                    },
+                    _ => Errno::EIO,
+                };
+                reply.error(errno);
+                return;
+            }
+            if from != to {
+                self.inodes.write().await.rename(&from_str, &to_str);
+                for file in files
+                    .values_mut()
+                    .filter(|file| file.path == from_str || file.path.starts_with(&prefix))
+                {
+                    file.path = format!("{to_str}{}", &file.path[from_str.len()..]);
+                }
+            }
+            reply.ok();
         });
     }
 
