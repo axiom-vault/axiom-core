@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
@@ -124,6 +125,39 @@ impl Drop for HashingStream {
                 let _ = sender.send(finish_digest(std::mem::take(&mut self.hasher)));
             }
         }
+    }
+}
+
+/// Stream wrapper that counts bytes yielded to the provider. Lets an upload
+/// verify that the ciphertext length matches `EncryptingStream::encrypted_len`
+/// of the plaintext byte count.
+struct CountingByteStream {
+    inner: ByteStream,
+    count: Arc<AtomicU64>,
+}
+
+impl CountingByteStream {
+    fn new(inner: ByteStream) -> (Self, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                inner,
+                count: count.clone(),
+            },
+            count,
+        )
+    }
+}
+
+impl Stream for CountingByteStream {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = self.inner.poll_next_unpin(cx);
+        if let Poll::Ready(Some(Ok(ref chunk))) = item {
+            self.count.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+        item
     }
 }
 
@@ -276,6 +310,46 @@ impl Read for WriterReceiver {
         buffer[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
         self.offset += count;
         Ok(count)
+    }
+}
+
+/// `Read` wrapper that counts how many plaintext bytes the underlying
+/// reader actually yielded and fuses itself at EOF. Once the inner reader
+/// returns 0 the wrapper returns 0 forever, so a source that is appended to
+/// mid-import cannot create an extra short frame that would make the stored
+/// ciphertext longer than `EncryptingStream::encrypted_len(count)`.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+    eof: bool,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            count: 0,
+            eof: false,
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.eof || buffer.is_empty() {
+            return Ok(0);
+        }
+        let n = self.inner.read(buffer)?;
+        if n == 0 {
+            self.eof = true;
+        } else {
+            self.count += n as u64;
+        }
+        Ok(n)
     }
 }
 
@@ -699,71 +773,148 @@ impl<'a> VaultOperations<'a> {
     ///
     /// Ciphertext frames flow straight from the encryptor into the provider
     /// upload; nothing is staged on disk or held in memory beyond a few chunks.
+    ///
+    /// This preserves the original single-file behavior: symlinks are followed
+    /// when opening `source`, and the recorded size is the number of bytes
+    /// actually encrypted (which eliminates the pre-existing race where a file
+    /// changes size between `metadata` and read).
     pub async fn create_file_from_path(
         &self,
         path: &VaultPath,
         source: impl AsRef<Path>,
     ) -> Result<()> {
+        let source = source.as_ref().to_path_buf();
+        let (file, expected_size) = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&source)?;
+            let size = file.metadata()?.len();
+            Ok::<_, std::io::Error>((file, size))
+        })
+        .await
+        .map_err(|error| Error::Storage(format!("file open task failed: {error}")))?
+        .map_err(Error::Io)?;
+        self.create_file_from_reader(path, file, Some(expected_size))
+            .await?;
+        Ok(())
+    }
+
+    /// Import plaintext from an arbitrary reader through bounded-memory
+    /// encryption and provider streaming. The recorded size is the actual
+    /// number of plaintext bytes consumed, not any declared hint, so
+    /// readers whose length changes mid-import remain extractable.
+    ///
+    /// When `expected_size` is known (e.g. from `metadata` of the opened
+    /// file), the provider's bounded-memory `upload_sized_stream` path is
+    /// used and the import fails closed if the bytes actually read differ.
+    /// When it is `None`, the provider falls back to `upload_stream`.
+    ///
+    /// Returns the content digest of the uploaded ciphertext.
+    ///
+    /// # Preconditions
+    /// - `path` must not already exist in the vault.
+    /// - Session must be active.
+    ///
+    /// # Postconditions
+    /// - File is created in storage with encrypted content.
+    /// - Tree is updated with the actual encrypted byte count and digest.
+    ///
+    /// # Errors
+    /// - Path already exists.
+    /// - Encryption failure.
+    /// - Storage failure.
+    /// - Size mismatch, if `expected_size` is supplied and the reader yields
+    ///   a different number of bytes.
+    pub async fn create_file_from_reader(
+        &self,
+        path: &VaultPath,
+        source: impl Read + Send + 'static,
+        expected_size: Option<u64>,
+    ) -> Result<String> {
         let name = path
             .name()
             .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
         if self.session.tree().read().await.get_node(path).is_ok() {
             return Err(Error::AlreadyExists(format!("Path already exists: {path}")));
         }
-        let source = source.as_ref().to_path_buf();
-        let size = tokio::fs::metadata(&source).await?.len();
+
+        debug!("Creating encrypted file from reader");
+
         let encrypted_name = self.encrypt_name(name)?;
         let file_key = self
             .session
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
-        let encrypted_size = EncryptingStream::new(&key)?.encrypted_len(size);
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
-        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
-        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_key = key.clone();
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let mut input = CountingReader::new(source);
             let mut output = ChunkSender {
-                sender,
+                sender: cipher_sender,
                 buffer: Vec::new(),
             };
-            let result = std::fs::File::open(source)
-                .map_err(Error::from)
-                .and_then(|mut input| {
-                    EncryptingStream::new(&key)?.encrypt_stream(&mut input, &mut output)?;
-                    Ok(output.flush()?)
-                });
+            let result = EncryptingStream::new(&encrypt_key)
+                .and_then(|stream| stream.encrypt_stream(&mut input, &mut output))
+                .and_then(|_| Ok(output.flush()?));
             if let Err(error) = &result {
                 // Abort the upload so the provider discards its partial object.
                 let _ = output
                     .sender
                     .blocking_send(Err(Error::Storage(error.to_string())));
             }
-            result
+            result.map(|_| input.count())
         });
-        let (encrypted_stream, content_digest) = HashingStream::new(receiver);
-        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut tree = self.session.tree().write().await;
-        let upload_result = self
-            .session
-            .provider()
-            .upload_sized_stream(&storage_path, Box::pin(encrypted_stream), encrypted_size)
-            .await;
+        let provider = self.session.provider();
+        let (encrypted_stream, content_digest) = HashingStream::new(cipher_receiver);
+        let (counting_stream, byte_count) = CountingByteStream::new(Box::pin(encrypted_stream));
+        let upload_result = if let Some(expected_size) = expected_size {
+            let encrypted_size = EncryptingStream::new(&key)?.encrypted_len(expected_size);
+            provider
+                .upload_sized_stream(&storage_path, Box::pin(counting_stream), encrypted_size)
+                .await
+        } else {
+            provider
+                .upload_stream(&storage_path, Box::pin(counting_stream))
+                .await
+        };
         let encryption_result = encrypt_task
             .await
-            .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
+            .map_err(|error| Error::Storage(format!("encryption task failed: {error}")))?;
         upload_result?;
-        encryption_result?;
+        let actual_size = encryption_result?;
         let content_digest = content_digest.await?;
 
+        if let Some(expected_size) = expected_size {
+            if actual_size != expected_size {
+                return Err(Error::InvalidInput(format!(
+                    "source changed during import: expected {expected_size} bytes, read {actual_size}"
+                )));
+            }
+        }
+
+        // Defense in depth: the ciphertext length must match the length that
+        // `EncryptingStream::encrypted_len` predicts for the plaintext byte
+        // count. Sticky EOF already prevents appended data from creating an
+        // extra frame; this check catches any other frame-count anomaly.
+        let expected_encrypted_len = EncryptingStream::new(&key)?.encrypted_len(actual_size);
+        let actual_encrypted_len = byte_count.load(Ordering::Relaxed);
+        if actual_encrypted_len != expected_encrypted_len {
+            return Err(Error::InvalidInput(format!(
+                "encrypted length mismatch: expected {expected_encrypted_len}, got {actual_encrypted_len}"
+            )));
+        }
+
+        let mut tree = self.session.tree().write().await;
         let mut candidate = tree.clone();
-        candidate.create_file(path, &encrypted_name, size)?;
+        candidate.create_file(path, &encrypted_name, actual_size)?;
         let node = candidate.get_node_mut(path)?;
         node.metadata.content_version = STREAM_CONTENT_VERSION;
-        node.metadata.content_digest = Some(content_digest);
+        node.metadata.content_digest = Some(content_digest.clone());
         self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
-        info!(size, "File imported");
-        Ok(())
+        info!(size = actual_size, "File imported from reader");
+        Ok(content_digest)
     }
 
     /// Export a vault file without materializing ciphertext or plaintext in memory.
@@ -1631,8 +1782,143 @@ mod tests {
     use axiomvault_crypto::KdfParams;
     use axiomvault_storage::provider::ByteStream;
     use axiomvault_storage::{MemoryProvider, Metadata, StorageProvider};
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Reader that returns 0 once (or repeatedly) mid-stream before resuming,
+    /// to simulate a source that is appended to during import.
+    struct ZeroThenMoreReader {
+        data: Cursor<Vec<u8>>,
+        zero_after: usize,
+        zeros_remaining: usize,
+        bytes_before_zero: usize,
+    }
+
+    impl ZeroThenMoreReader {
+        fn new(data: Vec<u8>, zero_after: usize, zeros: usize) -> Self {
+            Self {
+                data: Cursor::new(data),
+                zero_after,
+                zeros_remaining: zeros,
+                bytes_before_zero: 0,
+            }
+        }
+    }
+
+    impl Read for ZeroThenMoreReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes_before_zero < self.zero_after {
+                let want = (self.zero_after - self.bytes_before_zero).min(buf.len());
+                let n = self.data.read(&mut buf[..want])?;
+                self.bytes_before_zero += n;
+                return Ok(n);
+            }
+            if self.zeros_remaining > 0 {
+                self.zeros_remaining -= 1;
+                return Ok(0);
+            }
+            self.data.read(buf)
+        }
+    }
+
+    /// Provider spy that records which upload method was called for data objects.
+    struct UploadSpyProvider {
+        inner: MemoryProvider,
+        used_sized: AtomicBool,
+        used_stream: AtomicBool,
+        declared_size: Mutex<Option<u64>>,
+    }
+
+    impl UploadSpyProvider {
+        fn new() -> Self {
+            Self {
+                inner: MemoryProvider::new(),
+                used_sized: AtomicBool::new(false),
+                used_stream: AtomicBool::new(false),
+                declared_size: Mutex::new(None),
+            }
+        }
+
+        fn used_sized(&self) -> bool {
+            self.used_sized.load(Ordering::SeqCst)
+        }
+
+        fn used_stream(&self) -> bool {
+            self.used_stream.load(Ordering::SeqCst)
+        }
+
+        fn declared_size(&self) -> Option<u64> {
+            *self.declared_size.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for UploadSpyProvider {
+        fn name(&self) -> &str {
+            "upload-spy-memory"
+        }
+
+        async fn upload(&self, path: &VaultPath, data: Vec<u8>) -> Result<Metadata> {
+            self.inner.upload(path, data).await
+        }
+
+        async fn upload_stream(&self, path: &VaultPath, stream: ByteStream) -> Result<Metadata> {
+            self.used_stream.store(true, Ordering::SeqCst);
+            self.inner.upload_stream(path, stream).await
+        }
+
+        async fn upload_sized_stream(
+            &self,
+            path: &VaultPath,
+            stream: ByteStream,
+            total_size: u64,
+        ) -> Result<Metadata> {
+            self.used_sized.store(true, Ordering::SeqCst);
+            *self.declared_size.lock().unwrap() = Some(total_size);
+            self.inner.upload_stream(path, stream).await
+        }
+
+        async fn download(&self, path: &VaultPath) -> Result<Vec<u8>> {
+            self.inner.download(path).await
+        }
+
+        async fn download_stream(&self, path: &VaultPath) -> Result<ByteStream> {
+            self.inner.download_stream(path).await
+        }
+
+        async fn exists(&self, path: &VaultPath) -> Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn delete(&self, path: &VaultPath) -> Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, path: &VaultPath) -> Result<Vec<Metadata>> {
+            self.inner.list(path).await
+        }
+
+        async fn metadata(&self, path: &VaultPath) -> Result<Metadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn create_dir(&self, path: &VaultPath) -> Result<Metadata> {
+            self.inner.create_dir(path).await
+        }
+
+        async fn delete_dir(&self, path: &VaultPath) -> Result<()> {
+            self.inner.delete_dir(path).await
+        }
+
+        async fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+            self.inner.rename(from, to).await
+        }
+
+        async fn copy(&self, from: &VaultPath, to: &VaultPath) -> Result<Metadata> {
+            self.inner.copy(from, to).await
+        }
+    }
 
     struct FailingProvider {
         inner: MemoryProvider,
@@ -1789,6 +2075,36 @@ mod tests {
         )
         .unwrap();
         let provider = Arc::new(FailingProvider::new());
+        provider
+            .create_dir(&VaultPath::parse("/d").unwrap())
+            .await
+            .unwrap();
+        provider
+            .create_dir(&VaultPath::parse("/m").unwrap())
+            .await
+            .unwrap();
+        let session = VaultSession::unlock(
+            creation.config,
+            password,
+            provider.clone(),
+            VaultTree::new(),
+        )
+        .unwrap();
+        (session, provider)
+    }
+
+    async fn create_spy_test_session() -> (VaultSession, Arc<UploadSpyProvider>) {
+        let id = VaultId::new("test").unwrap();
+        let password = b"test-password";
+        let creation = VaultConfig::new(
+            id,
+            password,
+            "memory",
+            serde_json::Value::Null,
+            KdfParams::moderate(),
+        )
+        .unwrap();
+        let provider = Arc::new(UploadSpyProvider::new());
         provider
             .create_dir(&VaultPath::parse("/d").unwrap())
             .await
@@ -2046,6 +2362,188 @@ mod tests {
         ops.export_file_to_path(&path, &destination).await.unwrap();
 
         assert_eq!(std::fs::read(destination).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_path_records_actual_size_and_extracts() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        let content = b"exact content for size check";
+        std::fs::write(&source, content).unwrap();
+        let path = VaultPath::parse("/size-checked.txt").unwrap();
+
+        ops.create_file_from_path(&path, &source).await.unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(content.len() as u64));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_records_bytes_actually_read() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("larger-than-read.txt");
+        let destination = temp.path().join("destination.txt");
+        let full_content = b"this is the full file content";
+        std::fs::write(&source, full_content).unwrap();
+        let path = VaultPath::parse("/truncated-reader.txt").unwrap();
+
+        let file = std::fs::File::open(&source).unwrap();
+        let limited = file.take(10);
+        ops.create_file_from_reader(&path, limited, None)
+            .await
+            .unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(10));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), &full_content[..10]);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_with_expected_size_uses_sized_upload() {
+        let (session, provider) = create_spy_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/sized-upload.txt").unwrap();
+        let content = b"sized stream content";
+        let reader = std::io::Cursor::new(content.to_vec());
+
+        ops.create_file_from_reader(&path, reader, Some(content.len() as u64))
+            .await
+            .unwrap();
+
+        assert!(provider.used_sized());
+        assert!(!provider.used_stream());
+        let declared = provider.declared_size().unwrap();
+        let file_key = session.master_key().unwrap().derive_file_key(
+            ops.session
+                .tree()
+                .read()
+                .await
+                .get_node(&path)
+                .unwrap()
+                .metadata
+                .encrypted_name
+                .as_bytes(),
+        );
+        let expected_encrypted = EncryptingStream::new(file_key.as_bytes())
+            .unwrap()
+            .encrypted_len(content.len() as u64);
+        assert_eq!(declared, expected_encrypted);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_without_expected_size_uses_stream_upload() {
+        let (session, provider) = create_spy_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/stream-upload.txt").unwrap();
+        let content = b"plain stream content";
+        let reader = std::io::Cursor::new(content.to_vec());
+
+        ops.create_file_from_reader(&path, reader, None)
+            .await
+            .unwrap();
+
+        assert!(provider.used_stream());
+        assert!(!provider.used_sized());
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_rejects_size_mismatch() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/size-mismatch.txt").unwrap();
+        let content = b"shorter than declared";
+        let reader = std::io::Cursor::new(content.to_vec());
+
+        let result = ops.create_file_from_reader(&path, reader, Some(1000)).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::InvalidInput(_)));
+        assert!(ops.metadata(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_zero_then_more_with_size_fails_closed() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/growing-file.txt").unwrap();
+        let content: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
+
+        let reader = ZeroThenMoreReader::new(content.clone(), 64, 1);
+        let result = ops
+            .create_file_from_reader(&path, reader, Some(content.len() as u64))
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::InvalidInput(_)));
+        assert!(ops.metadata(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_zero_then_more_without_size_truncates_safely() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/growing-file-unknown.txt").unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let destination = temp.path().join("out.bin");
+        let content: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
+
+        let reader = ZeroThenMoreReader::new(content.clone(), 64, 1);
+        ops.create_file_from_reader(&path, reader, None)
+            .await
+            .unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(64));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), &content[..64]);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_empty_file_roundtrips() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/empty.txt").unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let destination = temp.path().join("out.bin");
+
+        ops.create_file_from_reader(&path, std::io::empty(), Some(0))
+            .await
+            .unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(0));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert!(std::fs::read(destination).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_multi_chunk_roundtrips() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let path = VaultPath::parse("/multi-chunk.bin").unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let destination = temp.path().join("out.bin");
+        // Three full 64 KiB chunks plus a partial chunk.
+        let len = 3 * DEFAULT_CHUNK_SIZE + 1234;
+        let content: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let reader = std::io::Cursor::new(content.clone());
+
+        ops.create_file_from_reader(&path, reader, Some(len as u64))
+            .await
+            .unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(len as u64));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), content);
     }
 
     #[cfg(unix)]
