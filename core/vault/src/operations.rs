@@ -279,6 +279,33 @@ impl Read for WriterReceiver {
     }
 }
 
+/// `Read` wrapper that counts how many plaintext bytes the underlying
+/// reader actually yielded. This lets an import record the size that was
+/// encrypted rather than a size declared before reading, so files that
+/// change during import stay extractable.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
 /// New content for an existing vault file, or the content of a new one,
 /// encrypted and uploaded as it is written. Nothing changes in the vault
 /// until [`VaultOperations::finish_file_writer`]; a writer dropped before
@@ -699,71 +726,106 @@ impl<'a> VaultOperations<'a> {
     ///
     /// Ciphertext frames flow straight from the encryptor into the provider
     /// upload; nothing is staged on disk or held in memory beyond a few chunks.
+    ///
+    /// This preserves the original single-file behavior: symlinks are followed
+    /// when opening `source`, and the recorded size is the number of bytes
+    /// actually encrypted (which eliminates the pre-existing race where a file
+    /// changes size between `metadata` and read).
     pub async fn create_file_from_path(
         &self,
         path: &VaultPath,
         source: impl AsRef<Path>,
     ) -> Result<()> {
+        let source = source.as_ref().to_path_buf();
+        let file = tokio::task::spawn_blocking(move || std::fs::File::open(&source))
+            .await
+            .map_err(|error| Error::Storage(format!("file open task failed: {error}")))?
+            .map_err(Error::Io)?;
+        self.create_file_from_reader(path, file).await?;
+        Ok(())
+    }
+
+    /// Import plaintext from an arbitrary reader through bounded-memory
+    /// encryption and provider streaming. The recorded size is the actual
+    /// number of plaintext bytes consumed, not any declared hint, so
+    /// readers whose length changes mid-import remain extractable.
+    ///
+    /// Returns the content digest of the uploaded ciphertext.
+    ///
+    /// # Preconditions
+    /// - `path` must not already exist in the vault.
+    /// - Session must be active.
+    ///
+    /// # Postconditions
+    /// - File is created in storage with encrypted content.
+    /// - Tree is updated with the actual encrypted byte count and digest.
+    ///
+    /// # Errors
+    /// - Path already exists.
+    /// - Encryption failure.
+    /// - Storage failure.
+    pub async fn create_file_from_reader(
+        &self,
+        path: &VaultPath,
+        source: impl Read + Send + 'static,
+    ) -> Result<String> {
         let name = path
             .name()
             .ok_or_else(|| Error::InvalidInput("Invalid file path".to_string()))?;
         if self.session.tree().read().await.get_node(path).is_ok() {
             return Err(Error::AlreadyExists(format!("Path already exists: {path}")));
         }
-        let source = source.as_ref().to_path_buf();
-        let size = tokio::fs::metadata(&source).await?.len();
+
+        debug!("Creating encrypted file from reader");
+
         let encrypted_name = self.encrypt_name(name)?;
         let file_key = self
             .session
             .master_key()?
             .derive_file_key(encrypted_name.as_bytes());
         let key = Zeroizing::new(file_key.as_bytes().to_vec());
-        let encrypted_size = EncryptingStream::new(&key)?.encrypted_len(size);
+        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
 
-        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
-        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        let (cipher_sender, cipher_receiver) = tokio::sync::mpsc::channel(UPLOAD_CHANNEL_CAPACITY);
+        let encrypt_task = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let mut input = CountingReader::new(source);
             let mut output = ChunkSender {
-                sender,
+                sender: cipher_sender,
                 buffer: Vec::new(),
             };
-            let result = std::fs::File::open(source)
-                .map_err(Error::from)
-                .and_then(|mut input| {
-                    EncryptingStream::new(&key)?.encrypt_stream(&mut input, &mut output)?;
-                    Ok(output.flush()?)
-                });
+            let result = EncryptingStream::new(&key)
+                .and_then(|stream| stream.encrypt_stream(&mut input, &mut output))
+                .and_then(|_| Ok(output.flush()?));
             if let Err(error) = &result {
                 // Abort the upload so the provider discards its partial object.
                 let _ = output
                     .sender
                     .blocking_send(Err(Error::Storage(error.to_string())));
             }
-            result
+            result.map(|_| input.count())
         });
-        let (encrypted_stream, content_digest) = HashingStream::new(receiver);
-        let storage_path = VaultPath::parse(DATA_DIRNAME)?.join(&encrypted_name)?;
-        let mut tree = self.session.tree().write().await;
-        let upload_result = self
-            .session
-            .provider()
-            .upload_sized_stream(&storage_path, Box::pin(encrypted_stream), encrypted_size)
+        let provider = self.session.provider();
+        let (encrypted_stream, content_digest) = HashingStream::new(cipher_receiver);
+        let upload_result = provider
+            .upload_stream(&storage_path, Box::pin(encrypted_stream))
             .await;
         let encryption_result = encrypt_task
             .await
-            .map_err(|error| Error::Storage(format!("encryption task failed: {}", error)))?;
+            .map_err(|error| Error::Storage(format!("encryption task failed: {error}")))?;
         upload_result?;
-        encryption_result?;
+        let actual_size = encryption_result?;
         let content_digest = content_digest.await?;
 
+        let mut tree = self.session.tree().write().await;
         let mut candidate = tree.clone();
-        candidate.create_file(path, &encrypted_name, size)?;
+        candidate.create_file(path, &encrypted_name, actual_size)?;
         let node = candidate.get_node_mut(path)?;
         node.metadata.content_version = STREAM_CONTENT_VERSION;
-        node.metadata.content_digest = Some(content_digest);
+        node.metadata.content_digest = Some(content_digest.clone());
         self.session.save_tree_snapshot(&candidate).await?;
         *tree = candidate;
-        info!(size, "File imported");
-        Ok(())
+        info!(size = actual_size, "File imported from reader");
+        Ok(content_digest)
     }
 
     /// Export a vault file without materializing ciphertext or plaintext in memory.
@@ -2046,6 +2108,46 @@ mod tests {
         ops.export_file_to_path(&path, &destination).await.unwrap();
 
         assert_eq!(std::fs::read(destination).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_path_records_actual_size_and_extracts() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        let content = b"exact content for size check";
+        std::fs::write(&source, content).unwrap();
+        let path = VaultPath::parse("/size-checked.txt").unwrap();
+
+        ops.create_file_from_path(&path, &source).await.unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(content.len() as u64));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn create_file_from_reader_records_bytes_actually_read() {
+        let session = create_test_session().await;
+        let ops = VaultOperations::new(&session).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("larger-than-read.txt");
+        let destination = temp.path().join("destination.txt");
+        let full_content = b"this is the full file content";
+        std::fs::write(&source, full_content).unwrap();
+        let path = VaultPath::parse("/truncated-reader.txt").unwrap();
+
+        let file = std::fs::File::open(&source).unwrap();
+        let limited = file.take(10);
+        ops.create_file_from_reader(&path, limited).await.unwrap();
+
+        let (_, _, size) = ops.metadata(&path).await.unwrap();
+        assert_eq!(size, Some(10));
+        ops.export_file_to_path(&path, &destination).await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), &full_content[..10]);
     }
 
     #[cfg(unix)]
